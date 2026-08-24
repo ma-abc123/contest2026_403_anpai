@@ -1,5 +1,13 @@
 # AI Watch 迁移与开发说明
 
+## 迁移状态
+
+- 2026-08-24：AI Watch 作品代码、板级配置、开发文档和公共仓补丁已迁入专属参赛仓。
+- 2026-08-24：迁移提交已推送至个人 Fork 的 `contest/ai-watch` 分支。
+- 远程备份提交：`10071eef9bbccb51f9950dfad2a55b4ee2f5d3f3`。
+- 远程分支：<https://github.com/ma-abc123/contest2026_403_anpai/tree/contest/ai-watch>
+- 该分支目前仅为个人 Fork 中的开发备份，尚未向组委会仓库发起或合入参赛 PR。
+
 ## 唯一工作区
 
 后续只在以下目录开发：
