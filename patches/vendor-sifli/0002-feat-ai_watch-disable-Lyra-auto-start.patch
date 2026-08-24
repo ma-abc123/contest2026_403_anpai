@@ -1,0 +1,24 @@
+From 289070aee855e282943cd8285af3299a503027d2 Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Mon, 24 Aug 2026 18:46:03 +0800
+Subject: [PATCH 2/3] feat(ai_watch): disable Lyra auto-start
+
+- Comment out vapp launch in rcS init script
+- Boot directly to NSH without Lyra black screen
+- Users can manually start Lyra if needed
+
+Milestone: M1 complete with bonus features
+---
+ boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS b/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS
+index 4a36786..b4f239f 100644
+--- a/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS
++++ b/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS
+@@ -1,2 +1 @@
+ sleep 3
+-vapp hap://app/com.application.lyra.demo &
+-- 
+2.34.1
+

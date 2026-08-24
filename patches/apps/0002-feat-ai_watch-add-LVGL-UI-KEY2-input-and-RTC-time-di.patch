@@ -1,0 +1,371 @@
+From 2ff3f5d6c416271e9a9ad8169703b4c1ca3f2582 Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Mon, 24 Aug 2026 18:45:56 +0800
+Subject: [PATCH 2/4] feat(ai_watch): add LVGL UI, KEY2 input, and RTC time
+ display
+
+- Add LVGL home screen with title, time, and BT status labels
+- Implement KEY2 button input via /dev/buttons with debounce
+- Add RTC time display with auto-default if not set
+- Add time update thread for real-time clock display
+- Increase stack size to 32768 for LVGL requirements
+- Use thread-safe flag variables for UI updates
+
+Milestone: M1 complete with bonus features
+---
+ examples/ai_watch/Kconfig         |   2 +-
+ examples/ai_watch/ai_watch_main.c | 313 +++++++++++++++++++++++++++++-
+ 2 files changed, 312 insertions(+), 3 deletions(-)
+
+diff --git a/examples/ai_watch/Kconfig b/examples/ai_watch/Kconfig
+index a1261d436..cef17f837 100644
+--- a/examples/ai_watch/Kconfig
++++ b/examples/ai_watch/Kconfig
+@@ -24,7 +24,7 @@ config EXAMPLES_AI_WATCH_PRIORITY
+ 
+ config EXAMPLES_AI_WATCH_STACKSIZE
+ 	int "AI Watch stack size"
+-	default DEFAULT_TASK_STACKSIZE
++	default 32768
+ 
+ config EXAMPLES_AI_WATCH_HEAPSIZE
+ 	int "AI Watch heap size"
+diff --git a/examples/ai_watch/ai_watch_main.c b/examples/ai_watch/ai_watch_main.c
+index 8f52b950f..1eca5fcd0 100644
+--- a/examples/ai_watch/ai_watch_main.c
++++ b/examples/ai_watch/ai_watch_main.c
+@@ -24,12 +24,217 @@
+ 
+ #include <nuttx/config.h>
+ #include <stdio.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <sys/ioctl.h>
++#include <time.h>
++#include <nuttx/input/buttons.h>
++
++#include <lvgl/lvgl.h>
+ 
+ /****************************************************************************
+- * Preprocessor Definitions
++ * Pre-processor Definitions
+  ****************************************************************************/
+ 
+-#define AI_WATCH_VERSION "1.0.0"
++#define AI_WATCH_VERSION    "1.0.0"
++#define BUTTON_DEVICE       "/dev/buttons"
++#define POLL_DELAY_MS       100
++#define DEBOUNCE_MS         200
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static lv_obj_t *g_title_label;
++static lv_obj_t *g_time_label;
++static lv_obj_t *g_bt_label;
++static volatile bool g_bt_state = false;
++static volatile bool g_key_pressed = false;
++static volatile bool g_time_update = false;
++static char g_time_str[32] = "--:--:--";
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: time_thread
++ *
++ * Description:
++ *   Thread to read RTC time and update time string every second
++ *
++ ****************************************************************************/
++
++static FAR void *time_thread(FAR void *arg)
++{
++  struct timespec ts;
++  struct tm tm;
++
++  printf("Time update thread started\n");
++
++  /* Check if RTC time is set, if not set a default time */
++
++  clock_gettime(CLOCK_REALTIME, &ts);
++  localtime_r(&ts.tv_sec, &tm);
++
++  if (tm.tm_year < (2020 - 1900))
++    {
++      printf("RTC not set, setting default time: 2026-08-24 18:00:00\n");
++
++      /* Set default time: 2026-08-24 18:00:00 */
++
++      struct tm default_tm = {0};
++      default_tm.tm_year = 2026 - 1900;
++      default_tm.tm_mon  = 8 - 1;
++      default_tm.tm_mday = 24;
++      default_tm.tm_hour = 18;
++      default_tm.tm_min  = 0;
++      default_tm.tm_sec  = 0;
++
++      ts.tv_sec = mktime(&default_tm);
++      ts.tv_nsec = 0;
++      clock_settime(CLOCK_REALTIME, &ts);
++    }
++
++  /* Main time update loop */
++
++  while (1)
++    {
++      clock_gettime(CLOCK_REALTIME, &ts);
++      localtime_r(&ts.tv_sec, &tm);
++
++      /* Format as HH:MM:SS */
++
++      strftime(g_time_str, sizeof(g_time_str), "%H:%M:%S", &tm);
++
++      /* Set flag for main loop to update UI */
++
++      g_time_update = true;
++
++      /* Sleep for 1 second */
++
++      sleep(1);
++    }
++
++  return NULL;
++}
++
++/****************************************************************************
++ * Name: button_thread
++ *
++ * Description:
++ *   Thread to monitor KEY2 button press via /dev/buttons
++ *
++ ****************************************************************************/
++
++static FAR void *button_thread(FAR void *arg)
++{
++  int fd;
++  btn_buttonset_t supported;
++  struct pollfd fds[1];
++  struct timespec last_press = {0, 0};
++
++  fd = open(BUTTON_DEVICE, O_RDONLY | O_NONBLOCK);
++  if (fd < 0)
++    {
++      printf("ERROR: Failed to open %s: %d\n", BUTTON_DEVICE, errno);
++      return NULL;
++    }
++
++  /* Query supported buttons */
++
++  ioctl(fd, BTNIOC_SUPPORTED, &supported);
++  printf("Supported buttons: 0x%02lx\n", (unsigned long)supported);
++
++  /* Setup poll */
++
++  fds[0].fd = fd;
++  fds[0].events = POLLIN;
++
++  printf("KEY2 button monitor started\n");
++
++  while (1)
++    {
++      int ret = poll(fds, 1, POLL_DELAY_MS);
++      if (ret > 0 && (fds[0].revents & POLLIN))
++        {
++          btn_buttonset_t sample;
++          read(fd, &sample, sizeof(sample));
++
++          /* KEY2 is bit 0, active high */
++
++          if (sample & 0x01)
++            {
++              struct timespec now;
++              clock_gettime(CLOCK_MONOTONIC, &now);
++
++              /* Debounce: ignore if less than DEBOUNCE_MS since last press */
++
++              long diff_ms = (now.tv_sec - last_press.tv_sec) * 1000 +
++                             (now.tv_nsec - last_press.tv_nsec) / 1000000;
++
++              if (diff_ms >= DEBOUNCE_MS)
++                {
++                  printf("KEY2 pressed! Toggling BT state\n");
++
++                  /* Toggle Bluetooth state and set flag for main loop */
++
++                  g_bt_state = !g_bt_state;
++                  g_key_pressed = true;
++                  last_press = now;
++                }
++            }
++        }
++    }
++
++  close(fd);
++  return NULL;
++}
++
++/****************************************************************************
++ * Name: create_ui
++ *
++ * Description:
++ *   Create the LVGL UI with title, time placeholder, and BT status
++ *
++ ****************************************************************************/
++
++static void create_ui(void)
++{
++  /* Get active screen */
++
++  lv_obj_t *scr = lv_scr_act();
++
++  /* Set screen background to black */
++
++  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
++
++  /* Title label - "AI Watch" */
++
++  g_title_label = lv_label_create(scr);
++  lv_label_set_text(g_title_label, "AI Watch");
++  lv_obj_set_style_text_color(g_title_label, lv_color_white(), 0);
++  lv_obj_set_style_text_font(g_title_label, &lv_font_montserrat_28, 0);
++  lv_obj_align(g_title_label, LV_ALIGN_TOP_MID, 0, 60);
++
++  /* Time placeholder label */
++
++  g_time_label = lv_label_create(scr);
++  lv_label_set_text(g_time_label, "--:--:--");
++  lv_obj_set_style_text_color(g_time_label, lv_color_white(), 0);
++  lv_obj_set_style_text_font(g_time_label, &lv_font_montserrat_24, 0);
++  lv_obj_align(g_time_label, LV_ALIGN_CENTER, 0, 0);
++
++  /* Bluetooth status label */
++
++  g_bt_label = lv_label_create(scr);
++  lv_label_set_text(g_bt_label, "BT: OFF");
++  lv_obj_set_style_text_color(g_bt_label, lv_color_make(0, 191, 255), 0);
++  lv_obj_set_style_text_font(g_bt_label, &lv_font_montserrat_20, 0);
++  lv_obj_align(g_bt_label, LV_ALIGN_BOTTOM_MID, 0, -60);
++}
+ 
+ /****************************************************************************
+  * Public Functions
+@@ -41,7 +246,111 @@
+ 
+ int main(int argc, FAR char *argv[])
+ {
++  lv_nuttx_dsc_t info;
++  lv_nuttx_result_t result;
++  pthread_t btn_thread;
++  pthread_t time_tid;
++  int ret;
++
+   printf("AI Watch version %s\n", AI_WATCH_VERSION);
+   printf("ai_watch started\n");
++
++  /* Initialize LVGL */
++
++  lv_init();
++  lv_nuttx_dsc_init(&info);
++  info.fb_path = "/dev/lcd0";
++
++  lv_nuttx_init(&info, &result);
++
++  if (result.disp == NULL)
++    {
++      printf("ERROR: LVGL initialization failed!\n");
++      return 1;
++    }
++
++  printf("LVGL initialized, display ready\n");
++
++  /* Create UI */
++
++  create_ui();
++  printf("UI created\n");
++
++  /* Start button monitoring thread */
++
++  ret = pthread_create(&btn_thread, NULL, button_thread, NULL);
++  if (ret != 0)
++    {
++      printf("ERROR: Failed to create button thread: %d\n", ret);
++    }
++  else
++    {
++      printf("Button thread started\n");
++    }
++
++  /* Start time update thread */
++
++  ret = pthread_create(&time_tid, NULL, time_thread, NULL);
++  if (ret != 0)
++    {
++      printf("ERROR: Failed to create time thread: %d\n", ret);
++    }
++  else
++    {
++      printf("Time thread started\n");
++    }
++
++  /* Main LVGL event loop */
++
++  printf("Entering main loop\n");
++
++  while (1)
++    {
++      uint32_t idle;
++
++      /* Check if time needs update */
++
++      if (g_time_update)
++        {
++          g_time_update = false;
++
++          if (g_time_label != NULL)
++            {
++              lv_label_set_text(g_time_label, g_time_str);
++            }
++        }
++
++      /* Check if KEY2 was pressed and update UI in LVGL context */
++
++      if (g_key_pressed)
++        {
++          g_key_pressed = false;
++
++          if (g_bt_label != NULL)
++            {
++              if (g_bt_state)
++                {
++                  lv_label_set_text(g_bt_label, "BT: ON");
++                }
++              else
++                {
++                  lv_label_set_text(g_bt_label, "BT: OFF");
++                }
++            }
++        }
++
++      idle = lv_timer_handler();
++
++      /* Minimum sleep of 1ms */
++
++      idle = idle ? idle : 1;
++      usleep(idle * 1000);
++    }
++
++  /* Cleanup (never reached) */
++
++  lv_nuttx_deinit(&result);
++  lv_deinit();
++
+   return 0;
+ }
+-- 
+2.34.1
+

@@ -1,0 +1,30 @@
+From abd81dc850295b7b07c9f8a5425bb0033ed221f7 Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Mon, 24 Aug 2026 19:24:09 +0800
+Subject: [PATCH 3/4] fix(ai_watch): increase stack size to 34000 for LVGL
+
+- LVGL requires 32768+ bytes stack
+- Actual stack size is 104 bytes less than configured value
+- Increase to 34000 to ensure sufficient stack for LVGL
+
+Fix: screen not displaying due to stack overflow
+---
+ examples/ai_watch/Kconfig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/examples/ai_watch/Kconfig b/examples/ai_watch/Kconfig
+index cef17f837..cf2fd43e3 100644
+--- a/examples/ai_watch/Kconfig
++++ b/examples/ai_watch/Kconfig
+@@ -24,7 +24,7 @@ config EXAMPLES_AI_WATCH_PRIORITY
+ 
+ config EXAMPLES_AI_WATCH_STACKSIZE
+ 	int "AI Watch stack size"
+-	default 32768
++	default 34000
+ 
+ config EXAMPLES_AI_WATCH_HEAPSIZE
+ 	int "AI Watch heap size"
+-- 
+2.34.1
+

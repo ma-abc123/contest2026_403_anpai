@@ -1,0 +1,297 @@
+# 第 2 个开发日清单：完成 M1 最小项目闭环
+
+原计划中的“第 2 天官方基线”已经在 M0 全部完成。今天直接进入 M1，优先完成 `ai_watch` 项目骨架、独立配置、编译、烧录和 NSH 验收，不同时展开完整 UI、触摸、BLE 和传感器功能。
+
+## 当前起点
+
+- [x] `/home/ma/openvela-sf32lb52` 已存在。
+- [x] `manifest-lock.xml` 已生成。
+- [x] `configs/ai_watch` 尚未创建。
+- [x] `apps/examples/ai_watch` 尚未创建。
+- [ ] `cmake_out/ai_watch` 尚未创建。
+- [x] `apps` 和 `vendor/sifli` 当前处于 detached HEAD，需要建立开发分支。
+- [ ] `apps/testing/drivers/nist-sts/` 下存在已有未跟踪内容。本次不得删除、修改或提交这些文件。
+
+## 1. 新终端先固定工具链
+
+每次打开新终端后，先执行以下命令。不要省略这一步，否则可能使用 Ubuntu apt 安装的 GCC 10.3，导致 LLVM 17 libc++ 编译失败。
+
+```bash
+export PATH="$HOME/opt/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
+
+command -v arm-none-eabi-gcc
+arm-none-eabi-gcc --version | head -1
+command -v olddefconfig
+command -v menuconfig
+command -v savedefconfig
+cmake --version | head -1
+ninja --version
+```
+
+验收：
+
+- [ ] `arm-none-eabi-gcc` 路径位于 `$HOME/opt/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi/bin/`。
+- [ ] 版本显示 `14.2.1`。
+- [ ] `olddefconfig`、`menuconfig` 和 `savedefconfig` 均能找到。
+
+如果 GCC 不是 14.2.1，立即停止，不要开始 CMake 配置或编译。
+
+## 2. 记录开发前状态
+
+```bash
+cd /home/ma/openvela-sf32lb52
+repo status
+
+git -C apps status --short --branch
+git -C vendor/sifli status --short --branch
+```
+
+- [ ] 确认当前已有修改和未跟踪文件。
+- [ ] 记录 `apps/testing/drivers/nist-sts/` 下的已有未跟踪内容。
+- [ ] 后续不覆盖、不删除、不提交与本任务无关的修改。
+
+## 3. 建立开发分支
+
+分别在实际需要修改的仓库建立 `contest/ai-watch` 分支：
+
+```bash
+cd /home/ma/openvela-sf32lb52
+
+git -C apps switch contest/ai-watch 2>/dev/null || \
+  git -C apps switch -c contest/ai-watch
+
+git -C vendor/sifli switch contest/ai-watch 2>/dev/null || \
+  git -C vendor/sifli switch -c contest/ai-watch
+
+git -C apps status --short --branch
+git -C vendor/sifli status --short --branch
+```
+
+- [x] `apps` 位于 `contest/ai-watch` 分支。
+- [x] `vendor/sifli` 位于 `contest/ai-watch` 分支。
+
+## 4. 建立独立板级配置
+
+```bash
+cd /home/ma/openvela-sf32lb52
+
+test ! -e \
+  vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch
+
+cp -a \
+  vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/nsh \
+  vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch
+```
+
+- [x] `configs/ai_watch` 已从官方 `configs/nsh` 复制。
+- [x] 官方 `configs/nsh` 保持不变。
+- [ ] 此时不要提前创建或配置 `cmake_out/ai_watch`。
+
+## 5. 创建最小 `ai_watch` 应用
+
+只创建以下四个文件：
+
+```text
+apps/examples/ai_watch/CMakeLists.txt
+apps/examples/ai_watch/Kconfig
+apps/examples/ai_watch/Makefile
+apps/examples/ai_watch/ai_watch_main.c
+```
+
+要求：
+
+- [x] 配置符号统一使用 `CONFIG_EXAMPLES_AI_WATCH`。
+- [x] NSH 命令名统一使用 `ai_watch`。
+- [x] 首版只打印应用名称、版本和启动成功信息。
+- [x] 暂不创建完整的 `ui/`、`services/`、`platform/` 等目录。
+- [x] 参考 `apps/examples/hello` 的最小构建结构。
+
+创建后检查：
+
+```bash
+cd /home/ma/openvela-sf32lb52
+
+test -f apps/examples/ai_watch/CMakeLists.txt
+test -f apps/examples/ai_watch/Kconfig
+test -f apps/examples/ai_watch/Makefile
+test -f apps/examples/ai_watch/ai_watch_main.c
+```
+
+## 6. 首次配置全新的构建目录
+
+必须先完成第 5 步，再执行本步骤。新构建目录必须带上完整的 `EXTRA_FLAGS`，否则 GCC 14 会在 vendor 旧代码和 LLVM 17 libc++ 上报错。
+
+先再次确认当前终端使用 GCC 14.2.1：
+
+```bash
+arm-none-eabi-gcc --version | head -1
+```
+
+确认 `cmake_out/ai_watch` 不存在：
+
+```bash
+cd /home/ma/openvela-sf32lb52
+test ! -e cmake_out/ai_watch
+```
+
+执行完整的首次配置命令：
+
+```bash
+cd /home/ma/openvela-sf32lb52
+
+cmake \
+  -B cmake_out/ai_watch \
+  -S "$PWD/nuttx" \
+  -GNinja \
+  -DBOARD_CONFIG=../vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch \
+  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=return-mismatch -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
+```
+
+- [x] CMake 配置成功。
+- [x] 配置日志确认使用 `arm-none-eabi-gcc` 14.2.1。
+- [ ] 不手工修改 `cmake_out/ai_watch/.config`。
+
+## 7. 启用应用配置并编译
+
+```bash
+cd /home/ma/openvela-sf32lb52/cmake_out/ai_watch
+ninja menuconfig
+```
+
+在 `menuconfig` 中搜索 `EXAMPLES_AI_WATCH` 并启用 `CONFIG_EXAMPLES_AI_WATCH`，然后保存退出。
+
+```bash
+cd /home/ma/openvela-sf32lb52/cmake_out/ai_watch
+ninja savedefconfig
+set -o pipefail
+ninja -j4 2>&1 | tee build-ai-watch.log
+```
+
+- [x] `CONFIG_EXAMPLES_AI_WATCH` 已启用。
+- [x] `ninja savedefconfig` 已更新 `configs/ai_watch/defconfig`。
+- [x] 不从构建目录手工复制 `defconfig`。
+- [x] 编译成功并生成 `cmake_out/ai_watch/nuttx.bin`。
+- [x] 完整编译日志已保存为 `cmake_out/ai_watch/build-ai-watch.log`。
+
+检查产物：
+
+```bash
+test -s /home/ma/openvela-sf32lb52/cmake_out/ai_watch/nuttx.bin
+ls -lh /home/ma/openvela-sf32lb52/cmake_out/ai_watch/nuttx.bin
+```
+
+## 8. 烧录固件
+
+先确认实际串口设备，再设置变量。下例假定设备为 `/dev/ttyUSB0`：
+
+```bash
+SF32_PORT=/dev/ttyUSB0
+test -c "$SF32_PORT"
+```
+
+关闭正在占用该串口的 Picocom，然后烧录：
+
+```bash
+cd /home/ma/openvela-sf32lb52
+
+sftool -c SF32LB52 -p "$SF32_PORT" -b 1000000 \
+  --before default_reset --after soft_reset \
+  write_flash cmake_out/ai_watch/nuttx.bin@0x12010000
+```
+
+- [x] 烧录成功。
+- [x] 板卡正常复位并启动。
+
+## 9. 使用正确的串口参数验收
+
+Picocom 必须带 `--omap crlf`，否则终端中回车可能无法执行 NSH 命令。
+
+```bash
+mkdir -p "$HOME/huangshan-logs"
+
+picocom \
+  --omap crlf \
+  -b 1000000 \
+  --noreset \
+  --lower-dtr \
+  --lower-rts \
+  --logfile "$HOME/huangshan-logs/ai-watch-$(date +%Y%m%d-%H%M%S).log" \
+  "$SF32_PORT"
+```
+
+进入 `nsh>` 后执行：
+
+```text
+nsh> ps
+```
+
+如果 Lyra `vapp` 已自动启动，确认其数字 PID 后停止它：
+
+```text
+nsh> kill -15 <vapp 的数字 PID>
+nsh> ps
+```
+
+然后运行项目应用：
+
+```text
+nsh> ai_watch
+```
+
+- [x] 串口输出应用名称和版本。
+- [x] 串口输出 `ai_watch started` 或含义等价的启动成功信息。
+- [x] 无 assertion、hard fault、崩溃或异常重启。
+- [ ] 串口日志已保存到 `$HOME/huangshan-logs/`。
+
+## 10. 整理并提交本次修改
+
+```bash
+cd /home/ma/openvela-sf32lb52
+
+git -C apps status --short
+git -C apps diff --check
+git -C apps diff
+
+git -C vendor/sifli status --short
+git -C vendor/sifli diff --check
+git -C vendor/sifli diff
+```
+
+- [x] `apps` 只提交 `apps/examples/ai_watch` 的本次修改。
+- [x] 不提交 `apps/testing/drivers/nist-sts/` 下的已有未跟踪内容。
+- [x] `vendor/sifli` 只提交 `configs/ai_watch` 的本次修改。
+- [x] 不把构建产物、构建日志或串口日志提交到源码仓库。
+- [x] `apps` 和 `vendor/sifli` 分别提交，不在 openvela 顶层执行一次笼统的 `git commit`。
+
+## 11. 有余力再做
+
+- [ ] 给 `ai_watch` 增加一个最简单的 LVGL 首页。
+- [ ] 首页只显示项目名、时间占位和蓝牙状态占位。
+- [ ] 直接读取 `/dev/buttons` 验证 KEY2，绕过已知有问题的 `buttons` 例程。
+- [ ] 按键触发一次可观察反馈，例如切换文字或打印事件。
+- [ ] 连续运行 30 分钟，记录启动前后的 `free` 输出。
+- [ ] 调查 Lyra 自动启动来源，但今天只确定处理方案，不大范围删除 QuickApp 配置。
+
+## 12. 当天完成标准
+
+最低完成标准：
+
+```text
+nsh> ai_watch
+ai_watch version ...
+ai_watch started
+```
+
+并同时满足：
+
+- [x] 当前终端使用 Arm GNU Toolchain 14.2.1。
+- [x] `configs/ai_watch` 独立存在，官方 `configs/nsh` 未改动。
+- [x] `CONFIG_EXAMPLES_AI_WATCH` 已写入项目 `defconfig`。
+- [x] 全新构建目录使用了完整 `EXTRA_FLAGS`。
+- [x] 固件能够重新编译、烧录和启动。
+- [x] 使用带 `--omap crlf` 的 Picocom 完成 NSH 验收。
+- [x] 串口无 assertion、fault 或异常重启。
+- [x] 修改已按 `apps` 和 `vendor/sifli` 分仓库整理。
+
+首页、按键和 30 分钟稳定性属于当天加分目标。触摸导航、多个页面、RTC 真正接入、BLE 和传感器留到后续阶段。

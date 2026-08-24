@@ -1,0 +1,37 @@
+From 31c9110f32df4f8f3ee547c09f57dbc015141c55 Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Mon, 24 Aug 2026 21:09:30 +0800
+Subject: [PATCH 3/3] fix(lckfb_huangshan_pi): preprocess AI Watch rcS
+
+---
+ boards/sf32lb52/lckfb_huangshan_pi/src/CMakeLists.txt | 2 +-
+ boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS | 5 +++++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/boards/sf32lb52/lckfb_huangshan_pi/src/CMakeLists.txt b/boards/sf32lb52/lckfb_huangshan_pi/src/CMakeLists.txt
+index b919ee1..e6d4823 100644
+--- a/boards/sf32lb52/lckfb_huangshan_pi/src/CMakeLists.txt
++++ b/boards/sf32lb52/lckfb_huangshan_pi/src/CMakeLists.txt
+@@ -41,7 +41,7 @@ nuttx_add_romfs(
+   etc/1.txt
+   ${HAP_FILES}
+   PATH
+-  ${CMAKE_CURRENT_LIST_DIR}/etc)
++  ${CMAKE_CURRENT_BINARY_DIR}/etc)
+ 
+ target_link_libraries(board PRIVATE romfs_etc)
+ 
+diff --git a/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS b/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS
+index b4f239f..7a1a6be 100644
+--- a/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS
++++ b/boards/sf32lb52/lckfb_huangshan_pi/src/etc/init.d/rcS
+@@ -1 +1,6 @@
++#include <nuttx/config.h>
++
+ sleep 3
++#ifndef CONFIG_EXAMPLES_AI_WATCH
++vapp "hap://app/com.application.lyra.demo" &
++#endif
+-- 
+2.34.1
+

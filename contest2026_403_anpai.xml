@@ -9,8 +9,7 @@
   <include name="openvela.xml"/>
 
   <project path="contest2026_403_anpai" name="contest2026_403_anpai">
-    <linkfile src="app/hello_app" dest="packages/demos/contest2026_403_hello_app"/>
-    <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_403_hello_quickapp"/>
-    <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_403_board"/>
+    <linkfile src="app/ai_watch" dest="apps/examples/ai_watch"/>
+    <linkfile src="board/ai_watch" dest="vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch"/>
   </project>
 </manifest>

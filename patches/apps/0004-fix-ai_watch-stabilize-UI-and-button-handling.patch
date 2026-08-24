@@ -1,0 +1,585 @@
+From e2dd06be60259d8351bca6348d41ebf603812867 Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Mon, 24 Aug 2026 21:09:17 +0800
+Subject: [PATCH 4/4] fix(ai_watch): stabilize UI and button handling
+
+---
+ examples/ai_watch/Kconfig         |   2 +-
+ examples/ai_watch/ai_watch_main.c | 457 +++++++++++++++---------------
+ 2 files changed, 222 insertions(+), 237 deletions(-)
+
+diff --git a/examples/ai_watch/Kconfig b/examples/ai_watch/Kconfig
+index cf2fd43e3..5bba576c4 100644
+--- a/examples/ai_watch/Kconfig
++++ b/examples/ai_watch/Kconfig
+@@ -24,7 +24,7 @@ config EXAMPLES_AI_WATCH_PRIORITY
+ 
+ config EXAMPLES_AI_WATCH_STACKSIZE
+ 	int "AI Watch stack size"
+-	default 34000
++	default 36864
+ 
+ config EXAMPLES_AI_WATCH_HEAPSIZE
+ 	int "AI Watch heap size"
+diff --git a/examples/ai_watch/ai_watch_main.c b/examples/ai_watch/ai_watch_main.c
+index 1eca5fcd0..8deec6d68 100644
+--- a/examples/ai_watch/ai_watch_main.c
++++ b/examples/ai_watch/ai_watch_main.c
+@@ -23,13 +23,17 @@
+  ****************************************************************************/
+ 
+ #include <nuttx/config.h>
+-#include <stdio.h>
+-#include <unistd.h>
++
++#include <errno.h>
+ #include <fcntl.h>
+-#include <poll.h>
+-#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <time.h>
++#include <unistd.h>
++
+ #include <nuttx/input/buttons.h>
+ 
+ #include <lvgl/lvgl.h>
+@@ -38,319 +42,300 @@
+  * Pre-processor Definitions
+  ****************************************************************************/
+ 
+-#define AI_WATCH_VERSION    "1.0.0"
+-#define BUTTON_DEVICE       "/dev/buttons"
+-#define POLL_DELAY_MS       100
+-#define DEBOUNCE_MS         200
++#define AI_WATCH_VERSION            "1.1.3"
++#define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
++#define AI_WATCH_BUTTON_KEY2        (1 << 0)
++#define AI_WATCH_BUTTON_POLL_MS     10
++#define AI_WATCH_BUTTON_RELEASE_MS  80
++#define AI_WATCH_RTC_MIN_YEAR       2020
+ 
+ /****************************************************************************
+- * Private Data
++ * Private Types
+  ****************************************************************************/
+ 
+-static lv_obj_t *g_title_label;
+-static lv_obj_t *g_time_label;
+-static lv_obj_t *g_bt_label;
+-static volatile bool g_bt_state = false;
+-static volatile bool g_key_pressed = false;
+-static volatile bool g_time_update = false;
+-static char g_time_str[32] = "--:--:--";
++struct ai_watch_s
++{
++  FAR lv_obj_t *time_label;
++  FAR lv_obj_t *date_label;
++  FAR lv_obj_t *bt_label;
++  int button_fd;
++  btn_buttonset_t supported_buttons;
++  struct timespec button_raw_since;
++  struct timespec next_button_poll;
++  time_t displayed_second;
++  bool button_raw_pressed;
++  bool button_armed;
++  bool bt_state;
++  bool rtc_valid;
++  bool rtc_warning_printed;
++};
+ 
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+ 
+-/****************************************************************************
+- * Name: time_thread
+- *
+- * Description:
+- *   Thread to read RTC time and update time string every second
+- *
+- ****************************************************************************/
+-
+-static FAR void *time_thread(FAR void *arg)
++static int64_t ai_watch_elapsed_ms(FAR const struct timespec *now,
++                                   FAR const struct timespec *then)
+ {
+-  struct timespec ts;
+-  struct tm tm;
++  return (int64_t)(now->tv_sec - then->tv_sec) * 1000 +
++         (now->tv_nsec - then->tv_nsec) / 1000000;
++}
+ 
+-  printf("Time update thread started\n");
++static bool ai_watch_deadline_reached(FAR const struct timespec *now,
++                                      FAR const struct timespec *deadline)
++{
++  return now->tv_sec > deadline->tv_sec ||
++         (now->tv_sec == deadline->tv_sec &&
++          now->tv_nsec >= deadline->tv_nsec);
++}
+ 
+-  /* Check if RTC time is set, if not set a default time */
++static void ai_watch_advance_deadline(FAR struct timespec *deadline,
++                                      long delay_ms)
++{
++  deadline->tv_nsec += delay_ms * 1000000;
++  deadline->tv_sec += deadline->tv_nsec / 1000000000;
++  deadline->tv_nsec %= 1000000000;
++}
+ 
+-  clock_gettime(CLOCK_REALTIME, &ts);
+-  localtime_r(&ts.tv_sec, &tm);
++static int ai_watch_button_initialize(FAR struct ai_watch_s *watch)
++{
++  btn_buttonset_t sample;
++  ssize_t nread;
++  int ret;
+ 
+-  if (tm.tm_year < (2020 - 1900))
++  watch->button_fd = open(AI_WATCH_BUTTON_DEVICE, O_RDONLY | O_NONBLOCK);
++  if (watch->button_fd < 0)
+     {
+-      printf("RTC not set, setting default time: 2026-08-24 18:00:00\n");
++      int errcode = errno;
+ 
+-      /* Set default time: 2026-08-24 18:00:00 */
+-
+-      struct tm default_tm = {0};
+-      default_tm.tm_year = 2026 - 1900;
+-      default_tm.tm_mon  = 8 - 1;
+-      default_tm.tm_mday = 24;
+-      default_tm.tm_hour = 18;
+-      default_tm.tm_min  = 0;
+-      default_tm.tm_sec  = 0;
+-
+-      ts.tv_sec = mktime(&default_tm);
+-      ts.tv_nsec = 0;
+-      clock_settime(CLOCK_REALTIME, &ts);
++      printf("ERROR: Failed to open %s: %d\n",
++             AI_WATCH_BUTTON_DEVICE, errcode);
++      return -errcode;
+     }
+ 
+-  /* Main time update loop */
+-
+-  while (1)
++  ret = ioctl(watch->button_fd, BTNIOC_SUPPORTED,
++              (unsigned long)((uintptr_t)&watch->supported_buttons));
++  if (ret < 0)
+     {
+-      clock_gettime(CLOCK_REALTIME, &ts);
+-      localtime_r(&ts.tv_sec, &tm);
+-
+-      /* Format as HH:MM:SS */
++      int errcode = errno;
+ 
+-      strftime(g_time_str, sizeof(g_time_str), "%H:%M:%S", &tm);
+-
+-      /* Set flag for main loop to update UI */
+-
+-      g_time_update = true;
++      printf("ERROR: BTNIOC_SUPPORTED failed: %d\n", errcode);
++      close(watch->button_fd);
++      watch->button_fd = -1;
++      return -errcode;
++    }
+ 
+-      /* Sleep for 1 second */
++  nread = read(watch->button_fd, &sample, sizeof(sample));
++  if (nread != sizeof(sample))
++    {
++      int errcode = nread < 0 ? errno : EIO;
+ 
+-      sleep(1);
++      printf("ERROR: Initial button read failed: %d\n", errcode);
++      close(watch->button_fd);
++      watch->button_fd = -1;
++      return -errcode;
+     }
+ 
+-  return NULL;
+-}
++  clock_gettime(CLOCK_MONOTONIC, &watch->next_button_poll);
++  watch->button_raw_since = watch->next_button_poll;
++  watch->button_raw_pressed = (sample & AI_WATCH_BUTTON_KEY2) != 0;
++  watch->button_armed = !watch->button_raw_pressed;
+ 
+-/****************************************************************************
+- * Name: button_thread
+- *
+- * Description:
+- *   Thread to monitor KEY2 button press via /dev/buttons
+- *
+- ****************************************************************************/
++  printf("Supported buttons: 0x%02lx\n",
++         (unsigned long)watch->supported_buttons);
++  printf("KEY2 button monitor started\n");
++  return OK;
++}
+ 
+-static FAR void *button_thread(FAR void *arg)
++static void ai_watch_button_update(FAR struct ai_watch_s *watch,
++                                   FAR const struct timespec *now)
+ {
+-  int fd;
+-  btn_buttonset_t supported;
+-  struct pollfd fds[1];
+-  struct timespec last_press = {0, 0};
++  btn_buttonset_t sample;
++  bool pressed;
++  ssize_t nread;
+ 
+-  fd = open(BUTTON_DEVICE, O_RDONLY | O_NONBLOCK);
+-  if (fd < 0)
++  if (watch->button_fd < 0 ||
++      !ai_watch_deadline_reached(now, &watch->next_button_poll))
+     {
+-      printf("ERROR: Failed to open %s: %d\n", BUTTON_DEVICE, errno);
+-      return NULL;
++      return;
+     }
+ 
+-  /* Query supported buttons */
+-
+-  ioctl(fd, BTNIOC_SUPPORTED, &supported);
+-  printf("Supported buttons: 0x%02lx\n", (unsigned long)supported);
+-
+-  /* Setup poll */
+-
+-  fds[0].fd = fd;
+-  fds[0].events = POLLIN;
++  watch->next_button_poll = *now;
++  ai_watch_advance_deadline(&watch->next_button_poll,
++                            AI_WATCH_BUTTON_POLL_MS);
+ 
+-  printf("KEY2 button monitor started\n");
+-
+-  while (1)
++  nread = read(watch->button_fd, &sample, sizeof(sample));
++  if (nread != sizeof(sample))
+     {
+-      int ret = poll(fds, 1, POLL_DELAY_MS);
+-      if (ret > 0 && (fds[0].revents & POLLIN))
++      if (nread < 0 && errno != EAGAIN && errno != EINTR)
+         {
+-          btn_buttonset_t sample;
+-          read(fd, &sample, sizeof(sample));
+-
+-          /* KEY2 is bit 0, active high */
+-
+-          if (sample & 0x01)
+-            {
+-              struct timespec now;
+-              clock_gettime(CLOCK_MONOTONIC, &now);
+-
+-              /* Debounce: ignore if less than DEBOUNCE_MS since last press */
+-
+-              long diff_ms = (now.tv_sec - last_press.tv_sec) * 1000 +
+-                             (now.tv_nsec - last_press.tv_nsec) / 1000000;
++          printf("ERROR: Button read failed: %d\n", errno);
++        }
+ 
+-              if (diff_ms >= DEBOUNCE_MS)
+-                {
+-                  printf("KEY2 pressed! Toggling BT state\n");
++      return;
++    }
+ 
+-                  /* Toggle Bluetooth state and set flag for main loop */
++  pressed = (sample & AI_WATCH_BUTTON_KEY2) != 0;
++  if (pressed != watch->button_raw_pressed)
++    {
++      watch->button_raw_pressed = pressed;
++      watch->button_raw_since = *now;
++    }
+ 
+-                  g_bt_state = !g_bt_state;
+-                  g_key_pressed = true;
+-                  last_press = now;
+-                }
+-            }
++  if (pressed)
++    {
++      if (watch->button_armed)
++        {
++          watch->button_armed = false;
++          watch->bt_state = !watch->bt_state;
++          lv_label_set_text(watch->bt_label,
++                            watch->bt_state ? "BT: ON" : "BT: OFF");
++          printf("KEY2 pressed: BT %s\n",
++                 watch->bt_state ? "ON" : "OFF");
+         }
+     }
+-
+-  close(fd);
+-  return NULL;
++  else if (ai_watch_elapsed_ms(now, &watch->button_raw_since) >=
++           AI_WATCH_BUTTON_RELEASE_MS)
++    {
++      watch->button_armed = true;
++    }
+ }
+ 
+-/****************************************************************************
+- * Name: create_ui
+- *
+- * Description:
+- *   Create the LVGL UI with title, time placeholder, and BT status
+- *
+- ****************************************************************************/
+-
+-static void create_ui(void)
++static void ai_watch_time_update(FAR struct ai_watch_s *watch)
+ {
+-  /* Get active screen */
+-
+-  lv_obj_t *scr = lv_scr_act();
+-
+-  /* Set screen background to black */
+-
+-  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
++  char date[32];
++  char time[16];
++  struct timespec ts;
++  struct tm tm;
+ 
+-  /* Title label - "AI Watch" */
++  if (clock_gettime(CLOCK_REALTIME, &ts) < 0 ||
++      localtime_r(&ts.tv_sec, &tm) == NULL ||
++      tm.tm_year + 1900 < AI_WATCH_RTC_MIN_YEAR)
++    {
++      if (!watch->rtc_warning_printed)
++        {
++          printf("RTC time is not set; waiting for time synchronization\n");
++          watch->rtc_warning_printed = true;
++        }
+ 
+-  g_title_label = lv_label_create(scr);
+-  lv_label_set_text(g_title_label, "AI Watch");
+-  lv_obj_set_style_text_color(g_title_label, lv_color_white(), 0);
+-  lv_obj_set_style_text_font(g_title_label, &lv_font_montserrat_28, 0);
+-  lv_obj_align(g_title_label, LV_ALIGN_TOP_MID, 0, 60);
++      if (watch->rtc_valid)
++        {
++          lv_label_set_text(watch->time_label, "--:--:--");
++          lv_label_set_text(watch->date_label, "Date not set");
++          watch->rtc_valid = false;
++        }
+ 
+-  /* Time placeholder label */
++      return;
++    }
+ 
+-  g_time_label = lv_label_create(scr);
+-  lv_label_set_text(g_time_label, "--:--:--");
+-  lv_obj_set_style_text_color(g_time_label, lv_color_white(), 0);
+-  lv_obj_set_style_text_font(g_time_label, &lv_font_montserrat_24, 0);
+-  lv_obj_align(g_time_label, LV_ALIGN_CENTER, 0, 0);
++  watch->rtc_valid = true;
++  if (ts.tv_sec == watch->displayed_second)
++    {
++      return;
++    }
+ 
+-  /* Bluetooth status label */
++  watch->displayed_second = ts.tv_sec;
++  strftime(time, sizeof(time), "%H:%M:%S", &tm);
++  strftime(date, sizeof(date), "%Y-%m-%d", &tm);
++  lv_label_set_text(watch->time_label, time);
++  lv_label_set_text(watch->date_label, date);
++}
+ 
+-  g_bt_label = lv_label_create(scr);
+-  lv_label_set_text(g_bt_label, "BT: OFF");
+-  lv_obj_set_style_text_color(g_bt_label, lv_color_make(0, 191, 255), 0);
+-  lv_obj_set_style_text_font(g_bt_label, &lv_font_montserrat_20, 0);
+-  lv_obj_align(g_bt_label, LV_ALIGN_BOTTOM_MID, 0, -60);
++static void ai_watch_create_ui(FAR struct ai_watch_s *watch)
++{
++  FAR lv_obj_t *screen = lv_scr_act();
++  FAR lv_obj_t *title;
++
++  lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
++
++  title = lv_label_create(screen);
++  lv_label_set_text(title, "AI Watch");
++  lv_obj_set_style_text_color(title, lv_color_white(), 0);
++  lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
++  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 55);
++
++  watch->time_label = lv_label_create(screen);
++  lv_label_set_text(watch->time_label, "--:--:--");
++  lv_obj_set_style_text_color(watch->time_label, lv_color_white(), 0);
++  lv_obj_set_style_text_font(watch->time_label, &lv_font_montserrat_24, 0);
++  lv_obj_align(watch->time_label, LV_ALIGN_CENTER, 0, -10);
++
++  watch->date_label = lv_label_create(screen);
++  lv_label_set_text(watch->date_label, "Date not set");
++  lv_obj_set_style_text_color(watch->date_label,
++                              lv_color_make(180, 180, 180), 0);
++  lv_obj_set_style_text_font(watch->date_label,
++                             &lv_font_montserrat_16, 0);
++  lv_obj_align_to(watch->date_label, watch->time_label,
++                  LV_ALIGN_OUT_BOTTOM_MID, 0, 12);
++
++  watch->bt_label = lv_label_create(screen);
++  lv_label_set_text(watch->bt_label, "BT: OFF");
++  lv_obj_set_style_text_color(watch->bt_label,
++                              lv_color_make(0, 191, 255), 0);
++  lv_obj_set_style_text_font(watch->bt_label,
++                             &lv_font_montserrat_20, 0);
++  lv_obj_align(watch->bt_label, LV_ALIGN_BOTTOM_MID, 0, -55);
+ }
+ 
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
+ 
+-/****************************************************************************
+- * ai_watch_main
+- ****************************************************************************/
+-
+ int main(int argc, FAR char *argv[])
+ {
+-  lv_nuttx_dsc_t info;
+   lv_nuttx_result_t result;
+-  pthread_t btn_thread;
+-  pthread_t time_tid;
+-  int ret;
++  lv_nuttx_dsc_t info;
++  struct ai_watch_s watch =
++  {
++    .button_fd = -1,
++    .displayed_second = -1,
++  };
+ 
+   printf("AI Watch version %s\n", AI_WATCH_VERSION);
+   printf("ai_watch started\n");
+ 
+-  /* Initialize LVGL */
++  if (lv_is_initialized())
++    {
++      printf("ERROR: LVGL is already initialized\n");
++      return EXIT_FAILURE;
++    }
+ 
+   lv_init();
+   lv_nuttx_dsc_init(&info);
+   info.fb_path = "/dev/lcd0";
+-
+   lv_nuttx_init(&info, &result);
+ 
+   if (result.disp == NULL)
+     {
+-      printf("ERROR: LVGL initialization failed!\n");
+-      return 1;
++      printf("ERROR: LVGL initialization failed\n");
++      lv_deinit();
++      return EXIT_FAILURE;
+     }
+ 
+   printf("LVGL initialized, display ready\n");
++  ai_watch_create_ui(&watch);
++  ai_watch_time_update(&watch);
++  ai_watch_button_initialize(&watch);
++  printf("UI created; entering main loop\n");
+ 
+-  /* Create UI */
+-
+-  create_ui();
+-  printf("UI created\n");
+-
+-  /* Start button monitoring thread */
+-
+-  ret = pthread_create(&btn_thread, NULL, button_thread, NULL);
+-  if (ret != 0)
+-    {
+-      printf("ERROR: Failed to create button thread: %d\n", ret);
+-    }
+-  else
+-    {
+-      printf("Button thread started\n");
+-    }
+-
+-  /* Start time update thread */
+-
+-  ret = pthread_create(&time_tid, NULL, time_thread, NULL);
+-  if (ret != 0)
+-    {
+-      printf("ERROR: Failed to create time thread: %d\n", ret);
+-    }
+-  else
+-    {
+-      printf("Time thread started\n");
+-    }
+-
+-  /* Main LVGL event loop */
+-
+-  printf("Entering main loop\n");
+-
+-  while (1)
++  for (; ; )
+     {
++      struct timespec now;
+       uint32_t idle;
+ 
+-      /* Check if time needs update */
+-
+-      if (g_time_update)
+-        {
+-          g_time_update = false;
+-
+-          if (g_time_label != NULL)
+-            {
+-              lv_label_set_text(g_time_label, g_time_str);
+-            }
+-        }
+-
+-      /* Check if KEY2 was pressed and update UI in LVGL context */
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      ai_watch_button_update(&watch, &now);
++      ai_watch_time_update(&watch);
+ 
+-      if (g_key_pressed)
++      idle = lv_timer_handler();
++      if (idle == 0 || idle > AI_WATCH_BUTTON_POLL_MS)
+         {
+-          g_key_pressed = false;
+-
+-          if (g_bt_label != NULL)
+-            {
+-              if (g_bt_state)
+-                {
+-                  lv_label_set_text(g_bt_label, "BT: ON");
+-                }
+-              else
+-                {
+-                  lv_label_set_text(g_bt_label, "BT: OFF");
+-                }
+-            }
++          idle = AI_WATCH_BUTTON_POLL_MS;
+         }
+ 
+-      idle = lv_timer_handler();
+-
+-      /* Minimum sleep of 1ms */
+-
+-      idle = idle ? idle : 1;
+       usleep(idle * 1000);
+     }
+ 
+-  /* Cleanup (never reached) */
+-
+-  lv_nuttx_deinit(&result);
+-  lv_deinit();
+-
+-  return 0;
++  return EXIT_SUCCESS;
+ }
+-- 
+2.34.1
+

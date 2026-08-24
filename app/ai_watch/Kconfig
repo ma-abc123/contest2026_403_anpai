@@ -1,0 +1,34 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config EXAMPLES_AI_WATCH
+	tristate "AI Watch application"
+	default n
+	---help---
+		Enable the AI Watch wrist assistant application
+
+if EXAMPLES_AI_WATCH
+
+config EXAMPLES_AI_WATCH_PROGNAME
+	string "Program name"
+	default "ai_watch"
+	---help---
+		This is the name of the program that will be used when the NSH ELF
+		program is installed.
+
+config EXAMPLES_AI_WATCH_PRIORITY
+	int "AI Watch task priority"
+	default 100
+
+config EXAMPLES_AI_WATCH_STACKSIZE
+	int "AI Watch stack size"
+	default 36864
+
+config EXAMPLES_AI_WATCH_HEAPSIZE
+	int "AI Watch heap size"
+	depends on MM_TASK_HEAP
+	default MM_TASK_HEAP_DEFAULT_SIZE
+
+endif

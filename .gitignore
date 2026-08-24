@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+out/
+*.o
+*.a
+*.elf
+*.hex
+*.map
+
+# Editor and local files
+*.swp
+*.tmp
+.vscode/
+
+# Keep official AI Coding logs tracked.
+!logs/
+!logs/**

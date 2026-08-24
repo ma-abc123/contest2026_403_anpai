@@ -1,0 +1,29 @@
+From a2afa86088b4bcb3161bf27655690384925fbcca Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Sun, 23 Aug 2026 22:32:05 +0800
+Subject: [PATCH] runtimes/feature: fix ill-formed const rvalue-ref move ctor
+
+FeatureArray's move constructor was declared 'const FeatureArray&&'
+while its body assigns other.p_ = nullptr. No standard-conforming
+compiler accepts this (GCC 14 rejects the build outright). Drop the
+stray const so the move constructor can actually take ownership.
+---
+ src/utils/feature_utils.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/utils/feature_utils.h b/src/utils/feature_utils.h
+index 8b9456b..c578fd7 100644
+--- a/src/utils/feature_utils.h
++++ b/src/utils/feature_utils.h
+@@ -209,7 +209,7 @@ public:
+         p_ = FeatureInstanceDupValue(other.p_);
+     }
+ 
+-    FeatureArray(const FeatureArray&& other)
++    FeatureArray(FeatureArray&& other)
+     {
+         p_ = other.p_;
+         other.p_ = nullptr;
+-- 
+2.34.1
+

@@ -1,0 +1,231 @@
+From b75cb951639f7379a248b4cebc0d9eae336b76ab Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Mon, 24 Aug 2026 16:57:52 +0800
+Subject: [PATCH 1/4] feat(ai_watch): add minimal AI Watch application skeleton
+
+- Create apps/examples/ai_watch with standard NuttX app structure
+- Add Kconfig, CMakeLists.txt, Makefile, Make.defs, ai_watch_main.c
+- Define CONFIG_EXAMPLES_AI_WATCH configuration symbol
+- App prints version and startup message on NSH
+
+Milestone: M1 minimal project closure
+---
+ examples/ai_watch/CMakeLists.txt  | 35 +++++++++++++++++++++++
+ examples/ai_watch/Kconfig         | 34 ++++++++++++++++++++++
+ examples/ai_watch/Make.defs       | 23 +++++++++++++++
+ examples/ai_watch/Makefile        | 35 +++++++++++++++++++++++
+ examples/ai_watch/ai_watch_main.c | 47 +++++++++++++++++++++++++++++++
+ 5 files changed, 174 insertions(+)
+ create mode 100644 examples/ai_watch/CMakeLists.txt
+ create mode 100644 examples/ai_watch/Kconfig
+ create mode 100644 examples/ai_watch/Make.defs
+ create mode 100644 examples/ai_watch/Makefile
+ create mode 100644 examples/ai_watch/ai_watch_main.c
+
+diff --git a/examples/ai_watch/CMakeLists.txt b/examples/ai_watch/CMakeLists.txt
+new file mode 100644
+index 000000000..5721914c0
+--- /dev/null
++++ b/examples/ai_watch/CMakeLists.txt
+@@ -0,0 +1,35 @@
++# ##############################################################################
++# apps/examples/ai_watch/CMakeLists.txt
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more contributor
++# license agreements.  See the NOTICE file distributed with this work for
++# additional information regarding copyright ownership.  The ASF licenses this
++# file to you under the Apache License, Version 2.0 (the "License"); you may not
++# use this file except in compliance with the License.  You may obtain a copy of
++# the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++# License for the specific language governing permissions and limitations under
++# the License.
++#
++# ##############################################################################
++
++if(CONFIG_EXAMPLES_AI_WATCH)
++  nuttx_add_application(
++    MODULE
++    ${CONFIG_EXAMPLES_AI_WATCH}
++    NAME
++    ${CONFIG_EXAMPLES_AI_WATCH_PROGNAME}
++    SRCS
++    ai_watch_main.c
++    STACKSIZE
++    ${CONFIG_EXAMPLES_AI_WATCH_STACKSIZE}
++    HEAPSIZE
++    ${CONFIG_EXAMPLES_AI_WATCH_HEAPSIZE}
++    PRIORITY
++    ${CONFIG_EXAMPLES_AI_WATCH_PRIORITY})
++endif()
+diff --git a/examples/ai_watch/Kconfig b/examples/ai_watch/Kconfig
+new file mode 100644
+index 000000000..a1261d436
+--- /dev/null
++++ b/examples/ai_watch/Kconfig
+@@ -0,0 +1,34 @@
++#
++# For a description of the syntax of this configuration file,
++# see the file kconfig-language.txt in the NuttX tools repository.
++#
++
++config EXAMPLES_AI_WATCH
++	tristate "AI Watch application"
++	default n
++	---help---
++		Enable the AI Watch wrist assistant application
++
++if EXAMPLES_AI_WATCH
++
++config EXAMPLES_AI_WATCH_PROGNAME
++	string "Program name"
++	default "ai_watch"
++	---help---
++		This is the name of the program that will be used when the NSH ELF
++		program is installed.
++
++config EXAMPLES_AI_WATCH_PRIORITY
++	int "AI Watch task priority"
++	default 100
++
++config EXAMPLES_AI_WATCH_STACKSIZE
++	int "AI Watch stack size"
++	default DEFAULT_TASK_STACKSIZE
++
++config EXAMPLES_AI_WATCH_HEAPSIZE
++	int "AI Watch heap size"
++	depends on MM_TASK_HEAP
++	default MM_TASK_HEAP_DEFAULT_SIZE
++
++endif
+diff --git a/examples/ai_watch/Make.defs b/examples/ai_watch/Make.defs
+new file mode 100644
+index 000000000..5e281c87b
+--- /dev/null
++++ b/examples/ai_watch/Make.defs
+@@ -0,0 +1,23 @@
++############################################################################
++# apps/examples/ai_watch/Make.defs
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.  The
++# ASF licenses this file to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance with the
++# License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++# License for the specific language governing permissions and limitations
++# under the License.
++#
++############################################################################
++
++ifneq ($(CONFIG_EXAMPLES_AI_WATCH),)
++CONFIGURED_APPS += $(APPDIR)/examples/ai_watch
++endif
+diff --git a/examples/ai_watch/Makefile b/examples/ai_watch/Makefile
+new file mode 100644
+index 000000000..d235d1b44
+--- /dev/null
++++ b/examples/ai_watch/Makefile
+@@ -0,0 +1,35 @@
++############################################################################
++# apps/examples/ai_watch/Makefile
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.  The
++# ASF licenses this file to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance with the
++# License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++# License for the specific language governing permissions and limitations
++# under the License.
++#
++############################################################################
++
++include $(APPDIR)/Make.defs
++
++# AI Watch built-in application info
++
++PROGNAME  = $(CONFIG_EXAMPLES_AI_WATCH_PROGNAME)
++PRIORITY  = $(CONFIG_EXAMPLES_AI_WATCH_PRIORITY)
++STACKSIZE = $(CONFIG_EXAMPLES_AI_WATCH_STACKSIZE)
++HEAPSIZE  = $(CONFIG_EXAMPLES_AI_WATCH_HEAPSIZE)
++MODULE    = $(CONFIG_EXAMPLES_AI_WATCH)
++
++# AI Watch Application
++
++MAINSRC = ai_watch_main.c
++
++include $(APPDIR)/Application.mk
+diff --git a/examples/ai_watch/ai_watch_main.c b/examples/ai_watch/ai_watch_main.c
+new file mode 100644
+index 000000000..8f52b950f
+--- /dev/null
++++ b/examples/ai_watch/ai_watch_main.c
+@@ -0,0 +1,47 @@
++/****************************************************************************
++ * apps/examples/ai_watch/ai_watch_main.c
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.  The
++ * ASF licenses this file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the
++ * License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++#include <stdio.h>
++
++/****************************************************************************
++ * Preprocessor Definitions
++ ****************************************************************************/
++
++#define AI_WATCH_VERSION "1.0.0"
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * ai_watch_main
++ ****************************************************************************/
++
++int main(int argc, FAR char *argv[])
++{
++  printf("AI Watch version %s\n", AI_WATCH_VERSION);
++  printf("ai_watch started\n");
++  return 0;
++}
+-- 
+2.34.1
+
