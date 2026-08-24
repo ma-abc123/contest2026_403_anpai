@@ -7,6 +7,7 @@
 - 远程备份提交：`10071eef9bbccb51f9950dfad2a55b4ee2f5d3f3`。
 - 远程分支：<https://github.com/ma-abc123/contest2026_403_anpai/tree/contest/ai-watch>
 - 该分支目前仅为个人 Fork 中的开发备份，尚未向组委会仓库发起或合入参赛 PR。
+- 2026-08-25：新工作区已完成 `repo sync`，AI Watch 的应用和板级配置软链接已生效。
 
 ## 唯一工作区
 
@@ -34,6 +35,25 @@
 | `board/ai_watch/` | `vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch/` |
 
 修改应用和 defconfig 时，直接编辑专属仓中的源目录。编译树中的映射路径不作为提交位置。
+
+## 本机 Manifest 配置
+
+本工作区的 `.repo/local_manifests/contest403.xml` 会覆盖组委会模板中的默认 `hello_app` 映射，并固定专属仓到当前已验证的提交：
+
+```text
+f67e3110898b63e5496c9ced70568cd703490fdf
+```
+
+该文件仅作用于本机工作区，不提交到参赛仓。它避免后续 `repo sync` 将映射还原为模板目录。
+
+以后参赛仓产生并推送新的提交后，如需让 `repo sync` 固定到新版本，应将此文件中的 `revision` 更新为新的完整提交号，再运行：
+
+```bash
+cd /home/ma/openvela-contest403
+repo sync -l contest2026_403_anpai
+```
+
+正常日常开发不需要执行这条命令；只在修改本机 manifest 或需要重新生成软链接时使用。
 
 ## 公共仓改动
 
@@ -66,6 +86,15 @@ git am ../../../contest2026_403_anpai/patches/frameworks-runtimes-feature/*.patc
 - 作品应用、作品专用配置、README、开发文档和 AI 日志：提交到 `contest2026_403_anpai`。
 - 对现有公共源码文件的修改：提交到对应公共仓分支，并向 `dev-ai-contest-2026` 发起 PR。
 - 编译产物、下载缓存、密钥和无关测试文件：不提交。
+
+`repo status` 可能显示以下本机状态，均不应提交到公共源码仓：
+
+- `.claude/settings.local.json`：本机 AI 工具权限设置。
+- `apps/examples/ai_watch`：从参赛仓映射出的应用软链接。
+- `vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch`：从参赛仓映射出的板级配置软链接。
+- `apps/testing/drivers/nist-sts`：上游嵌套仓检出状态提示；本次同步已完成，不要为消除提示而手工删除其文件。
+
+因此不要在 `apps/` 或 `vendor/sifli/` 下执行 `git add .`。应用和 defconfig 的提交只在 `contest2026_403_anpai/` 目录完成。
 
 ## 磁盘处理
 
