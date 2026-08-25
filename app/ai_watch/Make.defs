@@ -1,5 +1,5 @@
 ############################################################################
-# apps/examples/ai_watch/Make.defs
+# packages/demos/contest2026_403_ai_watch/Make.defs
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -19,5 +19,5 @@
 ############################################################################
 
 ifneq ($(CONFIG_EXAMPLES_AI_WATCH),)
-CONFIGURED_APPS += $(APPDIR)/examples/ai_watch
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_403_ai_watch
 endif

@@ -31,18 +31,14 @@
 
 | 专属仓源目录 | openvela 编译树目录 |
 | --- | --- |
-| `app/ai_watch/` | `apps/examples/ai_watch/` |
-| `board/ai_watch/` | `vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch/` |
+| `app/ai_watch/` | `packages/demos/contest2026_403_ai_watch/` |
+| `board/ai_watch/` | `vendor/openvela/boards/contest2026_403_ai_watch/` |
 
-修改应用和 defconfig 时，直接编辑专属仓中的源目录。编译树中的映射路径不作为提交位置。
+修改应用和 defconfig 时，直接编辑专属仓中的源目录。编译树中的映射路径不作为提交位置。`board/ai_watch/configs/ai_watch/defconfig` 是作品拥有的配置文件，但继续复用现有 SiFli 黄山派 BSP。
 
 ## 本机 Manifest 配置
 
-本工作区的 `.repo/local_manifests/contest403.xml` 会覆盖组委会模板中的默认 `hello_app` 映射，并固定专属仓到当前已验证的提交：
-
-```text
-f67e3110898b63e5496c9ced70568cd703490fdf
-```
+本工作区的 `.repo/local_manifests/contest403.xml` 会覆盖组委会模板中的默认 `hello_app` 映射，并固定专属仓到已经过本机软链接验证的提交。
 
 该文件仅作用于本机工作区，不提交到参赛仓。它避免后续 `repo sync` 将映射还原为模板目录。
 
@@ -60,7 +56,7 @@ repo sync -l contest2026_403_anpai
 旧工作区中的 Git 提交已完整导出到 `patches/`，用于保留历史和恢复公共仓修改：
 
 - `patches/apps/`：旧应用提交的完整历史备份。应用源码已迁入 `app/ai_watch/`，正常情况下不要再应用这些补丁。
-- `patches/vendor-sifli/0001-*`：旧板级 defconfig 提交备份。defconfig 已迁入 `board/ai_watch/`，正常情况下不要应用此补丁。
+- `patches/vendor-sifli/0001-*`：旧板级 defconfig 提交备份。defconfig 已迁入 `board/ai_watch/configs/ai_watch/`，正常情况下不要应用此补丁。
 - `patches/vendor-sifli/0002-*` 和 `0003-*`：修改现有 SiFli 启动文件，需要恢复到新工作区的 `vendor/sifli` 分支，并最终向公共仓提交 PR。
 - `patches/frameworks-runtimes-feature/`：通用编译修复，需要恢复到新工作区的 `frameworks/runtimes/feature` 分支，并最终向公共仓提交 PR。
 
@@ -90,11 +86,11 @@ git am ../../../contest2026_403_anpai/patches/frameworks-runtimes-feature/*.patc
 `repo status` 可能显示以下本机状态，均不应提交到公共源码仓：
 
 - `.claude/settings.local.json`：本机 AI 工具权限设置。
-- `apps/examples/ai_watch`：从参赛仓映射出的应用软链接。
-- `vendor/sifli/boards/sf32lb52/lckfb_huangshan_pi/configs/ai_watch`：从参赛仓映射出的板级配置软链接。
+- `packages/demos/contest2026_403_ai_watch`：从参赛仓映射出的应用软链接。
+- `vendor/openvela/boards/contest2026_403_ai_watch`：从参赛仓映射出的板级配置软链接。
 - `apps/testing/drivers/nist-sts`：上游嵌套仓检出状态提示；本次同步已完成，不要为消除提示而手工删除其文件。
 
-因此不要在 `apps/` 或 `vendor/sifli/` 下执行 `git add .`。应用和 defconfig 的提交只在 `contest2026_403_anpai/` 目录完成。
+因此不要在 `packages/`、`vendor/openvela/` 或 `vendor/sifli/` 下执行 `git add .`。应用和 defconfig 的提交只在 `contest2026_403_anpai/` 目录完成。
 
 ## 磁盘处理
 
