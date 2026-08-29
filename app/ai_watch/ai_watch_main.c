@@ -41,12 +41,13 @@
 #include <lvgl/src/drivers/nuttx/lv_nuttx_touchscreen.h>
 
 #include "ai_watch_icons.h"
+#include "ai_watch_ble.h"
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.0.0"
+#define AI_WATCH_VERSION            "4.1.0"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -212,6 +213,7 @@ struct ai_watch_s
   FAR lv_obj_t *bt_switch;
   FAR lv_obj_t *theme_roller;
   FAR lv_obj_t *about_label;
+  FAR lv_obj_t *ble_state_label;
 
   /* Display objects - Dynamic app page */
 
@@ -256,9 +258,10 @@ struct ai_watch_s
 
   /* Application state */
 
-  bool bt_state;
   bool settings_bt_enabled;
   int current_theme;
+
+  /* BLE state is owned by ai_watch_ble.c; poll ai_watch_ble_get_state() */
 
   /* Timer state */
 
@@ -277,8 +280,7 @@ static void ai_watch_open_app(FAR struct ai_watch_s *watch, int app_index);
 
 /* Theme / state */
 
-static void ai_watch_update_bt_state(FAR struct ai_watch_s *watch,
-                                     bool new_state);
+static void ai_watch_update_bt_label(FAR struct ai_watch_s *watch);
 static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme);
 
 /* UI creation */
@@ -292,6 +294,21 @@ static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch);
 static void ai_watch_create_timer_app(FAR struct ai_watch_s *watch);
 static void ai_watch_destroy_timer_app(FAR struct ai_watch_s *watch);
 static void ai_watch_timer_update_cb(FAR lv_timer_t *timer);
+
+/* Reminder app */
+
+static void ai_watch_create_reminder_app(FAR struct ai_watch_s *watch);
+static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch);
+
+/* DHT22 sensor app */
+
+static void ai_watch_create_dht_app(FAR struct ai_watch_s *watch);
+static void ai_watch_destroy_dht_app(FAR struct ai_watch_s *watch);
+
+/* MAX30102 heart rate / SpO2 app */
+
+static void ai_watch_create_hr_app(FAR struct ai_watch_s *watch);
+static void ai_watch_destroy_hr_app(FAR struct ai_watch_s *watch);
 
 /* Time */
 
@@ -326,13 +343,27 @@ static const struct ai_app_desc_s g_app_registry[] =
     "Reminder",
     { &icon_reminder_t0, &icon_reminder_t1, &icon_reminder_t2,
       &icon_reminder_t3, &icon_reminder_t4 },
-    NULL, NULL, false
+    ai_watch_create_reminder_app, ai_watch_destroy_reminder_app, true
   },
   {
     "Settings",
     { &icon_settings_t0, &icon_settings_t1, &icon_settings_t2,
       &icon_settings_t3, &icon_settings_t4 },
     NULL, NULL, true
+  },
+  {
+    "Temp & Humidity",
+    { &icon_temp_humidity_t0, &icon_temp_humidity_t1,
+      &icon_temp_humidity_t2, &icon_temp_humidity_t3,
+      &icon_temp_humidity_t4 },
+    ai_watch_create_dht_app, ai_watch_destroy_dht_app, true
+  },
+  {
+    "Heart Rate",
+    { &icon_heart_rate_t0, &icon_heart_rate_t1,
+      &icon_heart_rate_t2, &icon_heart_rate_t3,
+      &icon_heart_rate_t4 },
+    ai_watch_create_hr_app, ai_watch_destroy_hr_app, true
   },
 };
 
@@ -1002,8 +1033,22 @@ static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
               lv_obj_set_style_text_color(
                   child, ai_watch_theme_secondary(theme), 0);
             }
-          else if (child != watch->bt_switch &&
-                   child != watch->theme_roller)
+          else if (child == watch->ble_state_label)
+            {
+              lv_obj_set_style_text_color(
+                  child, ai_watch_theme_accent(theme), 0);
+            }
+          else if (child == watch->bt_switch)
+            {
+              lv_obj_set_style_bg_color(watch->bt_switch,
+                                        ai_watch_theme_secondary(theme),
+                                        LV_PART_MAIN);
+              lv_obj_set_style_bg_color(watch->bt_switch,
+                                        ai_watch_theme_accent(theme),
+                                        LV_PART_INDICATOR |
+                                        LV_STATE_CHECKED);
+            }
+          else if (child != watch->theme_roller)
             {
               lv_obj_set_style_text_color(
                   child, ai_watch_theme_text(theme), 0);
@@ -1016,28 +1061,17 @@ static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
  * Private Functions - State Management
  ****************************************************************************/
 
-static void ai_watch_update_bt_state(FAR struct ai_watch_s *watch,
-                                     bool new_state)
+static void ai_watch_update_bt_label(FAR struct ai_watch_s *watch)
 {
-  watch->bt_state = new_state;
-  watch->settings_bt_enabled = new_state;
+  FAR const char *text;
 
-  lv_label_set_text(watch->bt_label,
-                    watch->bt_state ? "BT: ON" : "BT: OFF");
+  text = ai_watch_ble_get_status_text(ai_watch_ble_get_state());
+  lv_label_set_text(watch->bt_label, text);
 
-  if (watch->bt_switch != NULL)
+  if (watch->ble_state_label != NULL)
     {
-      if (watch->bt_state)
-        {
-          lv_obj_add_state(watch->bt_switch, LV_STATE_CHECKED);
-        }
-      else
-        {
-          lv_obj_clear_state(watch->bt_switch, LV_STATE_CHECKED);
-        }
+      lv_label_set_text(watch->ble_state_label, text);
     }
-
-  printf("Bluetooth %s\n", watch->bt_state ? "enabled" : "disabled");
 }
 
 /****************************************************************************
@@ -1389,17 +1423,1097 @@ static void ai_watch_destroy_timer_app(FAR struct ai_watch_s *watch)
 }
 
 /****************************************************************************
- * Private Functions - UI Callbacks
+ * Private Functions - Reminder App
  ****************************************************************************/
 
-static void ai_watch_settings_bt_cb(lv_event_t *e)
+/* Reminder list item label references for read/unread styling */
+
+#define REMINDER_APP_MAX_LABELS  8
+
+struct ai_reminder_app_s
+{
+  FAR lv_obj_t *list_obj;
+  FAR lv_obj_t *item_labels[REMINDER_APP_MAX_LABELS];
+  FAR lv_obj_t *empty_label;
+  FAR lv_timer_t *refresh_timer;
+};
+
+static struct ai_reminder_app_s g_reminder_app;
+
+static void ai_watch_reminder_refresh_cb(FAR lv_timer_t *timer)
+{
+  FAR struct ai_watch_s *watch = lv_timer_get_user_data(timer);
+  FAR struct ai_watch_reminder_store_s *store;
+  int theme = watch->current_theme;
+  int i;
+
+  store = ai_watch_ble_get_reminders();
+  if (store == NULL || !store->pending)
+    {
+      return;
+    }
+
+  store->pending = false;
+
+  /* Hide empty label if we have reminders */
+
+  if (g_reminder_app.empty_label != NULL)
+    {
+      if (store->count > 0)
+        {
+          lv_obj_add_flag(g_reminder_app.empty_label,
+                          LV_OBJ_FLAG_HIDDEN);
+        }
+      else
+        {
+          lv_obj_clear_flag(g_reminder_app.empty_label,
+                            LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+  /* Update item labels */
+
+  for (i = 0; i < REMINDER_APP_MAX_LABELS; i++)
+    {
+      FAR lv_obj_t *lbl = g_reminder_app.item_labels[i];
+
+      if (lbl == NULL)
+        {
+          continue;
+        }
+
+      if (i < store->count && store->items[i].id != 0)
+        {
+          FAR const struct ai_watch_reminder_s *item =
+              &store->items[i];
+          char buf[48];
+          bool is_read = (item->flags & 0x01) != 0;
+
+          snprintf(buf, sizeof(buf), "%s %s",
+                   is_read ? "  " : LV_SYMBOL_EYE_OPEN,
+                   item->title);
+          lv_label_set_text(lbl, buf);
+
+          if (is_read)
+            {
+              lv_obj_set_style_text_color(
+                  lbl, ai_watch_theme_secondary(theme), 0);
+            }
+          else
+            {
+              lv_obj_set_style_text_color(
+                  lbl, ai_watch_theme_text(theme), 0);
+            }
+
+          lv_obj_clear_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+        }
+      else
+        {
+          lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void ai_watch_reminder_back_cb(lv_event_t *e)
 {
   FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
-  FAR lv_obj_t *sw = lv_event_get_target(e);
-  bool new_state = lv_obj_has_state(sw, LV_STATE_CHECKED);
 
-  ai_watch_update_bt_state(watch, new_state);
+  ai_watch_pop_page(watch);
 }
+
+static void ai_watch_create_reminder_app(FAR struct ai_watch_s *watch)
+{
+  FAR lv_obj_t *screen;
+  FAR lv_obj_t *title;
+  FAR lv_obj_t *back_btn;
+  FAR lv_obj_t *back_lbl;
+  FAR lv_obj_t *list;
+  FAR lv_obj_t *empty_lbl;
+  int theme = watch->current_theme;
+  int i;
+
+  screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
+  lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+
+  title = lv_label_create(screen);
+  lv_label_set_text(title, "Reminders");
+  lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+
+  /* Scrollable list area */
+
+  list = lv_obj_create(screen);
+  lv_obj_set_size(list, 340, 320);
+  lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 65);
+  lv_obj_set_style_bg_color(list, ai_watch_theme_bg(theme), 0);
+  lv_obj_set_style_border_width(list, 0, 0);
+  lv_obj_set_style_pad_all(list, 8, 0);
+  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  /* Empty state label */
+
+  empty_lbl = lv_label_create(list);
+  lv_label_set_text(empty_lbl, "No reminders\n\nWaiting for data\n"
+                    "from phone...");
+  lv_obj_set_style_text_color(empty_lbl,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(empty_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_align(empty_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_pad_top(empty_lbl, 60, 0);
+  g_reminder_app.empty_label = empty_lbl;
+
+  /* Pre-create item labels (hidden until data arrives) */
+
+  for (i = 0; i < REMINDER_APP_MAX_LABELS; i++)
+    {
+      FAR lv_obj_t *lbl = lv_label_create(list);
+
+      lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+      lv_obj_set_width(lbl, 320);
+      lv_obj_set_style_text_color(lbl, ai_watch_theme_text(theme), 0);
+      lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+      lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+      g_reminder_app.item_labels[i] = lbl;
+    }
+
+  g_reminder_app.list_obj = list;
+
+  /* Back button */
+
+  back_btn = lv_btn_create(screen);
+  lv_obj_set_size(back_btn, 120, 45);
+  lv_obj_set_style_bg_color(back_btn, ai_watch_theme_btn_bg(theme), 0);
+  lv_obj_set_style_radius(back_btn, 12, 0);
+  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+  back_lbl = lv_label_create(back_btn);
+  lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+  lv_obj_set_style_text_color(back_lbl,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(back_lbl);
+  lv_obj_add_event_cb(back_btn, ai_watch_reminder_back_cb,
+                      LV_EVENT_CLICKED, watch);
+
+  /* Refresh timer — checks for new reminder data every 500ms */
+
+  g_reminder_app.refresh_timer = lv_timer_create(
+      ai_watch_reminder_refresh_cb, 500, watch);
+
+  /* Trigger initial refresh */
+
+  {
+    FAR struct ai_watch_reminder_store_s *store =
+        ai_watch_ble_get_reminders();
+
+    if (store != NULL)
+      {
+        store->pending = true;
+      }
+  }
+
+  watch->app_page_screen = screen;
+}
+
+static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch)
+{
+  if (g_reminder_app.refresh_timer != NULL)
+    {
+      lv_timer_del(g_reminder_app.refresh_timer);
+      g_reminder_app.refresh_timer = NULL;
+    }
+
+  memset(&g_reminder_app, 0, sizeof(g_reminder_app));
+  watch->app_page_screen = NULL;
+}
+
+/****************************************************************************
+ * Private Functions - DHT22 Sensor App
+ *
+ * Displays temperature and humidity from a DHT22 sensor.
+ * If the sensor device is not available, shows "Sensor unavailable".
+ * No fake data is ever displayed.
+ ****************************************************************************/
+
+#define DHT_SENSOR_PATH         "/dev/dhtxx0"
+#define DHT_UPDATE_MS           2000  /* 2-second sampling period */
+
+struct ai_dht_app_s
+{
+  FAR lv_obj_t *temp_label;
+  FAR lv_obj_t *hum_label;
+  FAR lv_obj_t *status_label;
+  FAR lv_obj_t *time_label;
+  FAR lv_timer_t *update_timer;
+  bool sensor_available;
+  float last_temp;
+  float last_hum;
+  time_t last_sample_time;
+};
+
+static struct ai_dht_app_s g_dht_app;
+
+static void ai_watch_dht_update_cb(FAR lv_timer_t *timer)
+{
+  FAR struct ai_watch_s *watch = lv_timer_get_user_data(timer);
+  int theme = watch->current_theme;
+  FILE *fp;
+  char buf[64];
+
+  /* Try to read temperature */
+
+  fp = fopen(DHT_SENSOR_PATH, "r");
+  if (fp == NULL)
+    {
+      if (g_dht_app.sensor_available)
+        {
+          g_dht_app.sensor_available = false;
+          lv_label_set_text(g_dht_app.status_label,
+                            LV_SYMBOL_WARNING " Sensor unavailable");
+          lv_obj_set_style_text_color(g_dht_app.status_label,
+                                      lv_color_make(255, 180, 0), 0);
+          lv_label_set_text(g_dht_app.temp_label, "--.- C");
+          lv_label_set_text(g_dht_app.hum_label, "--.- %");
+          lv_label_set_text(g_dht_app.time_label, "Last: never");
+        }
+
+      return;
+    }
+
+  /* Read raw data from device.
+   * The dhtxx driver outputs temperature and humidity as text.
+   * Format depends on the NuttX sensor framework configuration.
+   */
+
+  if (fgets(buf, sizeof(buf), fp) != NULL)
+    {
+      float temp = 0.0f;
+      float hum = 0.0f;
+
+      /* Parse "temperature humidity" format */
+
+      if (sscanf(buf, "%f %f", &temp, &hum) >= 2)
+        {
+          g_dht_app.last_temp = temp;
+          g_dht_app.last_hum = hum;
+          g_dht_app.last_sample_time = time(NULL);
+          g_dht_app.sensor_available = true;
+
+          snprintf(buf, sizeof(buf), "%.1f C", temp);
+          lv_label_set_text(g_dht_app.temp_label, buf);
+
+          snprintf(buf, sizeof(buf), "%.1f %%", hum);
+          lv_label_set_text(g_dht_app.hum_label, buf);
+
+          lv_label_set_text(g_dht_app.status_label,
+                            LV_SYMBOL_OK " Sensor active");
+          lv_obj_set_style_text_color(g_dht_app.status_label,
+                                      lv_color_make(0, 200, 0), 0);
+
+          /* Show last sample time */
+
+          {
+            struct tm tm;
+
+            ai_watch_ble_localtime(g_dht_app.last_sample_time, &tm);
+            snprintf(buf, sizeof(buf), "Last: %02d:%02d:%02d",
+                     tm.tm_hour, tm.tm_min, tm.tm_sec);
+            lv_label_set_text(g_dht_app.time_label, buf);
+          }
+
+          /* Send sensor data via BLE */
+
+          ai_watch_ble_send_sensor_data(0x01, &temp, sizeof(float));
+          ai_watch_ble_send_sensor_data(0x02, &hum, sizeof(float));
+        }
+      else
+        {
+          if (!g_dht_app.sensor_available)
+            {
+              lv_label_set_text(g_dht_app.status_label,
+                                LV_SYMBOL_WARNING " Read error");
+              lv_obj_set_style_text_color(g_dht_app.status_label,
+                                          lv_color_make(255, 180, 0), 0);
+            }
+        }
+    }
+
+  fclose(fp);
+}
+
+static void ai_watch_dht_back_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+
+  ai_watch_pop_page(watch);
+}
+
+static void ai_watch_create_dht_app(FAR struct ai_watch_s *watch)
+{
+  FAR lv_obj_t *screen;
+  FAR lv_obj_t *title;
+  FAR lv_obj_t *temp_title;
+  FAR lv_obj_t *hum_title;
+  FAR lv_obj_t *back_btn;
+  FAR lv_obj_t *back_lbl;
+  int theme = watch->current_theme;
+
+  screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
+  lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+
+  title = lv_label_create(screen);
+  lv_label_set_text(title, "Temperature & Humidity");
+  lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 25);
+
+  /* Status label */
+
+  g_dht_app.status_label = lv_label_create(screen);
+  lv_label_set_text(g_dht_app.status_label,
+                    LV_SYMBOL_WARNING " Checking sensor...");
+  lv_obj_set_style_text_color(g_dht_app.status_label,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(g_dht_app.status_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(g_dht_app.status_label, LV_ALIGN_TOP_MID, 0, 55);
+
+  /* Temperature section */
+
+  temp_title = lv_label_create(screen);
+  lv_label_set_text(temp_title, "Temperature");
+  lv_obj_set_style_text_color(temp_title, ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_font(temp_title, &lv_font_montserrat_16, 0);
+  lv_obj_align(temp_title, LV_ALIGN_TOP_LEFT, 30, 100);
+
+  g_dht_app.temp_label = lv_label_create(screen);
+  lv_label_set_text(g_dht_app.temp_label, "--.- C");
+  lv_obj_set_style_text_color(g_dht_app.temp_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_dht_app.temp_label,
+                             &lv_font_montserrat_48, 0);
+  lv_obj_align(g_dht_app.temp_label, LV_ALIGN_CENTER, 0, -60);
+
+  /* Humidity section */
+
+  hum_title = lv_label_create(screen);
+  lv_label_set_text(hum_title, "Humidity");
+  lv_obj_set_style_text_color(hum_title, ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_font(hum_title, &lv_font_montserrat_16, 0);
+  lv_obj_align(hum_title, LV_ALIGN_CENTER, -120, 30);
+
+  g_dht_app.hum_label = lv_label_create(screen);
+  lv_label_set_text(g_dht_app.hum_label, "--.- %");
+  lv_obj_set_style_text_color(g_dht_app.hum_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_dht_app.hum_label,
+                             &lv_font_montserrat_48, 0);
+  lv_obj_align(g_dht_app.hum_label, LV_ALIGN_CENTER, 0, 50);
+
+  /* Last sample time */
+
+  g_dht_app.time_label = lv_label_create(screen);
+  lv_label_set_text(g_dht_app.time_label, "Last: never");
+  lv_obj_set_style_text_color(g_dht_app.time_label,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(g_dht_app.time_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(g_dht_app.time_label, LV_ALIGN_CENTER, 0, 110);
+
+  /* Disclaimer */
+
+  {
+    FAR lv_obj_t *disclaimer = lv_label_create(screen);
+
+    lv_label_set_text(disclaimer,
+                      "Non-medical use only\nNot for diagnosis");
+    lv_obj_set_style_text_color(disclaimer,
+                                ai_watch_theme_secondary(theme), 0);
+    lv_obj_set_style_text_font(disclaimer, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(disclaimer, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(disclaimer, LV_ALIGN_BOTTOM_MID, 0, -60);
+  }
+
+  /* Back button */
+
+  back_btn = lv_btn_create(screen);
+  lv_obj_set_size(back_btn, 120, 45);
+  lv_obj_set_style_bg_color(back_btn, ai_watch_theme_btn_bg(theme), 0);
+  lv_obj_set_style_radius(back_btn, 12, 0);
+  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+  back_lbl = lv_label_create(back_btn);
+  lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+  lv_obj_set_style_text_color(back_lbl,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(back_lbl);
+  lv_obj_add_event_cb(back_btn, ai_watch_dht_back_cb,
+                      LV_EVENT_CLICKED, watch);
+
+  /* Init state */
+
+  g_dht_app.sensor_available = false;
+  g_dht_app.last_temp = 0.0f;
+  g_dht_app.last_hum = 0.0f;
+  g_dht_app.last_sample_time = 0;
+
+  /* Update timer */
+
+  g_dht_app.update_timer = lv_timer_create(
+      ai_watch_dht_update_cb, DHT_UPDATE_MS, watch);
+
+  watch->app_page_screen = screen;
+}
+
+static void ai_watch_destroy_dht_app(FAR struct ai_watch_s *watch)
+{
+  if (g_dht_app.update_timer != NULL)
+    {
+      lv_timer_del(g_dht_app.update_timer);
+      g_dht_app.update_timer = NULL;
+    }
+
+  memset(&g_dht_app, 0, sizeof(g_dht_app));
+  watch->app_page_screen = NULL;
+}
+
+/****************************************************************************
+ * Private Functions - MAX30102 Heart Rate / SpO2 App
+ *
+ * Uses NuttX I2C API to communicate with MAX30102 at address 0x57.
+ * Implements: Part ID check, FIFO reading, basic HR/SpO2 estimation.
+ *
+ * WARNING: Non-medical use only. Not for diagnosis.
+ ****************************************************************************/
+
+#include <nuttx/i2c/i2c_master.h>
+
+#define MAX30102_I2C_ADDR       0x57  /* 7-bit address */
+#define MAX30102_I2C_PATH       "/dev/i2c1"
+
+/* MAX30102 Register Addresses */
+
+#define MAX30102_REG_INTSTAT1   0x00
+#define MAX30102_REG_INTSTAT2   0x01
+#define MAX30102_REG_INTEN1     0x02
+#define MAX30102_REG_INTEN2     0x03
+#define MAX30102_REG_FIFOWRPTR  0x04
+#define MAX30102_REG_FIFOOVFCNT 0x05
+#define MAX30102_REG_FIFOREDPTR 0x06
+#define MAX30102_REG_FIFODATA   0x07
+#define MAX30102_REG_FIFOCONFIG 0x08
+#define MAX30102_REG_MODECONFIG 0x09
+#define MAX30102_REG_SPO2CONFIG 0x0a
+#define MAX30102_REG_LED1PA     0x0c  /* Red LED */
+#define MAX30102_REG_LED2PA     0x0d  /* IR LED */
+#define MAX30102_REG_PARTID     0xff
+
+#define MAX30102_PART_ID        0x15  /* Expected Part ID */
+
+/* FIFO sample: 3 bytes red + 3 bytes IR = 6 bytes */
+
+#define MAX30102_SAMPLE_SIZE    6
+#define MAX30102_FIFO_SAMPLES   16
+
+struct ai_hr_app_s
+{
+  FAR lv_obj_t *hr_label;
+  FAR lv_obj_t *spo2_label;
+  FAR lv_obj_t *status_label;
+  FAR lv_obj_t *raw_label;
+  FAR lv_timer_t *update_timer;
+  int i2c_fd;
+  bool sensor_ok;
+  bool finger_detected;
+  uint32_t last_red;
+  uint32_t last_ir;
+  int hr_bpm;
+  int spo2_pct;
+};
+
+static struct ai_hr_app_s g_hr_app;
+
+/* I2C read helper */
+
+static int max30102_read_reg(int fd, uint8_t reg, uint8_t *val)
+{
+  struct i2c_msg_s msgs[2];
+  struct i2c_transfer_s xfer;
+  int ret;
+
+  msgs[0].frequency = 400000;
+  msgs[0].addr = MAX30102_I2C_ADDR;
+  msgs[0].flags = 0;
+  msgs[0].buffer = &reg;
+  msgs[0].length = 1;
+
+  msgs[1].frequency = 400000;
+  msgs[1].addr = MAX30102_I2C_ADDR;
+  msgs[1].flags = I2C_M_READ;
+  msgs[1].buffer = val;
+  msgs[1].length = 1;
+
+  xfer.msgv = msgs;
+  xfer.msgc = 2;
+
+  ret = ioctl(fd, I2CIOC_TRANSFER, (unsigned long)&xfer);
+  return ret;
+}
+
+static int max30102_write_reg(int fd, uint8_t reg, uint8_t val)
+{
+  struct i2c_msg_s msg;
+  struct i2c_transfer_s xfer;
+  uint8_t buf[2];
+  int ret;
+
+  buf[0] = reg;
+  buf[1] = val;
+
+  msg.frequency = 400000;
+  msg.addr = MAX30102_I2C_ADDR;
+  msg.flags = 0;
+  msg.buffer = buf;
+  msg.length = 2;
+
+  xfer.msgv = &msg;
+  xfer.msgc = 1;
+
+  ret = ioctl(fd, I2CIOC_TRANSFER, (unsigned long)&xfer);
+  return ret;
+}
+
+static int max30102_read_fifo(int fd, uint32_t *red, uint32_t *ir)
+{
+  uint8_t reg = MAX30102_REG_FIFODATA;
+  uint8_t data[MAX30102_SAMPLE_SIZE];
+  struct i2c_msg_s msgs[2];
+  struct i2c_transfer_s xfer;
+  int ret;
+
+  msgs[0].frequency = 400000;
+  msgs[0].addr = MAX30102_I2C_ADDR;
+  msgs[0].flags = 0;
+  msgs[0].buffer = &reg;
+  msgs[0].length = 1;
+
+  msgs[1].frequency = 400000;
+  msgs[1].addr = MAX30102_I2C_ADDR;
+  msgs[1].flags = I2C_M_READ;
+  msgs[1].buffer = data;
+  msgs[1].length = MAX30102_SAMPLE_SIZE;
+
+  xfer.msgv = msgs;
+  xfer.msgc = 2;
+
+  ret = ioctl(fd, I2CIOC_TRANSFER, (unsigned long)&xfer);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  /* Parse 18-bit values (bits [17:0] of 3 bytes) */
+
+  *red = ((uint32_t)(data[0] & 0x03) << 16) |
+         ((uint32_t)data[1] << 8) |
+         data[2];
+  *ir = ((uint32_t)(data[3] & 0x03) << 16) |
+        ((uint32_t)data[4] << 8) |
+        data[5];
+
+  return 0;
+}
+
+/* Simple HR estimation: count peaks in red signal over a window.
+ * This is a basic algorithm for demonstration only.
+ */
+
+static int estimate_hr(uint32_t red, uint32_t prev_red,
+                       uint32_t prev2_red, bool finger)
+{
+  static int peak_count = 0;
+  static uint32_t threshold = 0;
+  static int sample_count = 0;
+  static uint32_t min_val = 0xffffffff;
+  static uint32_t max_val = 0;
+
+  if (!finger)
+    {
+      peak_count = 0;
+      sample_count = 0;
+      min_val = 0xffffffff;
+      max_val = 0;
+      return -1;
+    }
+
+  sample_count++;
+
+  if (red < min_val)
+    {
+      min_val = red;
+    }
+
+  if (red > max_val)
+    {
+      max_val = red;
+    }
+
+  /* Adaptive threshold */
+
+  threshold = min_val + (max_val - min_val) / 2;
+
+  /* Peak detection: prev_red > threshold and prev_red > red
+   * and prev_red > prev2_red
+   */
+
+  if (prev_red > threshold && prev_red > red && prev_red > prev2_red)
+    {
+      peak_count++;
+    }
+
+  /* Calculate BPM from peaks in the sample window.
+   * At 100 Hz sample rate, 100 samples = 1 second.
+   * After collecting enough samples, estimate BPM.
+   */
+
+  if (sample_count >= 300) /* ~3 seconds at 100 Hz */
+    {
+      int bpm;
+
+      bpm = peak_count * 20; /* peaks per 3s × 20 = BPM */
+
+      /* Reset for next window */
+
+      peak_count = 0;
+      sample_count = 0;
+      min_val = 0xffffffff;
+      max_val = 0;
+
+      if (bpm >= 40 && bpm <= 200)
+        {
+          return bpm;
+        }
+    }
+
+  return -1; /* Not enough data yet */
+}
+
+/* Simple SpO2 estimation using ratio-of-ratios.
+ * SpO2 = 110 - 25 × R, where R = (Red_AC/Red_DC) / (IR_AC/IR_DC)
+ * This is a simplified version for demonstration.
+ */
+
+static int estimate_spo2(uint32_t red, uint32_t ir, bool finger)
+{
+  static uint32_t red_sum = 0;
+  static uint32_t ir_sum = 0;
+  static uint32_t red_min = 0xffffffff;
+  static uint32_t red_max = 0;
+  static uint32_t ir_min = 0xffffffff;
+  static uint32_t ir_max = 0;
+  static int sample_count = 0;
+  float r;
+  int spo2;
+
+  if (!finger || red < 1000 || ir < 1000)
+    {
+      red_sum = 0;
+      ir_sum = 0;
+      red_min = 0xffffffff;
+      red_max = 0;
+      ir_min = 0xffffffff;
+      ir_max = 0;
+      sample_count = 0;
+      return -1;
+    }
+
+  red_sum += red;
+  ir_sum += ir;
+  sample_count++;
+
+  if (red < red_min)
+    {
+      red_min = red;
+    }
+
+  if (red > red_max)
+    {
+      red_max = red;
+    }
+
+  if (ir < ir_min)
+    {
+      ir_min = ir;
+    }
+
+  if (ir > ir_max)
+    {
+      ir_max = ir;
+    }
+
+  if (sample_count < 100)
+    {
+      return -1;
+    }
+
+  /* Calculate ratio R */
+
+  {
+    float red_dc = (float)red_sum / sample_count;
+    float ir_dc = (float)ir_sum / sample_count;
+    float red_ac = (float)(red_max - red_min);
+    float ir_ac = (float)(ir_max - ir_min);
+
+    if (ir_dc < 1.0f || ir_ac < 1.0f || red_dc < 1.0f)
+      {
+        goto reset;
+      }
+
+    r = (red_ac / red_dc) / (ir_ac / ir_dc);
+    spo2 = (int)(110.0f - 25.0f * r);
+
+    if (spo2 < 70 || spo2 > 100)
+      {
+        spo2 = -1;
+      }
+  }
+
+reset:
+  red_sum = 0;
+  ir_sum = 0;
+  red_min = 0xffffffff;
+  red_max = 0;
+  ir_min = 0xffffffff;
+  ir_max = 0;
+  sample_count = 0;
+
+  return spo2;
+}
+
+static void ai_watch_hr_update_cb(FAR lv_timer_t *timer)
+{
+  FAR struct ai_watch_s *watch = lv_timer_get_user_data(timer);
+  int theme = watch->current_theme;
+  uint8_t part_id;
+  uint32_t red;
+  uint32_t ir;
+  int ret;
+  char buf[32];
+
+  if (g_hr_app.i2c_fd < 0)
+    {
+      /* Try to open I2C device */
+
+      g_hr_app.i2c_fd = open(MAX30102_I2C_PATH, O_RDONLY);
+      if (g_hr_app.i2c_fd < 0)
+        {
+          if (g_hr_app.sensor_ok)
+            {
+              g_hr_app.sensor_ok = false;
+              lv_label_set_text(g_hr_app.status_label,
+                                LV_SYMBOL_WARNING " I2C unavailable");
+              lv_obj_set_style_text_color(g_hr_app.status_label,
+                                          lv_color_make(255, 180, 0), 0);
+            }
+
+          return;
+        }
+    }
+
+  /* Verify Part ID */
+
+  if (!g_hr_app.sensor_ok)
+    {
+      ret = max30102_read_reg(g_hr_app.i2c_fd,
+                              MAX30102_REG_PARTID, &part_id);
+      if (ret < 0 || part_id != MAX30102_PART_ID)
+        {
+          lv_label_set_text(g_hr_app.status_label,
+                            LV_SYMBOL_WARNING " Sensor not found");
+          lv_obj_set_style_text_color(g_hr_app.status_label,
+                                      lv_color_make(255, 180, 0), 0);
+          snprintf(buf, sizeof(buf), "ID: 0x%02x (expect 0x%02x)",
+                   part_id, MAX30102_PART_ID);
+          lv_label_set_text(g_hr_app.raw_label, buf);
+          return;
+        }
+
+      /* Configure sensor: SpO2 mode, 100 Hz, 18-bit */
+
+      max30102_write_reg(g_hr_app.i2c_fd,
+                         MAX30102_REG_MODECONFIG, 0x03); /* SpO2 mode */
+      max30102_write_reg(g_hr_app.i2c_fd,
+                         MAX30102_REG_SPO2CONFIG, 0x27); /* 100Hz, 18bit */
+      max30102_write_reg(g_hr_app.i2c_fd,
+                         MAX30102_REG_LED1PA, 0x24); /* Red LED current */
+      max30102_write_reg(g_hr_app.i2c_fd,
+                         MAX30102_REG_LED2PA, 0x24); /* IR LED current */
+      max30102_write_reg(g_hr_app.i2c_fd,
+                         MAX30102_REG_FIFOCONFIG, 0x0f); /* 16 samples avg */
+
+      g_hr_app.sensor_ok = true;
+      lv_label_set_text(g_hr_app.status_label,
+                        LV_SYMBOL_OK " Sensor ready");
+      lv_obj_set_style_text_color(g_hr_app.status_label,
+                                  lv_color_make(0, 200, 0), 0);
+    }
+
+  /* Read FIFO sample */
+
+  ret = max30102_read_fifo(g_hr_app.i2c_fd, &red, &ir);
+  if (ret < 0)
+    {
+      lv_label_set_text(g_hr_app.status_label,
+                        LV_SYMBOL_WARNING " Read error");
+      lv_obj_set_style_text_color(g_hr_app.status_label,
+                                  lv_color_make(255, 180, 0), 0);
+      return;
+    }
+
+  g_hr_app.last_red = red;
+  g_hr_app.last_ir = ir;
+
+  /* Detect finger: both red and IR should have significant signal */
+
+  g_hr_app.finger_detected = (red > 5000 && ir > 5000);
+
+  if (!g_hr_app.finger_detected)
+    {
+      lv_label_set_text(g_hr_app.hr_label, "--");
+      lv_label_set_text(g_hr_app.spo2_label, "--");
+      lv_label_set_text(g_hr_app.status_label,
+                        LV_SYMBOL_WARNING " No finger detected");
+      lv_obj_set_style_text_color(g_hr_app.status_label,
+                                  lv_color_make(255, 180, 0), 0);
+
+      snprintf(buf, sizeof(buf), "R:%lu I:%lu",
+               (unsigned long)red, (unsigned long)ir);
+      lv_label_set_text(g_hr_app.raw_label, buf);
+      return;
+    }
+
+  /* Estimate HR and SpO2 */
+
+  {
+    static uint32_t prev_red = 0;
+    static uint32_t prev2_red = 0;
+    int hr;
+    int spo2;
+
+    hr = estimate_hr(red, prev_red, prev2_red,
+                     g_hr_app.finger_detected);
+    spo2 = estimate_spo2(red, ir, g_hr_app.finger_detected);
+
+    prev2_red = prev_red;
+    prev_red = red;
+
+    if (hr > 0)
+      {
+        g_hr_app.hr_bpm = hr;
+        snprintf(buf, sizeof(buf), "%d", hr);
+        lv_label_set_text(g_hr_app.hr_label, buf);
+
+        /* Send HR via BLE */
+
+        {
+          int16_t hr_val = (int16_t)hr;
+
+          ai_watch_ble_send_sensor_data(0x03, &hr_val, 2);
+        }
+      }
+
+    if (spo2 > 0)
+      {
+        g_hr_app.spo2_pct = spo2;
+        snprintf(buf, sizeof(buf), "%d%%", spo2);
+        lv_label_set_text(g_hr_app.spo2_label, buf);
+
+        /* Send SpO2 via BLE */
+
+        {
+          int16_t spo2_val = (int16_t)spo2;
+
+          ai_watch_ble_send_sensor_data(0x04, &spo2_val, 2);
+        }
+      }
+  }
+
+  /* Update raw data display */
+
+  snprintf(buf, sizeof(buf), "R:%lu I:%lu",
+           (unsigned long)red, (unsigned long)ir);
+  lv_label_set_text(g_hr_app.raw_label, buf);
+
+  lv_label_set_text(g_hr_app.status_label,
+                    LV_SYMBOL_OK " Measuring...");
+  lv_obj_set_style_text_color(g_hr_app.status_label,
+                              ai_watch_theme_accent(theme), 0);
+}
+
+static void ai_watch_hr_back_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+
+  ai_watch_pop_page(watch);
+}
+
+static void ai_watch_create_hr_app(FAR struct ai_watch_s *watch)
+{
+  FAR lv_obj_t *screen;
+  FAR lv_obj_t *title;
+  FAR lv_obj_t *hr_title;
+  FAR lv_obj_t *spo2_title;
+  FAR lv_obj_t *back_btn;
+  FAR lv_obj_t *back_lbl;
+  FAR lv_obj_t *disclaimer;
+  int theme = watch->current_theme;
+
+  screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
+  lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+
+  title = lv_label_create(screen);
+  lv_label_set_text(title, "Heart Rate & SpO2");
+  lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 25);
+
+  /* Status label */
+
+  g_hr_app.status_label = lv_label_create(screen);
+  lv_label_set_text(g_hr_app.status_label,
+                    LV_SYMBOL_WARNING " Checking sensor...");
+  lv_obj_set_style_text_color(g_hr_app.status_label,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(g_hr_app.status_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(g_hr_app.status_label, LV_ALIGN_TOP_MID, 0, 55);
+
+  /* Heart Rate section */
+
+  hr_title = lv_label_create(screen);
+  lv_label_set_text(hr_title, "Heart Rate");
+  lv_obj_set_style_text_color(hr_title, lv_color_make(255, 80, 80), 0);
+  lv_obj_set_style_text_font(hr_title, &lv_font_montserrat_16, 0);
+  lv_obj_align(hr_title, LV_ALIGN_TOP_LEFT, 30, 95);
+
+  g_hr_app.hr_label = lv_label_create(screen);
+  lv_label_set_text(g_hr_app.hr_label, "--");
+  lv_obj_set_style_text_color(g_hr_app.hr_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_hr_app.hr_label,
+                             &lv_font_montserrat_48, 0);
+  lv_obj_align(g_hr_app.hr_label, LV_ALIGN_CENTER, -60, -40);
+
+  {
+    FAR lv_obj_t *bpm_unit = lv_label_create(screen);
+
+    lv_label_set_text(bpm_unit, "BPM");
+    lv_obj_set_style_text_color(bpm_unit,
+                                ai_watch_theme_secondary(theme), 0);
+    lv_obj_set_style_text_font(bpm_unit, &lv_font_montserrat_16, 0);
+    lv_obj_align_to(bpm_unit, g_hr_app.hr_label,
+                    LV_ALIGN_OUT_RIGHT_BOTTOM, 5, -5);
+  }
+
+  /* SpO2 section */
+
+  spo2_title = lv_label_create(screen);
+  lv_label_set_text(spo2_title, "SpO2");
+  lv_obj_set_style_text_color(spo2_title, lv_color_make(80, 180, 255), 0);
+  lv_obj_set_style_text_font(spo2_title, &lv_font_montserrat_16, 0);
+  lv_obj_align(spo2_title, LV_ALIGN_CENTER, -120, 30);
+
+  g_hr_app.spo2_label = lv_label_create(screen);
+  lv_label_set_text(g_hr_app.spo2_label, "--");
+  lv_obj_set_style_text_color(g_hr_app.spo2_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_hr_app.spo2_label,
+                             &lv_font_montserrat_48, 0);
+  lv_obj_align(g_hr_app.spo2_label, LV_ALIGN_CENTER, -30, 55);
+
+  /* Raw data label */
+
+  g_hr_app.raw_label = lv_label_create(screen);
+  lv_label_set_text(g_hr_app.raw_label, "R:--- I:---");
+  lv_obj_set_style_text_color(g_hr_app.raw_label,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(g_hr_app.raw_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(g_hr_app.raw_label, LV_ALIGN_CENTER, 0, 110);
+
+  /* Disclaimer */
+
+  disclaimer = lv_label_create(screen);
+  lv_label_set_text(disclaimer,
+                    "Non-medical use only\nNot for diagnosis");
+  lv_obj_set_style_text_color(disclaimer,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(disclaimer, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_align(disclaimer, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(disclaimer, LV_ALIGN_BOTTOM_MID, 0, -60);
+
+  /* Back button */
+
+  back_btn = lv_btn_create(screen);
+  lv_obj_set_size(back_btn, 120, 45);
+  lv_obj_set_style_bg_color(back_btn, ai_watch_theme_btn_bg(theme), 0);
+  lv_obj_set_style_radius(back_btn, 12, 0);
+  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+  back_lbl = lv_label_create(back_btn);
+  lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+  lv_obj_set_style_text_color(back_lbl,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(back_lbl);
+  lv_obj_add_event_cb(back_btn, ai_watch_hr_back_cb,
+                      LV_EVENT_CLICKED, watch);
+
+  /* Init state */
+
+  g_hr_app.i2c_fd = -1;
+  g_hr_app.sensor_ok = false;
+  g_hr_app.finger_detected = false;
+  g_hr_app.last_red = 0;
+  g_hr_app.last_ir = 0;
+  g_hr_app.hr_bpm = -1;
+  g_hr_app.spo2_pct = -1;
+
+  /* Update timer —100ms for100 Hz sampling */
+
+  g_hr_app.update_timer = lv_timer_create(
+      ai_watch_hr_update_cb, 100, watch);
+
+  watch->app_page_screen = screen;
+}
+
+static void ai_watch_destroy_hr_app(FAR struct ai_watch_s *watch)
+{
+  if (g_hr_app.update_timer != NULL)
+    {
+      lv_timer_del(g_hr_app.update_timer);
+      g_hr_app.update_timer = NULL;
+    }
+
+  if (g_hr_app.i2c_fd >= 0)
+    {
+      close(g_hr_app.i2c_fd);
+      g_hr_app.i2c_fd = -1;
+    }
+
+  memset(&g_hr_app, 0, sizeof(g_hr_app));
+  g_hr_app.i2c_fd = -1;
+  watch->app_page_screen = NULL;
+}
+
+/****************************************************************************
+ * Private Functions - UI Callbacks
+ ****************************************************************************/
 
 static void ai_watch_settings_theme_cb(lv_event_t *e)
 {
@@ -1408,6 +2522,15 @@ static void ai_watch_settings_theme_cb(lv_event_t *e)
   int theme = lv_roller_get_selected(roller);
 
   ai_watch_update_theme(watch, theme);
+}
+
+static void ai_watch_settings_bt_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+  bool checked = lv_obj_has_state(watch->bt_switch, LV_STATE_CHECKED);
+
+  ai_watch_ble_set_enabled(checked);
+  printf("Settings: Bluetooth switched %s\n", checked ? "ON" : "OFF");
 }
 
 static void ai_watch_home_click_cb(lv_event_t *e)
@@ -1449,22 +2572,30 @@ static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch)
   lv_obj_set_style_text_font(bt_label, &lv_font_montserrat_16, 0);
   lv_obj_align(bt_label, LV_ALIGN_TOP_LEFT, 30, 80);
 
-  watch->bt_switch = lv_switch_create(screen);
-  lv_obj_set_size(watch->bt_switch, 50, 25);
-  lv_obj_align(watch->bt_switch, LV_ALIGN_TOP_RIGHT, -30, 75);
-  if (watch->bt_state)
-    {
-      lv_obj_add_state(watch->bt_switch, LV_STATE_CHECKED);
-    }
+  /* Bluetooth switch - wired to the real BLE bridge; advertising and
+   * connections stop when it is off.
+   */
 
+  watch->bt_switch = lv_switch_create(screen);
+  lv_obj_add_state(watch->bt_switch, LV_STATE_CHECKED);
   lv_obj_add_event_cb(watch->bt_switch, ai_watch_settings_bt_cb,
                       LV_EVENT_VALUE_CHANGED, watch);
+  lv_obj_align(watch->bt_switch, LV_ALIGN_TOP_RIGHT, -30, 72);
+
+  watch->ble_state_label = lv_label_create(screen);
+  lv_label_set_text(watch->ble_state_label,
+                    ai_watch_ble_get_status_text(ai_watch_ble_get_state()));
+  lv_obj_set_style_text_color(watch->ble_state_label,
+                              ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_font(watch->ble_state_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(watch->ble_state_label, LV_ALIGN_TOP_RIGHT, -30, 114);
 
   theme_label = lv_label_create(screen);
   lv_label_set_text(theme_label, "Theme");
   lv_obj_set_style_text_color(theme_label, ai_watch_theme_text(theme), 0);
   lv_obj_set_style_text_font(theme_label, &lv_font_montserrat_16, 0);
-  lv_obj_align(theme_label, LV_ALIGN_TOP_LEFT, 30, 130);
+  lv_obj_align(theme_label, LV_ALIGN_TOP_LEFT, 30, 145);
 
   watch->theme_roller = lv_roller_create(screen);
   lv_roller_set_options(watch->theme_roller,
@@ -1473,7 +2604,7 @@ static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch)
                        "Blue",
                        LV_ROLLER_MODE_NORMAL);
   lv_obj_set_width(watch->theme_roller, 150);
-  lv_obj_align(watch->theme_roller, LV_ALIGN_TOP_MID, 0, 160);
+  lv_obj_align(watch->theme_roller, LV_ALIGN_TOP_MID, 0, 175);
   lv_roller_set_visible_row_count(watch->theme_roller, 2);
   lv_roller_set_selected(watch->theme_roller, watch->current_theme,
                          LV_ANIM_OFF);
@@ -1671,7 +2802,7 @@ static void ai_watch_init_about(FAR struct ai_watch_s *watch)
   bool rtc_ok = false;
 
   if (clock_gettime(CLOCK_REALTIME, &ts) == 0 &&
-      localtime_r(&ts.tv_sec, &tm) != NULL &&
+      ai_watch_ble_localtime(ts.tv_sec, &tm) != NULL &&
       tm.tm_year + 1900 >= AI_WATCH_RTC_MIN_YEAR)
     {
       char time[16];
@@ -1826,9 +2957,12 @@ static void ai_watch_button_update(FAR struct ai_watch_s *watch,
 
           if (watch->current_page == AI_WATCH_PAGE_HOME)
             {
-              ai_watch_update_bt_state(watch, !watch->bt_state);
-              printf("KEY2 pressed: BT %s\n",
-                     watch->bt_state ? "ON" : "OFF");
+              /* On home page, KEY2 shows BLE status briefly.
+               * BLE is managed automatically — no manual toggle.
+               */
+
+              printf("KEY2 pressed: BLE state=%d\n",
+                     (int)ai_watch_ble_get_state());
             }
           else
             {
@@ -1863,7 +2997,7 @@ static void ai_watch_time_update(FAR struct ai_watch_s *watch)
   };
 
   if (clock_gettime(CLOCK_REALTIME, &ts) < 0 ||
-      localtime_r(&ts.tv_sec, &tm) == NULL ||
+      ai_watch_ble_localtime(ts.tv_sec, &tm) == NULL ||
       tm.tm_year + 1900 < AI_WATCH_RTC_MIN_YEAR)
     {
       if (!watch->rtc_warning_printed)
@@ -2011,6 +3145,9 @@ int main(int argc, FAR char *argv[])
     .page_stack_top = 0,
     .app_page_screen = NULL,
     .active_app_index = -1,
+    .settings_bt_enabled = false,
+    .bt_switch = NULL,
+    .ble_state_label = NULL,
     .timer =
     {
       .update_timer = NULL,
@@ -2132,6 +3269,11 @@ int main(int argc, FAR char *argv[])
   ai_watch_create_ui(&watch);
   ai_watch_button_initialize(&watch);
 
+  /* Start BLE bring-up (asynchronous; state is polled in the main loop) */
+
+  ai_watch_ble_init();
+  ai_watch_update_bt_label(&watch);
+
   printf("UI created; entering main loop\n");
 
   for (; ; )
@@ -2170,6 +3312,25 @@ int main(int argc, FAR char *argv[])
       ai_watch_button_update(&watch, &now);
       ai_watch_touch_update(&watch);
       ai_watch_time_update(&watch);
+
+      /* Process pending BLE events (time sync, command frames) and
+       * refresh the status label on state transitions.
+       */
+
+      {
+        static enum ai_watch_ble_bsp_state_e last_ble_state =
+          AI_WATCH_BLE_BSP_OFF;
+
+        enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
+
+        ai_watch_ble_process();
+
+        if (state != last_ble_state)
+          {
+            last_ble_state = state;
+            ai_watch_update_bt_label(&watch);
+          }
+      }
 
       idle = lv_timer_handler();
       if (idle == 0 || idle > AI_WATCH_BUTTON_POLL_MS)

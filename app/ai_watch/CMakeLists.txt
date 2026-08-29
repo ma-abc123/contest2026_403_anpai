@@ -27,6 +27,7 @@ if(CONFIG_EXAMPLES_AI_WATCH)
     SRCS
     ai_watch_main.c
     ai_watch_icons.c
+    ai_watch_ble.c
     STACKSIZE
     ${CONFIG_EXAMPLES_AI_WATCH_STACKSIZE}
     HEAPSIZE
