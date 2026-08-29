@@ -54,6 +54,13 @@ static struct ai_watch_reminder_store_s g_reminders;
 static int16_t g_tz_offset_min;         /* minutes east of UTC (display) */
 static uint32_t g_last_sync_utc;        /* UTC of last accepted sync */
 
+/* Arrivals waiting to be surfaced as the UI alert banner */
+
+static struct ai_watch_ble_alert_s
+    g_alerts[AI_WATCH_BLE_ALERT_RING_LEN];
+static uint8_t g_alert_head;            /* next write slot */
+static uint8_t g_alert_count;           /* entries waiting */
+
 /****************************************************************************
  * Private Functions - Status / DataUpload notifications
  ****************************************************************************/
@@ -102,12 +109,10 @@ static void ai_ble_apply_timesync(
 }
 
 /****************************************************************************
- * Private Functions - Command frame parsing
+ * Private Functions - Alert ring
  *
- * Frame: [version(1)][cmd_type(1)][id(1)][flags(1)][timestamp(4)]
- *        [title_len(1)][title(N)]
- *
- * Runs on the main loop thread; the reminder store is only touched here.
+ * Filled from the command parser (main-loop thread), drained by the UI
+ * (also main-loop thread): single producer/consumer, no locking needed.
  ****************************************************************************/
 
 static FAR struct ai_watch_reminder_s *ai_ble_find_slot(uint8_t id)
@@ -140,7 +145,72 @@ static FAR struct ai_watch_reminder_s *ai_ble_free_slot(void)
   return NULL;
 }
 
-static bool ai_ble_cmd_reminder(FAR const uint8_t *data, size_t len)
+static void ai_ble_alert_push(uint8_t type, uint8_t id, uint32_t timestamp,
+                              FAR const char *title)
+{
+  FAR struct ai_watch_ble_alert_s *alert;
+
+  if (g_alert_count >= AI_WATCH_BLE_ALERT_RING_LEN)
+    {
+      /* Ring full: drop the oldest so the newest state stays visible */
+
+      g_alert_head = (g_alert_head + 1) % AI_WATCH_BLE_ALERT_RING_LEN;
+      g_alert_count--;
+    }
+
+  alert = &g_alerts[(g_alert_head + g_alert_count) %
+                    AI_WATCH_BLE_ALERT_RING_LEN];
+  alert->type = type;
+  alert->id = id;
+  alert->timestamp = timestamp;
+  strlcpy(alert->title, title, sizeof(alert->title));
+  g_alert_count++;
+}
+
+bool ai_watch_ble_take_alert(FAR struct ai_watch_ble_alert_s *out)
+{
+  FAR struct ai_watch_ble_alert_s *alert;
+
+  if (out == NULL || g_alert_count == 0)
+    {
+      return false;
+    }
+
+  alert = &g_alerts[g_alert_head];
+  memcpy(out, alert, sizeof(*out));
+
+  g_alert_head = (g_alert_head + 1) % AI_WATCH_BLE_ALERT_RING_LEN;
+  g_alert_count--;
+  return true;
+}
+
+/****************************************************************************
+ * Private Functions - Command frame parsing
+ *
+ * Frame: [version(1)][cmd_type(1)][id(1)][flags(1)][timestamp(4)]
+ *        [title_len(1)][title(N)]
+ *
+ * Runs on the main loop thread; the reminder store is only touched here.
+ ****************************************************************************/
+
+static void ai_ble_recount(void)
+{
+  int i;
+  uint8_t n = 0;
+
+  for (i = 0; i < AI_WATCH_REMINDER_MAX; i++)
+    {
+      if (g_reminders.items[i].id != 0)
+        {
+          n++;
+        }
+    }
+
+  g_reminders.count = n;
+}
+
+static bool ai_ble_cmd_reminder(uint8_t cmd_type,
+                                FAR const uint8_t *data, size_t len)
 {
   FAR struct ai_watch_reminder_s *slot;
   uint32_t timestamp;
@@ -191,13 +261,18 @@ static bool ai_ble_cmd_reminder(FAR const uint8_t *data, size_t len)
 
   slot->id = data[2];
   slot->flags = data[3];
+  slot->type = cmd_type;
   slot->timestamp = timestamp;
   memcpy(slot->title, &data[9], title_len);
   slot->title[title_len] = '\0';
 
+  ai_ble_recount();
   g_reminders.pending = true;
-  printf("BLE: reminder[%u] \"%s\" flags=0x%02x\n",
-         data[2], slot->title, data[3]);
+  ai_ble_alert_push(cmd_type, slot->id, slot->timestamp, slot->title);
+  printf("BLE: %s[%u] \"%s\" flags=0x%02x\n",
+         (cmd_type == AI_WATCH_BLE_CMD_NOTIFICATION) ?
+         "notification" : "reminder",
+         slot->id, slot->title, slot->flags);
   return true;
 }
 
@@ -219,10 +294,12 @@ static bool ai_ble_parse_command(FAR const uint8_t *data, size_t len)
     {
       case AI_WATCH_BLE_CMD_REMINDER:
       case AI_WATCH_BLE_CMD_NOTIFICATION:
-        return ai_ble_cmd_reminder(data, len);
+        return ai_ble_cmd_reminder(data[1], data, len);
 
       case AI_WATCH_BLE_CMD_CLEAR:
         memset(&g_reminders, 0, sizeof(g_reminders));
+        g_alert_head = 0;
+        g_alert_count = 0;
         g_reminders.pending = true;
         printf("BLE: reminders cleared\n");
         return true;
@@ -244,6 +321,9 @@ static bool ai_ble_parse_command(FAR const uint8_t *data, size_t len)
 int ai_watch_ble_init(void)
 {
   memset(&g_reminders, 0, sizeof(g_reminders));
+  memset(g_alerts, 0, sizeof(g_alerts));
+  g_alert_head = 0;
+  g_alert_count = 0;
   g_tz_offset_min = 0;
   g_last_sync_utc = 0;
 
@@ -378,6 +458,52 @@ FAR struct tm *ai_watch_ble_localtime(time_t utc, FAR struct tm *tm)
 FAR struct ai_watch_reminder_store_s *ai_watch_ble_get_reminders(void)
 {
   return &g_reminders;
+}
+
+/****************************************************************************
+ * Name: ai_watch_reminder_set_read / _delete / reminders_clear
+ *
+ * Watch-side reminder lifecycle (see ai_watch_ble.h). Main-loop thread
+ * only, like every other user of the store.
+ ****************************************************************************/
+
+void ai_watch_reminder_set_read(uint8_t slot, bool read)
+{
+  if (slot >= AI_WATCH_REMINDER_MAX || g_reminders.items[slot].id == 0)
+    {
+      return;
+    }
+
+  if (read)
+    {
+      g_reminders.items[slot].flags |= AI_WATCH_REMINDER_FLAG_READ;
+    }
+  else
+    {
+      g_reminders.items[slot].flags &= ~AI_WATCH_REMINDER_FLAG_READ;
+    }
+
+  g_reminders.pending = true;
+}
+
+bool ai_watch_reminder_delete(uint8_t slot)
+{
+  if (slot >= AI_WATCH_REMINDER_MAX || g_reminders.items[slot].id == 0)
+    {
+      return false;
+    }
+
+  memset(&g_reminders.items[slot], 0,
+         sizeof(g_reminders.items[slot]));
+  ai_ble_recount();
+  g_reminders.pending = true;
+  return true;
+}
+
+void ai_watch_reminders_clear(void)
+{
+  memset(&g_reminders, 0, sizeof(g_reminders));
+  g_reminders.pending = true;
 }
 
 /****************************************************************************

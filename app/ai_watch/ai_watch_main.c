@@ -41,13 +41,14 @@
 #include <lvgl/src/drivers/nuttx/lv_nuttx_touchscreen.h>
 
 #include "ai_watch_icons.h"
+#include "fonts/ai_watch_font_cjk_16.h"
 #include "ai_watch_ble.h"
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.1.0"
+#define AI_WATCH_VERSION            "4.3.0"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -196,10 +197,12 @@ struct ai_watch_s
   /* Display objects - Home page */
 
   FAR lv_obj_t *home_screen;
+  FAR lv_obj_t *home_title_label;
+  FAR lv_obj_t *home_hint_label;
   FAR lv_obj_t *time_label;
   FAR lv_obj_t *seconds_label;
   FAR lv_obj_t *date_label;
-  FAR lv_obj_t *dow_label;
+  FAR lv_obj_t *unread_label;
   FAR lv_obj_t *bt_label;
 
   /* Display objects - App list page */
@@ -276,12 +279,17 @@ struct ai_watch_s
 
 static void ai_watch_push_page(FAR struct ai_watch_s *watch, int page);
 static void ai_watch_pop_page(FAR struct ai_watch_s *watch);
+static void ai_watch_go_home(FAR struct ai_watch_s *watch);
 static void ai_watch_open_app(FAR struct ai_watch_s *watch, int app_index);
 
 /* Theme / state */
 
 static void ai_watch_update_bt_label(FAR struct ai_watch_s *watch);
 static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme);
+
+/* Alert banner (defined after the reminder app section) */
+
+static void ai_watch_alert_apply_theme(int theme);
 
 /* UI creation */
 
@@ -966,7 +974,6 @@ static lv_color_t ai_watch_theme_btn_bg(int theme)
 
 static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
 {
-  uint32_t home_child_count;
   uint32_t settings_child_count;
   uint32_t i;
 
@@ -983,27 +990,24 @@ static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
 
   lv_obj_set_style_bg_color(watch->home_screen,
                             ai_watch_theme_bg(theme), 0);
-  lv_obj_set_style_text_color(
-      lv_obj_get_child(watch->home_screen, 0),
-      ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_color(watch->home_title_label,
+                              ai_watch_theme_text(theme), 0);
   lv_obj_set_style_text_color(watch->time_label,
                               ai_watch_theme_text(theme), 0);
   lv_obj_set_style_text_color(watch->seconds_label,
-                              ai_watch_theme_secondary(theme), 0);
+                              ai_watch_theme_accent(theme), 0);
   lv_obj_set_style_text_color(watch->date_label,
                               ai_watch_theme_secondary(theme), 0);
-  lv_obj_set_style_text_color(watch->dow_label,
-                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_color(watch->unread_label,
+                              ai_watch_theme_accent(theme), 0);
   lv_obj_set_style_text_color(watch->bt_label,
                               ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_color(watch->home_hint_label,
+                              ai_watch_theme_secondary(theme), 0);
 
-  home_child_count = lv_obj_get_child_count(watch->home_screen);
-  if (home_child_count > 0)
-    {
-      lv_obj_set_style_text_color(
-          lv_obj_get_child(watch->home_screen, home_child_count - 1),
-          ai_watch_theme_secondary(theme), 0);
-    }
+  /* Update the alert banner if it is on screen */
+
+  ai_watch_alert_apply_theme(theme);
 
   /* Update App List page (just background) */
 
@@ -1182,6 +1186,43 @@ static void ai_watch_pop_page(FAR struct ai_watch_s *watch)
   lv_scr_load_anim(target, anim, 200, 0, false);
   printf("Pop to page %d (stack depth %d)\n", prev_page,
          watch->page_stack_top);
+}
+
+/* Swipe-right shortcut: straight back to home from any app or settings
+ * page. The home screen itself and the hex app-list page are excluded
+ * (their gestures must not be affected). Mirrors the dynamic-app
+ * cleanup done by ai_watch_pop_page; the old screen object is freed by
+ * LVGL once the load animation finishes.
+ */
+
+static void ai_watch_go_home(FAR struct ai_watch_s *watch)
+{
+  if (watch->current_page == AI_WATCH_PAGE_HOME ||
+      watch->current_page == AI_WATCH_PAGE_APP_LIST)
+    {
+      return;
+    }
+
+  if (watch->current_page == AI_WATCH_PAGE_APP_BASE)
+    {
+      if (watch->active_app_index >= 0 &&
+          watch->active_app_index < (int)AI_WATCH_APP_COUNT &&
+          g_app_registry[watch->active_app_index].destroy_cb != NULL)
+        {
+          g_app_registry[watch->active_app_index].destroy_cb(watch);
+        }
+
+      watch->app_page_screen = NULL;
+      watch->active_app_index = -1;
+    }
+
+  watch->page_stack_top = 0;
+  watch->page_stack[0] = AI_WATCH_PAGE_HOME;
+  watch->current_page = AI_WATCH_PAGE_HOME;
+
+  lv_scr_load_anim(watch->home_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+                   200, 0, false);
+  printf("Swipe: back to home\n");
 }
 
 static void ai_watch_open_app(FAR struct ai_watch_s *watch, int app_index)
@@ -1426,9 +1467,27 @@ static void ai_watch_destroy_timer_app(FAR struct ai_watch_s *watch)
  * Private Functions - Reminder App
  ****************************************************************************/
 
-/* Reminder list item label references for read/unread styling */
-
 #define REMINDER_APP_MAX_LABELS  8
+
+/* True when s is pure ASCII (no UTF-8 multibyte sequences) */
+
+static bool ai_watch_text_is_ascii(FAR const char *s)
+{
+  if (s == NULL)
+    {
+      return true;
+    }
+
+  while (*s != '\0')
+    {
+      if ((*s++ & 0x80) != 0)
+        {
+          return false;
+        }
+    }
+
+  return true;
+}
 
 struct ai_reminder_app_s
 {
@@ -1482,17 +1541,44 @@ static void ai_watch_reminder_refresh_cb(FAR lv_timer_t *timer)
           continue;
         }
 
-      if (i < store->count && store->items[i].id != 0)
+      if (store->items[i].id != 0)
         {
           FAR const struct ai_watch_reminder_s *item =
               &store->items[i];
-          char buf[48];
-          bool is_read = (item->flags & 0x01) != 0;
+          char buf[40];
+          char when[8];
+          bool is_read = (item->flags & AI_WATCH_REMINDER_FLAG_READ) != 0;
 
-          snprintf(buf, sizeof(buf), "%s %s",
-                   is_read ? "  " : LV_SYMBOL_EYE_OPEN,
-                   item->title);
+          /* Trigger time in watch-local time (empty if unset) */
+
+          when[0] = '\0';
+          if (item->timestamp >= AI_WATCH_TS_MIN_UTC)
+            {
+              struct tm tm;
+
+              if (ai_watch_ble_localtime((time_t)item->timestamp, &tm)
+                  != NULL)
+                {
+                  snprintf(when, sizeof(when), "%02d:%02d ",
+                           tm.tm_hour, tm.tm_min);
+                }
+            }
+
+          /* No icon glyphs here: the CJK font deliberately carries no
+           * LV_SYMBOL_* glyphs (see fonts/gen_cjk_font.sh), so symbols
+           * in a CJK label would render as placeholder boxes.
+           */
+
+          snprintf(buf, sizeof(buf), "%s%s", when, item->title);
           lv_label_set_text(lbl, buf);
+
+          /* Chinese titles need the CJK font; keep Montserrat for
+           * pure-ASCII ones so glyphs stay consistent.
+           */
+
+          lv_obj_set_style_text_font(
+              lbl, ai_watch_text_is_ascii(item->title) ?
+              &lv_font_montserrat_16 : &ai_watch_font_cjk_16, 0);
 
           if (is_read)
             {
@@ -1514,6 +1600,39 @@ static void ai_watch_reminder_refresh_cb(FAR lv_timer_t *timer)
     }
 }
 
+static void ai_watch_reminder_item_click_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_reminder_store_s *store;
+  uint8_t slot = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+  bool is_read;
+
+  store = ai_watch_ble_get_reminders();
+  if (store == NULL || slot >= AI_WATCH_REMINDER_MAX ||
+      store->items[slot].id == 0)
+    {
+      return;
+    }
+
+  /* Tap toggles read/unread so a mis-tap can be undone */
+
+  is_read = (store->items[slot].flags & AI_WATCH_REMINDER_FLAG_READ) != 0;
+  ai_watch_reminder_set_read(slot, !is_read);
+}
+
+static void ai_watch_reminder_item_long_cb(lv_event_t *e)
+{
+  uint8_t slot = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+
+  ai_watch_reminder_delete(slot);
+}
+
+static void ai_watch_reminder_clear_cb(lv_event_t *e)
+{
+  (void)e;
+
+  ai_watch_reminders_clear();
+}
+
 static void ai_watch_reminder_back_cb(lv_event_t *e)
 {
   FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
@@ -1527,6 +1646,8 @@ static void ai_watch_create_reminder_app(FAR struct ai_watch_s *watch)
   FAR lv_obj_t *title;
   FAR lv_obj_t *back_btn;
   FAR lv_obj_t *back_lbl;
+  FAR lv_obj_t *clear_btn;
+  FAR lv_obj_t *clear_lbl;
   FAR lv_obj_t *list;
   FAR lv_obj_t *empty_lbl;
   int theme = watch->current_theme;
@@ -1567,7 +1688,9 @@ static void ai_watch_create_reminder_app(FAR struct ai_watch_s *watch)
   lv_obj_set_style_pad_top(empty_lbl, 60, 0);
   g_reminder_app.empty_label = empty_lbl;
 
-  /* Pre-create item labels (hidden until data arrives) */
+  /* Pre-create item labels (hidden until data arrives). Tap toggles
+   * read/unread, long-press deletes the entry.
+   */
 
   for (i = 0; i < REMINDER_APP_MAX_LABELS; i++)
     {
@@ -1578,18 +1701,24 @@ static void ai_watch_create_reminder_app(FAR struct ai_watch_s *watch)
       lv_obj_set_style_text_color(lbl, ai_watch_theme_text(theme), 0);
       lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
       lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_ext_click_area(lbl, 8);
+      lv_obj_add_event_cb(lbl, ai_watch_reminder_item_click_cb,
+                          LV_EVENT_CLICKED, (void *)(intptr_t)i);
+      lv_obj_add_event_cb(lbl, ai_watch_reminder_item_long_cb,
+                          LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
       g_reminder_app.item_labels[i] = lbl;
     }
 
   g_reminder_app.list_obj = list;
 
-  /* Back button */
+  /* Back button (left) and Clear-all button (right) */
 
   back_btn = lv_btn_create(screen);
   lv_obj_set_size(back_btn, 120, 45);
   lv_obj_set_style_bg_color(back_btn, ai_watch_theme_btn_bg(theme), 0);
   lv_obj_set_style_radius(back_btn, 12, 0);
-  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, -75, -20);
   back_lbl = lv_label_create(back_btn);
   lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
   lv_obj_set_style_text_color(back_lbl,
@@ -1597,6 +1726,20 @@ static void ai_watch_create_reminder_app(FAR struct ai_watch_s *watch)
   lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
   lv_obj_center(back_lbl);
   lv_obj_add_event_cb(back_btn, ai_watch_reminder_back_cb,
+                      LV_EVENT_CLICKED, watch);
+
+  clear_btn = lv_btn_create(screen);
+  lv_obj_set_size(clear_btn, 120, 45);
+  lv_obj_set_style_bg_color(clear_btn, ai_watch_theme_btn_bg(theme), 0);
+  lv_obj_set_style_radius(clear_btn, 12, 0);
+  lv_obj_align(clear_btn, LV_ALIGN_BOTTOM_MID, 75, -20);
+  clear_lbl = lv_label_create(clear_btn);
+  lv_label_set_text(clear_lbl, "Clear all");
+  lv_obj_set_style_text_color(clear_lbl,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(clear_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(clear_lbl);
+  lv_obj_add_event_cb(clear_btn, ai_watch_reminder_clear_cb,
                       LV_EVENT_CLICKED, watch);
 
   /* Refresh timer — checks for new reminder data every 500ms */
@@ -1629,6 +1772,139 @@ static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch)
 
   memset(&g_reminder_app, 0, sizeof(g_reminder_app));
   watch->app_page_screen = NULL;
+}
+
+/****************************************************************************
+ * Private Functions - Incoming Alert Banner
+ *
+ * When the phone pushes a reminder or notification, a card is shown on
+ * LVGL's top layer (above every page). It auto-hides after a few seconds
+ * or on tap. Data arrives via ai_watch_ble_take_alert(), polled from the
+ * main loop, so the banner is only ever touched from the LVGL thread.
+ ****************************************************************************/
+
+#define AI_WATCH_ALERT_SHOW_MS      6000
+#define AI_WATCH_ALERT_WIDTH        358
+
+struct ai_alert_ui_s
+{
+  FAR lv_obj_t *panel;
+  FAR lv_obj_t *type_label;
+  FAR lv_obj_t *title_label;
+  FAR lv_timer_t *hide_timer;
+  bool visible;
+};
+
+static struct ai_alert_ui_s g_alert_ui;
+
+static void ai_watch_alert_apply_theme(int theme)
+{
+  if (g_alert_ui.panel == NULL)
+    {
+      return;
+    }
+
+  lv_obj_set_style_bg_color(g_alert_ui.panel,
+                            ai_watch_theme_btn_bg(theme), 0);
+  lv_obj_set_style_border_color(g_alert_ui.panel,
+                                ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_color(g_alert_ui.type_label,
+                              ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_color(g_alert_ui.title_label,
+                              ai_watch_theme_text(theme), 0);
+}
+
+static void ai_watch_alert_hide(void)
+{
+  if (g_alert_ui.panel != NULL)
+    {
+      lv_obj_add_flag(g_alert_ui.panel, LV_OBJ_FLAG_HIDDEN);
+    }
+
+  if (g_alert_ui.hide_timer != NULL)
+    {
+      lv_timer_del(g_alert_ui.hide_timer);
+      g_alert_ui.hide_timer = NULL;
+    }
+
+  g_alert_ui.visible = false;
+}
+
+static void ai_watch_alert_timeout_cb(FAR lv_timer_t *timer)
+{
+  (void)timer;
+  ai_watch_alert_hide();
+}
+
+static void ai_watch_alert_click_cb(lv_event_t *e)
+{
+  (void)e;
+  ai_watch_alert_hide();
+}
+
+static void ai_watch_alert_show(FAR struct ai_watch_s *watch,
+    FAR const struct ai_watch_ble_alert_s *a)
+{
+  int theme = watch->current_theme;
+  FAR const char *type_text;
+  FAR const lv_font_t *title_font;
+
+  if (g_alert_ui.panel == NULL)
+    {
+      FAR lv_obj_t *panel = lv_obj_create(lv_layer_top());
+
+      lv_obj_set_size(panel, AI_WATCH_ALERT_WIDTH, LV_SIZE_CONTENT);
+      lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, 12);
+      lv_obj_set_style_radius(panel, 16, 0);
+      lv_obj_set_style_border_width(panel, 2, 0);
+      lv_obj_set_style_pad_all(panel, 12, 0);
+      lv_obj_set_style_pad_row(panel, 6, 0);
+      lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+      lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START,
+                            LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+      lv_obj_add_event_cb(panel, ai_watch_alert_click_cb,
+                          LV_EVENT_CLICKED, NULL);
+
+      g_alert_ui.type_label = lv_label_create(panel);
+      lv_label_set_long_mode(g_alert_ui.type_label, LV_LABEL_LONG_DOT);
+      lv_obj_set_width(g_alert_ui.type_label,
+                       AI_WATCH_ALERT_WIDTH - 2 * 12);
+      lv_obj_set_style_text_font(g_alert_ui.type_label,
+                                 &lv_font_montserrat_16, 0);
+
+      g_alert_ui.title_label = lv_label_create(panel);
+      lv_label_set_long_mode(g_alert_ui.title_label, LV_LABEL_LONG_DOT);
+      lv_obj_set_width(g_alert_ui.title_label,
+                       AI_WATCH_ALERT_WIDTH - 2 * 12);
+
+      g_alert_ui.panel = panel;
+    }
+
+  type_text = (a->type == AI_WATCH_BLE_CMD_NOTIFICATION) ?
+              LV_SYMBOL_ENVELOPE "  Notification" :
+              LV_SYMBOL_BELL "  Reminder";
+  title_font = ai_watch_text_is_ascii(a->title) ?
+               &lv_font_montserrat_20 : &ai_watch_font_cjk_16;
+
+  lv_label_set_text(g_alert_ui.type_label, type_text);
+  lv_obj_set_style_text_font(g_alert_ui.title_label, title_font, 0);
+  lv_label_set_text(g_alert_ui.title_label, a->title);
+
+  ai_watch_alert_apply_theme(theme);
+  lv_obj_clear_flag(g_alert_ui.panel, LV_OBJ_FLAG_HIDDEN);
+  g_alert_ui.visible = true;
+
+  /* Restart the auto-hide timer for the newest arrival */
+
+  if (g_alert_ui.hide_timer != NULL)
+    {
+      lv_timer_del(g_alert_ui.hide_timer);
+    }
+
+  g_alert_ui.hide_timer = lv_timer_create(ai_watch_alert_timeout_cb,
+                                          AI_WATCH_ALERT_SHOW_MS, NULL);
+  lv_timer_set_repeat_count(g_alert_ui.hide_timer, 1);
 }
 
 /****************************************************************************
@@ -2637,64 +2913,94 @@ static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch)
 static void ai_watch_create_home_page(FAR struct ai_watch_s *watch)
 {
   FAR lv_obj_t *screen = lv_obj_create(NULL);
-  FAR lv_obj_t *title;
-  FAR lv_obj_t *hint;
+  FAR lv_obj_t *time_row;
   int theme = watch->current_theme;
 
   lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
   watch->home_screen = screen;
   watch->fixed_pages[AI_WATCH_PAGE_HOME] = screen;
 
-  title = lv_label_create(screen);
-  lv_label_set_text(title, "AI Watch");
-  lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+  /* Title */
 
-  watch->time_label = lv_label_create(screen);
-  lv_label_set_text(watch->time_label, "--:--");
-  lv_obj_set_style_text_color(watch->time_label,
+  watch->home_title_label = lv_label_create(screen);
+  lv_label_set_text(watch->home_title_label, "AI Watch");
+  lv_obj_set_style_text_color(watch->home_title_label,
                               ai_watch_theme_text(theme), 0);
-  lv_obj_set_style_text_font(watch->time_label, &lv_font_montserrat_48, 0);
-  lv_obj_align(watch->time_label, LV_ALIGN_CENTER, 0, -40);
+  lv_obj_set_style_text_font(watch->home_title_label,
+                             &lv_font_montserrat_20, 0);
+  lv_obj_align(watch->home_title_label, LV_ALIGN_TOP_MID, 0, 26);
 
-  watch->seconds_label = lv_label_create(screen);
-  lv_label_set_text(watch->seconds_label, ":--");
-  lv_obj_set_style_text_color(watch->seconds_label,
-                              ai_watch_theme_secondary(theme), 0);
-  lv_obj_set_style_text_font(watch->seconds_label,
-                              &lv_font_montserrat_24, 0);
-  lv_obj_align_to(watch->seconds_label, watch->time_label,
-                  LV_ALIGN_OUT_RIGHT_MID, 5, 8);
+  /* Date + weekday combined in one label so the two can never overlap */
 
   watch->date_label = lv_label_create(screen);
   lv_label_set_text(watch->date_label, "----/--/--");
   lv_obj_set_style_text_color(watch->date_label,
                               ai_watch_theme_secondary(theme), 0);
-  lv_obj_set_style_text_font(watch->date_label, &lv_font_montserrat_16, 0);
-  lv_obj_align_to(watch->date_label, watch->time_label,
-                  LV_ALIGN_OUT_BOTTOM_MID, -20, 12);
+  lv_obj_set_style_text_font(watch->date_label,
+                             &lv_font_montserrat_16, 0);
+  lv_obj_align(watch->date_label, LV_ALIGN_TOP_MID, 0, 58);
 
-  watch->dow_label = lv_label_create(screen);
-  lv_label_set_text(watch->dow_label, "");
-  lv_obj_set_style_text_color(watch->dow_label,
-                              ai_watch_theme_secondary(theme), 0);
-  lv_obj_set_style_text_font(watch->dow_label, &lv_font_montserrat_16, 0);
-  lv_obj_align_to(watch->dow_label, watch->date_label,
-                  LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+  /* Time row: HH:MM (48 px) and the seconds (28 px, no colon) are laid
+   * out by a fixed-gap flex container, so a size change on either side
+   * re-flows the row instead of overlapping the neighbor.
+   */
+
+  time_row = lv_obj_create(screen);
+  lv_obj_set_size(time_row, AI_WATCH_SCREEN_WIDTH, 64);
+  lv_obj_align(time_row, LV_ALIGN_CENTER, 0, -38);
+  lv_obj_set_style_bg_opa(time_row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(time_row, 0, 0);
+  lv_obj_set_style_pad_all(time_row, 0, 0);
+  lv_obj_set_style_pad_column(time_row, 10, 0);
+  lv_obj_set_scrollbar_mode(time_row, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(time_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(time_row, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_flex_flow(time_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(time_row, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  watch->time_label = lv_label_create(time_row);
+  lv_label_set_text(watch->time_label, "--:--");
+  lv_obj_set_style_text_color(watch->time_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(watch->time_label, &lv_font_montserrat_48, 0);
+
+  watch->seconds_label = lv_label_create(time_row);
+  lv_label_set_text(watch->seconds_label, "--");
+  lv_obj_set_style_text_color(watch->seconds_label,
+                              ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_font(watch->seconds_label,
+                             &lv_font_montserrat_28, 0);
+
+  /* Unread reminder count (hidden while there is nothing unread) */
+
+  watch->unread_label = lv_label_create(screen);
+  lv_label_set_text(watch->unread_label, "");
+  lv_obj_set_style_text_color(watch->unread_label,
+                              ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_font(watch->unread_label,
+                             &lv_font_montserrat_16, 0);
+  lv_obj_align(watch->unread_label, LV_ALIGN_CENTER, 0, 20);
+  lv_obj_add_flag(watch->unread_label, LV_OBJ_FLAG_HIDDEN);
+
+  /* Bluetooth status */
 
   watch->bt_label = lv_label_create(screen);
   lv_label_set_text(watch->bt_label, "BT: OFF");
   lv_obj_set_style_text_color(watch->bt_label,
                               ai_watch_theme_accent(theme), 0);
   lv_obj_set_style_text_font(watch->bt_label, &lv_font_montserrat_20, 0);
-  lv_obj_align(watch->bt_label, LV_ALIGN_BOTTOM_MID, 0, -60);
+  lv_obj_align(watch->bt_label, LV_ALIGN_BOTTOM_MID, 0, -64);
 
-  hint = lv_label_create(screen);
-  lv_label_set_text(hint, "Tap or swipe up for apps");
-  lv_obj_set_style_text_color(hint, ai_watch_theme_secondary(theme), 0);
-  lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, 0);
-  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
+  /* Gesture hint */
+
+  watch->home_hint_label = lv_label_create(screen);
+  lv_label_set_text(watch->home_hint_label, "Tap or swipe up for apps");
+  lv_obj_set_style_text_color(watch->home_hint_label,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(watch->home_hint_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(watch->home_hint_label, LV_ALIGN_BOTTOM_MID, 0, -24);
 
   lv_obj_add_event_cb(screen, ai_watch_home_click_cb,
                       LV_EVENT_CLICKED, watch);
@@ -2987,7 +3293,6 @@ static void ai_watch_time_update(FAR struct ai_watch_s *watch)
   char date[32];
   char time_hm[8];
   char time_sec[8];
-  char dow[8];
   char about[128];
   struct timespec ts;
   struct tm tm;
@@ -3009,9 +3314,8 @@ static void ai_watch_time_update(FAR struct ai_watch_s *watch)
       if (watch->rtc_valid)
         {
           lv_label_set_text(watch->time_label, "--:--");
-          lv_label_set_text(watch->seconds_label, ":--");
+          lv_label_set_text(watch->seconds_label, "--");
           lv_label_set_text(watch->date_label, "----/--/--");
-          lv_label_set_text(watch->dow_label, "");
           watch->rtc_valid = false;
 
           snprintf(about, sizeof(about),
@@ -3035,18 +3339,18 @@ static void ai_watch_time_update(FAR struct ai_watch_s *watch)
   watch->displayed_second = ts.tv_sec;
 
   strftime(time_hm, sizeof(time_hm), "%H:%M", &tm);
-  snprintf(time_sec, sizeof(time_sec), ":%02d", tm.tm_sec);
-  strftime(date, sizeof(date), "%Y/%m/%d", &tm);
+  snprintf(time_sec, sizeof(time_sec), "%02d", tm.tm_sec);
 
-  int wday = ai_watch_day_of_week(tm.tm_year + 1900,
-                                  tm.tm_mon + 1, tm.tm_mday);
+  /* Weekday and date share a single label (no overlap possible) */
 
-  snprintf(dow, sizeof(dow), "%s", day_names[wday]);
+  snprintf(date, sizeof(date), "%s  %04d/%02d/%02d",
+           day_names[ai_watch_day_of_week(tm.tm_year + 1900,
+                                          tm.tm_mon + 1, tm.tm_mday)],
+           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 
   lv_label_set_text(watch->time_label, time_hm);
   lv_label_set_text(watch->seconds_label, time_sec);
   lv_label_set_text(watch->date_label, date);
-  lv_label_set_text(watch->dow_label, dow);
 
   snprintf(about, sizeof(about),
            "AI Watch v" AI_WATCH_VERSION "\n"
@@ -3056,6 +3360,63 @@ static void ai_watch_time_update(FAR struct ai_watch_s *watch)
            watch->touch_available ? "Active" : "Unavailable",
            time_hm);
   lv_label_set_text(watch->about_label, about);
+}
+
+/****************************************************************************
+ * Name: ai_watch_unread_update
+ *
+ * Description:
+ *   Refresh the home-page unread indicator (bell + count). Reads the
+ *   reminder store directly, so it does not depend on the reminder app
+ *   being open or its pending flag.
+ *
+ ****************************************************************************/
+
+static void ai_watch_unread_update(FAR struct ai_watch_s *watch)
+{
+  FAR struct ai_watch_reminder_store_s *store;
+  static int last_unread = -1;
+  char buf[32];
+  int unread = 0;
+  int i;
+
+  store = ai_watch_ble_get_reminders();
+  if (store != NULL)
+    {
+      for (i = 0; i < AI_WATCH_REMINDER_MAX; i++)
+        {
+          FAR const struct ai_watch_reminder_s *item = &store->items[i];
+
+          if (item->id != 0 &&
+              (item->flags & AI_WATCH_REMINDER_FLAG_READ) == 0)
+            {
+              unread++;
+            }
+        }
+    }
+
+  if (unread == last_unread)
+    {
+      return;
+    }
+
+  last_unread = unread;
+
+  if (watch->unread_label == NULL)
+    {
+      return;
+    }
+
+  if (unread > 0)
+    {
+      snprintf(buf, sizeof(buf), LV_SYMBOL_BELL " %d unread", unread);
+      lv_label_set_text(watch->unread_label, buf);
+      lv_obj_clear_flag(watch->unread_label, LV_OBJ_FLAG_HIDDEN);
+    }
+  else
+    {
+      lv_obj_add_flag(watch->unread_label, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /****************************************************************************
@@ -3101,27 +3462,34 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
           return;
         }
 
-      /* Only process gesture on HOME page.
-       * Menu page: hex menu container handles all touches.
-       * Other pages: back via KEY2 or on-screen buttons.
-       */
-
-      if (watch->current_page != AI_WATCH_PAGE_HOME)
+      if (watch->current_page == AI_WATCH_PAGE_HOME)
         {
-          return;
-        }
+          /* Home page: tap or swipe up opens the app list */
 
-      if (abs(dy) > AI_WATCH_SWIPE_THRESHOLD && abs(dy) > abs(dx))
-        {
-          if (dy < 0)
+          if (abs(dy) > AI_WATCH_SWIPE_THRESHOLD && abs(dy) > abs(dx))
+            {
+              if (dy < 0)
+                {
+                  ai_watch_push_page(watch, AI_WATCH_PAGE_APP_LIST);
+                }
+            }
+          else if (abs(dx) < AI_WATCH_SWIPE_THRESHOLD &&
+                   abs(dy) < AI_WATCH_SWIPE_THRESHOLD)
             {
               ai_watch_push_page(watch, AI_WATCH_PAGE_APP_LIST);
             }
         }
-      else if (abs(dx) < AI_WATCH_SWIPE_THRESHOLD &&
-               abs(dy) < AI_WATCH_SWIPE_THRESHOLD)
+      else if (watch->current_page != AI_WATCH_PAGE_APP_LIST)
         {
-          ai_watch_push_page(watch, AI_WATCH_PAGE_APP_LIST);
+          /* App and settings pages: swipe right returns straight home.
+           * The hex app-list page is excluded so its own drag handling
+           * is not affected.
+           */
+
+          if (dx > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
+            {
+              ai_watch_go_home(watch);
+            }
         }
     }
 }
@@ -3330,7 +3698,20 @@ int main(int argc, FAR char *argv[])
             last_ble_state = state;
             ai_watch_update_bt_label(&watch);
           }
+
+        /* Show an alert banner for every arrival not shown yet */
+
+        {
+          struct ai_watch_ble_alert_s alert;
+
+          while (ai_watch_ble_take_alert(&alert))
+            {
+              ai_watch_alert_show(&watch, &alert);
+            }
+        }
       }
+
+      ai_watch_unread_update(&watch);
 
       idle = lv_timer_handler();
       if (idle == 0 || idle > AI_WATCH_BUTTON_POLL_MS)

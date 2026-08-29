@@ -28,6 +28,7 @@ if(CONFIG_EXAMPLES_AI_WATCH)
     ai_watch_main.c
     ai_watch_icons.c
     ai_watch_ble.c
+    fonts/ai_watch_font_cjk_16.c
     STACKSIZE
     ${CONFIG_EXAMPLES_AI_WATCH_STACKSIZE}
     HEAPSIZE

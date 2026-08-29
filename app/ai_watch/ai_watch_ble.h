@@ -117,6 +117,10 @@
 #define AI_WATCH_REMINDER_MAX           8
 #define AI_WATCH_REMINDER_TITLE_MAX     24
 
+/* Pending-alert ring depth: how many arrivals can wait for the banner */
+
+#define AI_WATCH_BLE_ALERT_RING_LEN     4
+
 /* TimeSync validity window (matches bridge validation) */
 
 #define AI_WATCH_TS_MIN_UTC             1577836800u   /* 2020-01-01 */
@@ -132,6 +136,7 @@ struct ai_watch_reminder_s
 {
   uint8_t id;                   /* Unique ID (0 = empty slot) */
   uint8_t flags;                /* AI_WATCH_REMINDER_FLAG_* */
+  uint8_t type;                 /* AI_WATCH_BLE_CMD_REMINDER or _NOTIFICATION */
   uint32_t timestamp;           /* UTC Unix seconds */
   char title[AI_WATCH_REMINDER_TITLE_MAX + 1];
 };
@@ -145,6 +150,16 @@ struct ai_watch_reminder_store_s
   struct ai_watch_reminder_s items[AI_WATCH_REMINDER_MAX];
   uint8_t count;
   bool pending;                 /* set after any change, for UI refresh */
+};
+
+/* One arrival waiting to be shown as the on-screen alert banner */
+
+struct ai_watch_ble_alert_s
+{
+  uint8_t type;                 /* AI_WATCH_BLE_CMD_REMINDER or _NOTIFICATION */
+  uint8_t id;
+  uint32_t timestamp;           /* UTC Unix seconds */
+  char title[AI_WATCH_REMINDER_TITLE_MAX + 1];
 };
 
 /****************************************************************************
@@ -235,6 +250,51 @@ FAR struct tm *ai_watch_ble_localtime(time_t utc, FAR struct tm *tm);
  ****************************************************************************/
 
 FAR struct ai_watch_reminder_store_s *ai_watch_ble_get_reminders(void);
+
+/****************************************************************************
+ * Name: ai_watch_ble_take_alert
+ *
+ * Description:
+ *   Pop the oldest arrival (reminder or notification) that has not been
+ *   shown as an alert banner yet. Call repeatedly from the main loop
+ *   until it returns false. Command frames parsed in ai_watch_ble_process()
+ *   enqueue here, so this is safe to call from the LVGL thread.
+ *
+ * Returned Value:
+ *   true and fills *out when an alert is pending; false otherwise.
+ *
+ ****************************************************************************/
+
+bool ai_watch_ble_take_alert(FAR struct ai_watch_ble_alert_s *out);
+
+/****************************************************************************
+ * Name: ai_watch_reminder_set_read / _delete / reminders_clear
+ *
+ * Description:
+ *   Watch-side reminder lifecycle, called from the Reminder UI (main-loop
+ *   thread, same thread as the command parser - no locking):
+ *   - set_read:  toggle the AI_WATCH_REMINDER_FLAG_READ bit of one slot
+ *   - delete:    remove one reminder (id 0 = empty slot), compacting is
+ *                not needed - the UI hides empty slots
+ *   - clear:     drop every reminder (same as the phone CLEAR command)
+ *
+ *   All three mark the store pending so the Reminder UI re-renders and
+ *   the home-page unread count refreshes.
+ *
+ * Input Parameters:
+ *   slot - store index (0..AI_WATCH_REMINDER_MAX-1); must reference a
+ *          used slot (id != 0) for set_read/delete, ignored otherwise.
+ *
+ * Returned Value:
+ *   delete returns true when the slot was removed.
+ *
+ ****************************************************************************/
+
+void ai_watch_reminder_set_read(uint8_t slot, bool read);
+
+bool ai_watch_reminder_delete(uint8_t slot);
+
+void ai_watch_reminders_clear(void);
 
 /****************************************************************************
  * Name: ai_watch_ble_send_sensor_data
