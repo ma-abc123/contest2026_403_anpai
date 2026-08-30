@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include <nuttx/input/buttons.h>
+#include <nuttx/sensors/dhtxx.h>
 
 #include <lvgl/lvgl.h>
 #include <lvgl/src/drivers/nuttx/lv_nuttx_touchscreen.h>
@@ -49,7 +50,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.5.0"
+#define AI_WATCH_VERSION            "4.6.0"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -1946,13 +1947,16 @@ static void ai_watch_dht_update_cb(FAR lv_timer_t *timer)
 {
   FAR struct ai_watch_s *watch = lv_timer_get_user_data(timer);
   int theme = watch->current_theme;
-  FILE *fp;
+  struct dhtxx_sensor_data_s sample;
   char buf[64];
+  int fd;
+  int nread;
 
-  /* Try to read temperature */
+  /* The dhtxx driver returns one binary sample per read():
+   * struct dhtxx_sensor_data_s { float hum; float temp; status }. */
 
-  fp = fopen(DHT_SENSOR_PATH, "r");
-  if (fp == NULL)
+  fd = open(DHT_SENSOR_PATH, O_RDONLY);
+  if (fd < 0)
     {
       if (g_dht_app.sensor_available)
         {
@@ -1969,65 +1973,59 @@ static void ai_watch_dht_update_cb(FAR lv_timer_t *timer)
       return;
     }
 
-  /* Read raw data from device.
-   * The dhtxx driver outputs temperature and humidity as text.
-   * Format depends on the NuttX sensor framework configuration.
-   */
+  nread = read(fd, &sample, sizeof(sample));
+  close(fd);
 
-  if (fgets(buf, sizeof(buf), fp) != NULL)
+  if (nread == (int)sizeof(sample) && sample.status == DHTXX_SUCCESS)
     {
-      float temp = 0.0f;
-      float hum = 0.0f;
+      g_dht_app.last_temp = sample.temp;
+      g_dht_app.last_hum = sample.hum;
+      g_dht_app.last_sample_time = time(NULL);
+      g_dht_app.sensor_available = true;
 
-      /* Parse "temperature humidity" format */
+      snprintf(buf, sizeof(buf), "%.1f C", sample.temp);
+      lv_label_set_text(g_dht_app.temp_label, buf);
 
-      if (sscanf(buf, "%f %f", &temp, &hum) >= 2)
+      snprintf(buf, sizeof(buf), "%.1f %%", sample.hum);
+      lv_label_set_text(g_dht_app.hum_label, buf);
+
+      lv_label_set_text(g_dht_app.status_label,
+                        LV_SYMBOL_OK " Sensor active");
+      lv_obj_set_style_text_color(g_dht_app.status_label,
+                                  lv_color_make(0, 200, 0), 0);
+
+      /* Show last sample time */
+
+      {
+        struct tm tm;
+
+        ai_watch_ble_localtime(g_dht_app.last_sample_time, &tm);
+        snprintf(buf, sizeof(buf), "Last: %02d:%02d:%02d",
+                 tm.tm_hour, tm.tm_min, tm.tm_sec);
+        lv_label_set_text(g_dht_app.time_label, buf);
+      }
+
+      /* Send sensor data via BLE */
+
+      ai_watch_ble_send_sensor_data(AI_WATCH_BLE_SENSOR_TEMP,
+                                    &sample.temp, sizeof(float));
+      ai_watch_ble_send_sensor_data(AI_WATCH_BLE_SENSOR_HUM,
+                                    &sample.hum, sizeof(float));
+    }
+  else
+    {
+      /* Transient failures (checksum/timeout) keep the last good
+       * values on screen; only flag an error if nothing was read yet.
+       */
+
+      if (!g_dht_app.sensor_available)
         {
-          g_dht_app.last_temp = temp;
-          g_dht_app.last_hum = hum;
-          g_dht_app.last_sample_time = time(NULL);
-          g_dht_app.sensor_available = true;
-
-          snprintf(buf, sizeof(buf), "%.1f C", temp);
-          lv_label_set_text(g_dht_app.temp_label, buf);
-
-          snprintf(buf, sizeof(buf), "%.1f %%", hum);
-          lv_label_set_text(g_dht_app.hum_label, buf);
-
           lv_label_set_text(g_dht_app.status_label,
-                            LV_SYMBOL_OK " Sensor active");
+                            LV_SYMBOL_WARNING " Read error");
           lv_obj_set_style_text_color(g_dht_app.status_label,
-                                      lv_color_make(0, 200, 0), 0);
-
-          /* Show last sample time */
-
-          {
-            struct tm tm;
-
-            ai_watch_ble_localtime(g_dht_app.last_sample_time, &tm);
-            snprintf(buf, sizeof(buf), "Last: %02d:%02d:%02d",
-                     tm.tm_hour, tm.tm_min, tm.tm_sec);
-            lv_label_set_text(g_dht_app.time_label, buf);
-          }
-
-          /* Send sensor data via BLE */
-
-          ai_watch_ble_send_sensor_data(0x01, &temp, sizeof(float));
-          ai_watch_ble_send_sensor_data(0x02, &hum, sizeof(float));
-        }
-      else
-        {
-          if (!g_dht_app.sensor_available)
-            {
-              lv_label_set_text(g_dht_app.status_label,
-                                LV_SYMBOL_WARNING " Read error");
-              lv_obj_set_style_text_color(g_dht_app.status_label,
-                                          lv_color_make(255, 180, 0), 0);
-            }
+                                      lv_color_make(255, 180, 0), 0);
         }
     }
-
-  fclose(fp);
 }
 
 static void ai_watch_dht_back_cb(lv_event_t *e)
