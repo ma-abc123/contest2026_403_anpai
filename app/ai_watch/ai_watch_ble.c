@@ -389,6 +389,15 @@ void ai_watch_ble_process(void)
       ai_ble_parse_command(cmd, len);
     }
 
+  /* Controller self-heal: if the LCPU bluetooth firmware reported a
+   * hardware error, power-cycle it and rebuild the host stack. */
+
+  if (ai_watch_ble_bsp_take_hw_error())
+    {
+      ai_watch_ble_bsp_recover();
+      return;
+    }
+
   /* Auto-reconnect: after a link loss, retry re-advertising once per
    * second from this (application) thread until it succeeds - the
    * bridge cannot run the HCI command sequence reliably from its RX

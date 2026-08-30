@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -48,12 +49,13 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.3.0"
+#define AI_WATCH_VERSION            "4.4.1"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
 #define AI_WATCH_BUTTON_RELEASE_MS  80
 #define AI_WATCH_RTC_MIN_YEAR       2020
+#define AI_WATCH_RTC_MAX_YEAR       2035
 #define AI_WATCH_INPUT_DEVICE       "/dev/input0"
 
 /* Display dimensions */
@@ -80,6 +82,11 @@
 
 #define AI_WATCH_SWIPE_THRESHOLD    50
 #define AI_WATCH_SWIPE_TIMEOUT_MS   300
+/* Back-home gesture: fires mid-drag as soon as the horizontal intent is
+ * unambiguous; the release-based fallback allows slow, deliberate swipes.
+ */
+#define AI_WATCH_SWIPE_BACK_TRIGGER     70
+#define AI_WATCH_SWIPE_BACK_TIMEOUT_MS  800
 
 /* Theme definitions */
 
@@ -243,6 +250,8 @@ struct ai_watch_s
 
   FAR lv_indev_t *touch_indev;
   bool touch_active;
+  bool gesture_handled;         /* back-home fired mid-drag */
+
   bool touch_available;
   int touch_start_x;
   int touch_start_y;
@@ -3109,7 +3118,8 @@ static void ai_watch_init_about(FAR struct ai_watch_s *watch)
 
   if (clock_gettime(CLOCK_REALTIME, &ts) == 0 &&
       ai_watch_ble_localtime(ts.tv_sec, &tm) != NULL &&
-      tm.tm_year + 1900 >= AI_WATCH_RTC_MIN_YEAR)
+      tm.tm_year + 1900 >= AI_WATCH_RTC_MIN_YEAR &&
+      tm.tm_year + 1900 <= AI_WATCH_RTC_MAX_YEAR)
     {
       char time[16];
 
@@ -3301,9 +3311,22 @@ static void ai_watch_time_update(FAR struct ai_watch_s *watch)
     "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
   };
 
-  if (clock_gettime(CLOCK_REALTIME, &ts) < 0 ||
-      ai_watch_ble_localtime(ts.tv_sec, &tm) == NULL ||
-      tm.tm_year + 1900 < AI_WATCH_RTC_MIN_YEAR)
+  if (clock_gettime(CLOCK_REALTIME, &ts) < 0)
+    {
+      return;
+    }
+
+  /* Hot path: the main loop runs ~100Hz - only convert/calendar work
+   * when the displayed second actually changes. */
+
+  if (ts.tv_sec == watch->displayed_second && watch->rtc_valid)
+    {
+      return;
+    }
+
+  if (ai_watch_ble_localtime(ts.tv_sec, &tm) == NULL ||
+      tm.tm_year + 1900 < AI_WATCH_RTC_MIN_YEAR ||
+      tm.tm_year + 1900 > AI_WATCH_RTC_MAX_YEAR)
     {
       if (!watch->rtc_warning_printed)
         {
@@ -3443,9 +3466,30 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
       if (!watch->touch_active)
         {
           watch->touch_active = true;
+          watch->gesture_handled = false;
           watch->touch_start_x = point.x;
           watch->touch_start_y = point.y;
           watch->touch_start_time = now;
+        }
+      else if (!watch->gesture_handled &&
+               watch->current_page != AI_WATCH_PAGE_HOME &&
+               watch->current_page != AI_WATCH_PAGE_APP_LIST)
+        {
+          /* App and settings pages: return home as soon as the drag
+           * shows unambiguous horizontal intent - no release timing
+           * needed. The hex app-list page is excluded so its own drag
+           * handling is not affected.
+           */
+
+          int dx = point.x - watch->touch_start_x;
+          int dy = point.y - watch->touch_start_y;
+
+          if (dx > AI_WATCH_SWIPE_BACK_TRIGGER &&
+              abs(dx) > abs(dy) * 2)
+            {
+              watch->gesture_handled = true;
+              ai_watch_go_home(watch);
+            }
         }
     }
   else if (watch->touch_active)
@@ -3457,7 +3501,7 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
 
       watch->touch_active = false;
 
-      if (elapsed_ms > AI_WATCH_SWIPE_TIMEOUT_MS)
+      if (watch->gesture_handled)
         {
           return;
         }
@@ -3465,6 +3509,11 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
       if (watch->current_page == AI_WATCH_PAGE_HOME)
         {
           /* Home page: tap or swipe up opens the app list */
+
+          if (elapsed_ms > AI_WATCH_SWIPE_TIMEOUT_MS)
+            {
+              return;
+            }
 
           if (abs(dy) > AI_WATCH_SWIPE_THRESHOLD && abs(dy) > abs(dx))
             {
@@ -3481,10 +3530,12 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
         }
       else if (watch->current_page != AI_WATCH_PAGE_APP_LIST)
         {
-          /* App and settings pages: swipe right returns straight home.
-           * The hex app-list page is excluded so its own drag handling
-           * is not affected.
-           */
+          /* Slow deliberate swipes: release-based fallback */
+
+          if (elapsed_ms > AI_WATCH_SWIPE_BACK_TIMEOUT_MS)
+            {
+              return;
+            }
 
           if (dx > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
             {
@@ -3539,11 +3590,21 @@ int main(int argc, FAR char *argv[])
   printf("AI Watch version %s\n", AI_WATCH_VERSION);
   printf("ai_watch started\n");
 
+  {
+    /* Heap diagnostics: arena must end below the LCPU mailbox window
+     * (0x2007FC00) or the BT controller stream gets corrupted.
+     */
+
+    struct mallinfo mi = mallinfo();
+
+    printf("heap arena %u bytes\n", (unsigned int)mi.arena);
+  }
+
   /* Wait for LCD device (mandatory).  Touch will be added later. */
 
   int retry;
 
-  for (retry = 0; retry < 50; retry++)
+  for (retry = 0; retry < 100; retry++)
     {
       if (access("/dev/lcd0", F_OK) == 0)
         {
@@ -3554,9 +3615,9 @@ int main(int argc, FAR char *argv[])
       usleep(100000);
     }
 
-  if (retry >= 50)
+  if (retry >= 100)
     {
-      printf("ERROR: /dev/lcd0 not found after 5s\n");
+      printf("ERROR: /dev/lcd0 not found after 10s\n");
       return EXIT_FAILURE;
     }
 
@@ -3578,7 +3639,7 @@ int main(int argc, FAR char *argv[])
 
   int init_retry;
 
-  for (init_retry = 0; init_retry < 3; init_retry++)
+  for (init_retry = 0; ; init_retry++)
     {
       lv_nuttx_init(&info, &result);
 
@@ -3598,15 +3659,8 @@ int main(int argc, FAR char *argv[])
       info.input_path = NULL;
     }
 
-  if (result.disp == NULL)
-    {
-      printf("ERROR: LVGL init failed after %d retries\n", init_retry);
-      lv_nuttx_deinit(&result);
-      lv_deinit();
-      return EXIT_FAILURE;
-    }
-
-  printf("LVGL initialized, display ready\n");
+  printf("LVGL initialized, display ready after %d attempt(s)\n",
+         init_retry + 1);
 
   /* Touch may not be registered yet — try now, poll later if not */
 
@@ -3714,6 +3768,7 @@ int main(int argc, FAR char *argv[])
       ai_watch_unread_update(&watch);
 
       idle = lv_timer_handler();
+
       if (idle == 0 || idle > AI_WATCH_BUTTON_POLL_MS)
         {
           idle = AI_WATCH_BUTTON_POLL_MS;

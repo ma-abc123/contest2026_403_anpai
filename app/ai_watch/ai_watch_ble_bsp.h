@@ -181,6 +181,23 @@ int ai_watch_ble_bsp_notify(uint8_t chr, FAR const void *data,
 void ai_watch_ble_bsp_resume_advertising(void);
 
 /****************************************************************************
+ * Name: ai_watch_ble_bsp_take_hw_error / ai_watch_ble_bsp_recover
+ *
+ * Description:
+ *   Controller self-heal.  When the LCPU bluetooth firmware dies it
+ *   reports a Hardware Error event; the bridge latches that as a
+ *   pending flag (RX-thread context).  Poll take_hw_error() from the
+ *   main loop and call recover() when it returns true: the LCPU is
+ *   power-cycled (patches + RF calibration re-run), the zblue host is
+ *   torn down and rebuilt, and advertising resumes.
+ *
+ ****************************************************************************/
+
+bool ai_watch_ble_bsp_take_hw_error(void);
+
+void ai_watch_ble_bsp_recover(void);
+
+/****************************************************************************
  * Name: ai_watch_ble_bsp_set_enabled
  *
  * Description:
