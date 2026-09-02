@@ -61,11 +61,13 @@
 
 #define AI_WATCH_BLE_TIMESYNC_SIZE  7
 
-/* Command frame queue: one frame is at most
- * version(1)+cmd(1)+id(1)+flags(1)+ts(4)+len(1)+title(24) = 33 bytes
+/* Command frame queue: the largest frame is the AI_TEXT command:
+ * version(1)+cmd(1)+id(1)+flags(1)+ts(4)+len(1)+text(224) = 233 bytes.
+ * Requires MTU >= 247 (ATT write payload up to 244); the reminder frame
+ * stays at 33 bytes. 4 slots x 240 B ≈ 1 KB of static queue memory.
  */
 
-#define AI_WATCH_BLE_CMD_MAX        64
+#define AI_WATCH_BLE_CMD_MAX        240
 #define AI_WATCH_BLE_CMD_QUEUE_LEN  4
 
 /****************************************************************************

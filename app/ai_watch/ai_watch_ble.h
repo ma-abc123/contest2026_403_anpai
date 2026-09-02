@@ -96,6 +96,23 @@
 #define AI_WATCH_BLE_SENSOR_HUM         0x02  /* float32 LE, %RH */
 #define AI_WATCH_BLE_SENSOR_HR          0x03  /* uint16 LE, bpm */
 #define AI_WATCH_BLE_SENSOR_SPO2        0x04  /* uint16 LE, % */
+#define AI_WATCH_BLE_SENSOR_STEPS       0x05  /* uint32 LE, steps today */
+#define AI_WATCH_BLE_SENSOR_ACTIVITY    0x06  /* uint8, AI_WATCH_MOTION_*
+                                               * (0 rest / 1 walk / 2 run) */
+#define AI_WATCH_BLE_SENSOR_AI_TRIGGER  0x10  /* AI voice trigger, see
+                                               * ai_watch_ble_send_ai_trigger */
+#define AI_WATCH_BLE_SENSOR_FALL_EVENT  0x11  /* suspected-fall report:
+                                               * event(1) + impact_mg(2,LE)
+                                               * + angle_deg(1) + rsvd(4) */
+#define AI_WATCH_BLE_SENSOR_MOTION_DATA 0x12  /* raw capture (recording):
+                                               * t_ms(4, LE) + x/y/z(6) +
+                                               * gx/gy/gz(6), mg/mdps,
+                                               * decimated view */
+
+/* AI trigger payload: source(1) [+ optional context bytes] */
+
+#define AI_WATCH_AI_TRIGGER_SRC_PAGE    0x01  /* AI app page button */
+#define AI_WATCH_AI_TRIGGER_SRC_HR      0x02  /* reserved: heart-rate page */
 
 /* Command frame: [version(1)][cmd_type(1)][id(1)][flags(1)]
  *                [timestamp(4)][title_len(1)][title(N)]      (all LE)
@@ -104,8 +121,22 @@
 #define AI_WATCH_BLE_CMD_REMINDER       0x01
 #define AI_WATCH_BLE_CMD_NOTIFICATION   0x02
 #define AI_WATCH_BLE_CMD_CLEAR          0x03
+#define AI_WATCH_BLE_CMD_AI_TEXT        0x04  /* AI result text in title */
+#define AI_WATCH_BLE_CMD_AI_TIMER       0x05  /* countdown; timestamp field
+                                               * carries duration seconds */
 
 #define AI_WATCH_BLE_CMD_HDR_LEN        9   /* through title_len */
+
+/* AI result text limit: the bridge queue takes frames up to
+ * AI_WATCH_BLE_CMD_MAX (240), header is 9 bytes.
+ */
+
+#define AI_WATCH_AI_TEXT_MAX            224
+
+/* AI countdown duration limits (seconds) */
+
+#define AI_WATCH_AI_TIMER_MIN_S         1
+#define AI_WATCH_AI_TIMER_MAX_S         86400  /* 24 h */
 
 /* Reminder flag bits */
 
@@ -139,6 +170,9 @@ struct ai_watch_reminder_s
   uint8_t type;                 /* AI_WATCH_BLE_CMD_REMINDER or _NOTIFICATION */
   uint32_t timestamp;           /* UTC Unix seconds */
   char title[AI_WATCH_REMINDER_TITLE_MAX + 1];
+  bool due_alerted;             /* due-time banner already shown (watch-
+                                 * local; reset when the phone re-sends
+                                 * this id) */
 };
 
 /* Reminder store - owned by ai_watch_ble.c, mutated only from the main
@@ -156,10 +190,33 @@ struct ai_watch_reminder_store_s
 
 struct ai_watch_ble_alert_s
 {
-  uint8_t type;                 /* AI_WATCH_BLE_CMD_REMINDER or _NOTIFICATION */
+  uint8_t type;                 /* AI_WATCH_BLE_CMD_* (also used for the
+                                 * AI countdown expiry, _AI_TIMER) */
   uint8_t id;
   uint32_t timestamp;           /* UTC Unix seconds */
   char title[AI_WATCH_REMINDER_TITLE_MAX + 1];
+};
+
+/* Last AI result text (AI_TEXT command). Owned by ai_watch_ble.c,
+ * mutated only from the main loop; polled by the AI page UI.
+ */
+
+struct ai_watch_ai_result_s
+{
+  char text[AI_WATCH_AI_TEXT_MAX + 1];
+  uint32_t timestamp;           /* UTC Unix seconds from the frame */
+  uint8_t id;                   /* request id from the frame */
+  bool pending;                 /* new text not rendered yet */
+};
+
+/* One pending AI countdown request (AI_TIMER command) */
+
+struct ai_watch_ai_timer_req_s
+{
+  uint8_t id;
+  uint32_t duration_s;          /* 1..AI_WATCH_AI_TIMER_MAX_S */
+  char label[AI_WATCH_REMINDER_TITLE_MAX + 1];
+  bool pending;                 /* set by the parser, cleared by the reader */
 };
 
 /****************************************************************************
@@ -312,5 +369,74 @@ void ai_watch_reminders_clear(void);
 int ai_watch_ble_send_sensor_data(uint8_t sensor_type,
                                   FAR const void *data,
                                   uint8_t data_len);
+
+/****************************************************************************
+ * Name: ai_watch_ble_post
+ *
+ * Description:
+ *   Asynchronous ai_watch_ble_send_sensor_data: the frame is queued for
+ *   the TX worker thread (ai_watch_ble_init starts it) so the LVGL loop
+ *   never blocks on the ~1-connection-interval bt_gatt_indicate() call.
+ *   Use for ALL periodic uploads (steps, activity, motion capture, fall
+ *   reports); keep only the AI trigger synchronous so its button can
+ *   report the send result. Drops silently when BLE is down or the
+ *   queue is full.
+ *
+ * Returned Value:
+ *   0 when enqueued (or sent directly in the no-worker fallback),
+ *   negative errno otherwise.
+ *
+ ****************************************************************************/
+
+int ai_watch_ble_post(uint8_t sensor_type,
+                      FAR const void *data,
+                      uint8_t data_len);
+
+/****************************************************************************
+ * Name: ai_watch_ble_send_ai_trigger
+ *
+ * Description:
+ *   Tell the phone to start a voice/AI round: notify on DataUpload (f3)
+ *   as sensor_type AI_WATCH_BLE_SENSOR_AI_TRIGGER with payload
+ *   [source(1)][context(N)]:
+ *   - source: AI_WATCH_AI_TRIGGER_SRC_* (page button, reserved sources)
+ *   - context: optional bytes for that source (e.g. HR/SpO2 values from
+ *     the heart-rate page once that link is live); may be 0 bytes.
+ *
+ *   The phone answers with AI_TEXT / AI_TIMER / reminder commands.
+ *
+ * Returned Value:
+ *   0 on success, negative errno (-ENOTCONN / -EACCES / -EINVAL) otherwise.
+ *
+ ****************************************************************************/
+
+int ai_watch_ble_send_ai_trigger(uint8_t source,
+                                 FAR const void *context,
+                                 uint8_t context_len);
+
+/****************************************************************************
+ * Name: ai_watch_ble_get_ai_result
+ *
+ * Description:
+ *   Last AI result text received via AI_TEXT (empty string before the
+ *   first one). Check .pending to know the text changed since it was
+ *   last rendered; the reader clears .pending.
+ *
+ ****************************************************************************/
+
+FAR struct ai_watch_ai_result_s *ai_watch_ble_get_ai_result(void);
+
+/****************************************************************************
+ * Name: ai_watch_ble_take_ai_timer
+ *
+ * Description:
+ *   Consume one pending AI_TIMER request (new countdown to start; a
+ *   second request replaces the previous one). Returns false when none
+ *   is pending. Callable from the main loop thread.
+ *
+ ****************************************************************************/
+
+bool ai_watch_ble_take_ai_timer(
+    FAR struct ai_watch_ai_timer_req_s *req);
 
 #endif /* __APPS_AI_WATCH_AI_WATCH_BLE_H */

@@ -35,6 +35,8 @@ ICONS = [
     ("heart_rate", "icon_heart_rate"),
     ("blood_oxygen", "icon_blood_oxygen"),
     ("temp_humidity", "icon_temp_humidity"),
+    ("ai", "icon_ai"),
+    ("mic", "icon_mic"),
 ]
 
 SRC_DIR = "src"

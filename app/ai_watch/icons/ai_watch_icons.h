@@ -49,4 +49,16 @@ extern const lv_image_dsc_t icon_temp_humidity_t2;
 extern const lv_image_dsc_t icon_temp_humidity_t3;
 extern const lv_image_dsc_t icon_temp_humidity_t4;
 
+extern const lv_image_dsc_t icon_ai_t0;
+extern const lv_image_dsc_t icon_ai_t1;
+extern const lv_image_dsc_t icon_ai_t2;
+extern const lv_image_dsc_t icon_ai_t3;
+extern const lv_image_dsc_t icon_ai_t4;
+
+extern const lv_image_dsc_t icon_mic_t0;
+extern const lv_image_dsc_t icon_mic_t1;
+extern const lv_image_dsc_t icon_mic_t2;
+extern const lv_image_dsc_t icon_mic_t3;
+extern const lv_image_dsc_t icon_mic_t4;
+
 #endif /* __AI_WATCH_ICONS_H */

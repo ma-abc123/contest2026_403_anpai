@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,12 +46,13 @@
 #include "ai_watch_icons.h"
 #include "fonts/ai_watch_font_cjk_16.h"
 #include "ai_watch_ble.h"
+#include "ai_watch_motion.h"
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.6.0"
+#define AI_WATCH_VERSION            "4.8.4-exp1"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -113,6 +115,13 @@
 /* Minimum drag delta (pixels) to trigger a transform refresh */
 
 #define AI_WATCH_MENU_DRAG_THRESH   3
+
+/* Extra alert-banner types used by the fall pipeline (above the BLE
+ * command range so they can never collide with AI_WATCH_BLE_CMD_*).
+ */
+
+#define AI_WATCH_ALERT_TYPE_FALL       0x81
+#define AI_WATCH_ALERT_TYPE_FALL_INFO  0x82
 
 /****************************************************************************
  * Private Types
@@ -301,6 +310,12 @@ static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme);
 
 static void ai_watch_alert_apply_theme(int theme);
 
+/* Exercise / motion-service app + fall alarm overlay */
+
+static void ai_watch_create_exercise_app(FAR struct ai_watch_s *watch);
+static void ai_watch_destroy_exercise_app(FAR struct ai_watch_s *watch);
+static void ai_watch_fall_poll(FAR struct ai_watch_s *watch);
+
 /* UI creation */
 
 static void ai_watch_create_home_page(FAR struct ai_watch_s *watch);
@@ -328,6 +343,12 @@ static void ai_watch_destroy_dht_app(FAR struct ai_watch_s *watch);
 static void ai_watch_create_hr_app(FAR struct ai_watch_s *watch);
 static void ai_watch_destroy_hr_app(FAR struct ai_watch_s *watch);
 
+/* AI assistant app (voice trigger + AI result + countdown) */
+
+static void ai_watch_create_ai_app(FAR struct ai_watch_s *watch);
+static void ai_watch_destroy_ai_app(FAR struct ai_watch_s *watch);
+static void ai_watch_ai_countdown_poll(FAR struct ai_watch_s *watch);
+
 /* Time */
 
 static void ai_watch_time_update(FAR struct ai_watch_s *watch);
@@ -346,10 +367,10 @@ static void ai_menu_event_cb(lv_event_t *e);
 static const struct ai_app_desc_s g_app_registry[] =
 {
   {
-    "Exercise",
-    { &icon_exercise_t0, &icon_exercise_t1, &icon_exercise_t2,
-      &icon_exercise_t3, &icon_exercise_t4 },
-    NULL, NULL, false
+    "AI",
+    { &icon_ai_t0, &icon_ai_t1, &icon_ai_t2,
+      &icon_ai_t3, &icon_ai_t4 },
+    ai_watch_create_ai_app, ai_watch_destroy_ai_app, true
   },
   {
     "Timer",
@@ -382,6 +403,12 @@ static const struct ai_app_desc_s g_app_registry[] =
       &icon_heart_rate_t2, &icon_heart_rate_t3,
       &icon_heart_rate_t4 },
     ai_watch_create_hr_app, ai_watch_destroy_hr_app, true
+  },
+  {
+    "Exercise",
+    { &icon_exercise_t0, &icon_exercise_t1, &icon_exercise_t2,
+      &icon_exercise_t3, &icon_exercise_t4 },
+    ai_watch_create_exercise_app, ai_watch_destroy_exercise_app, true
   },
 };
 
@@ -1891,9 +1918,31 @@ static void ai_watch_alert_show(FAR struct ai_watch_s *watch,
       g_alert_ui.panel = panel;
     }
 
-  type_text = (a->type == AI_WATCH_BLE_CMD_NOTIFICATION) ?
-              LV_SYMBOL_ENVELOPE "  Notification" :
-              LV_SYMBOL_BELL "  Reminder";
+  if (a->type == AI_WATCH_BLE_CMD_NOTIFICATION)
+    {
+      type_text = LV_SYMBOL_ENVELOPE "  Notification";
+    }
+  else if (a->type == AI_WATCH_BLE_CMD_AI_TEXT)
+    {
+      type_text = "AI " LV_SYMBOL_RIGHT "  Result";
+    }
+  else if (a->type == AI_WATCH_BLE_CMD_AI_TIMER)
+    {
+      type_text = LV_SYMBOL_BELL "  Timer done";
+    }
+  else if (a->type == AI_WATCH_ALERT_TYPE_FALL)
+    {
+      type_text = LV_SYMBOL_WARNING "  Suspected fall";
+    }
+  else if (a->type == AI_WATCH_ALERT_TYPE_FALL_INFO)
+    {
+      type_text = LV_SYMBOL_OK "  Fall info";
+    }
+  else
+    {
+      type_text = LV_SYMBOL_BELL "  Reminder";
+    }
+
   title_font = ai_watch_text_is_ascii(a->title) ?
                &lv_font_montserrat_20 : &ai_watch_font_cjk_16;
 
@@ -1945,8 +1994,6 @@ static struct ai_dht_app_s g_dht_app;
 
 static void ai_watch_dht_update_cb(FAR lv_timer_t *timer)
 {
-  FAR struct ai_watch_s *watch = lv_timer_get_user_data(timer);
-  int theme = watch->current_theme;
   struct dhtxx_sensor_data_s sample;
   char buf[64];
   int fd;
@@ -2005,12 +2052,13 @@ static void ai_watch_dht_update_cb(FAR lv_timer_t *timer)
         lv_label_set_text(g_dht_app.time_label, buf);
       }
 
-      /* Send sensor data via BLE */
+      /* Send sensor data via BLE (async TX worker: each synchronous
+       * indicate blocks the loop for ~1 connection interval) */
 
-      ai_watch_ble_send_sensor_data(AI_WATCH_BLE_SENSOR_TEMP,
-                                    &sample.temp, sizeof(float));
-      ai_watch_ble_send_sensor_data(AI_WATCH_BLE_SENSOR_HUM,
-                                    &sample.hum, sizeof(float));
+      ai_watch_ble_post(AI_WATCH_BLE_SENSOR_TEMP,
+                        &sample.temp, sizeof(float));
+      ai_watch_ble_post(AI_WATCH_BLE_SENSOR_HUM,
+                        &sample.hum, sizeof(float));
     }
   else
     {
@@ -2203,6 +2251,21 @@ static void ai_watch_destroy_dht_app(FAR struct ai_watch_s *watch)
 #define MAX30102_SAMPLE_SIZE    6
 #define MAX30102_FIFO_SAMPLES   16
 
+/* How often to retry the Part-ID probe while the sensor is absent.
+ * Each failed probe can block for up to ~1 s per I2C message in the
+ * SiFli HAL (I2C_TIMEOUT_ADDR), so the probe runs on its own pthread
+ * and the LVGL thread only reads the result flags - it never blocks.
+ */
+
+#define MAX30102_PROBE_BACKOFF_MS  5000
+#define MAX30102_ASKAI_FEEDBACK_MS  3000
+
+/* Probe thread handshake (single writer each; LVGL thread reads) */
+
+#define MAX30102_PROBE_PENDING     0   /* probing / not checked yet */
+#define MAX30102_PROBE_OK          1
+#define MAX30102_PROBE_ABSENT      2
+
 struct ai_hr_app_s
 {
   FAR lv_obj_t *hr_label;
@@ -2217,9 +2280,23 @@ struct ai_hr_app_s
   uint32_t last_ir;
   int hr_bpm;
   int spo2_pct;
+  uint8_t probe_part;       /* last Part-ID byte seen by the probe thread */
+  uint32_t askai_until_tick;
 };
 
 static struct ai_hr_app_s g_hr_app;
+
+/* Probe thread handshake. The probe can block for seconds on an absent
+ * device (SiFli HAL I2C_TIMEOUT_ADDR = 1 s per message), so it never
+ * runs on the LVGL thread: this thread opens the bus, reads the Part
+ * ID and publishes the verdict. The FIFO/measure path stays on the
+ * LVGL thread and only talks to a confirmed-present sensor.
+ */
+
+static volatile uint8_t g_hr_probe_result = MAX30102_PROBE_PENDING;
+static volatile bool g_hr_probe_quit;
+static bool g_hr_probe_running;
+static pthread_t g_hr_probe_thread;
 
 /* I2C read helper */
 
@@ -2478,52 +2555,137 @@ reset:
   return spo2;
 }
 
+/* Probe worker: runs on its own pthread, never on the LVGL thread.
+ * Absent-device probes retry every MAX30102_PROBE_BACKOFF_MS; the
+ * sleep between retries is sliced so pthread_join on page exit waits
+ * at most one slice (~100 ms) outside of an in-flight transfer.
+ */
+
+static FAR void *ai_watch_hr_probe_thread(FAR void *arg)
+{
+  uint8_t part;
+  int fd;
+  int ret;
+  int n;
+
+  (void)arg;
+
+  /* Give the page transition a head start: the first probe on an
+   * absent device holds the I2C driver lock for up to ~2 s, and any
+   * concurrent bus-1 access would stall behind it.
+   */
+
+  for (n = 0; n < 3 && !g_hr_probe_quit; n++)
+    {
+      usleep(100 * 1000);
+    }
+
+  while (!g_hr_probe_quit)
+    {
+      /* Once present, the LVGL thread owns the bus for measurements;
+       * this thread only wakes up again if that path resets the
+       * verdict (sensor unplugged mid-session).
+       */
+
+      if (g_hr_probe_result == MAX30102_PROBE_OK)
+        {
+          usleep(100 * 1000);
+          continue;
+        }
+
+      fd = open(MAX30102_I2C_PATH, O_RDONLY);
+      if (fd < 0)
+        {
+          g_hr_app.probe_part = 0;
+          g_hr_probe_result = MAX30102_PROBE_ABSENT;
+        }
+      else
+        {
+          ret = max30102_read_reg(fd, MAX30102_REG_PARTID, &part);
+          close(fd);
+
+          g_hr_app.probe_part = part;
+          g_hr_probe_result =
+            (ret >= 0 && part == MAX30102_PART_ID) ?
+            MAX30102_PROBE_OK : MAX30102_PROBE_ABSENT;
+        }
+
+      if (g_hr_probe_result != MAX30102_PROBE_OK)
+        {
+          for (n = 0;
+               n < MAX30102_PROBE_BACKOFF_MS / 100 && !g_hr_probe_quit;
+               n++)
+            {
+              usleep(100 * 1000);
+            }
+        }
+    }
+
+  return NULL;
+}
+
 static void ai_watch_hr_update_cb(FAR lv_timer_t *timer)
 {
   FAR struct ai_watch_s *watch = lv_timer_get_user_data(timer);
   int theme = watch->current_theme;
-  uint8_t part_id;
   uint32_t red;
   uint32_t ir;
   int ret;
   char buf[32];
 
-  if (g_hr_app.i2c_fd < 0)
+  /* Transient "request sent" feedback from the Ask AI button */
+
+  if (lv_tick_get() < g_hr_app.askai_until_tick)
     {
-      /* Try to open I2C device */
-
-      g_hr_app.i2c_fd = open(MAX30102_I2C_PATH, O_RDONLY);
-      if (g_hr_app.i2c_fd < 0)
-        {
-          if (g_hr_app.sensor_ok)
-            {
-              g_hr_app.sensor_ok = false;
-              lv_label_set_text(g_hr_app.status_label,
-                                LV_SYMBOL_WARNING " I2C unavailable");
-              lv_obj_set_style_text_color(g_hr_app.status_label,
-                                          lv_color_make(255, 180, 0), 0);
-            }
-
-          return;
-        }
+      lv_label_set_text(g_hr_app.status_label, "AI: request sent");
+      lv_obj_set_style_text_color(g_hr_app.status_label,
+                                  ai_watch_theme_accent(theme), 0);
+      return;
     }
 
-  /* Verify Part ID */
+  /* Sensor presence is determined by the probe thread (verdict in
+   * g_hr_probe_result). While the verdict is pending this thread must
+   * NOT touch the I2C device at all - not even open() - because the
+   * probe holds the driver lock for up to seconds on an absent
+   * device, and contending here would freeze the UI.
+   */
 
   if (!g_hr_app.sensor_ok)
     {
-      ret = max30102_read_reg(g_hr_app.i2c_fd,
-                              MAX30102_REG_PARTID, &part_id);
-      if (ret < 0 || part_id != MAX30102_PART_ID)
+      if (g_hr_probe_result == MAX30102_PROBE_PENDING)
+        {
+          return;               /* keep "Checking sensor..." */
+        }
+
+      if (g_hr_probe_result != MAX30102_PROBE_OK)
         {
           lv_label_set_text(g_hr_app.status_label,
                             LV_SYMBOL_WARNING " Sensor not found");
           lv_obj_set_style_text_color(g_hr_app.status_label,
                                       lv_color_make(255, 180, 0), 0);
           snprintf(buf, sizeof(buf), "ID: 0x%02x (expect 0x%02x)",
-                   part_id, MAX30102_PART_ID);
+                   g_hr_app.probe_part, MAX30102_PART_ID);
           lv_label_set_text(g_hr_app.raw_label, buf);
           return;
+        }
+
+      /* Probe confirmed the sensor. Open the bus here (single owner:
+       * this thread), then configure. The probe thread has already
+       * opened the device once, so init costs are paid and, with the
+       * sensor present, every transfer is fast.
+       */
+
+      if (g_hr_app.i2c_fd < 0)
+        {
+          g_hr_app.i2c_fd = open(MAX30102_I2C_PATH, O_RDONLY);
+          if (g_hr_app.i2c_fd < 0)
+            {
+              lv_label_set_text(g_hr_app.status_label,
+                                LV_SYMBOL_WARNING " I2C unavailable");
+              lv_obj_set_style_text_color(g_hr_app.status_label,
+                                          lv_color_make(255, 180, 0), 0);
+              return;
+            }
         }
 
       /* Configure sensor: SpO2 mode, 100 Hz, 18-bit */
@@ -2551,6 +2713,13 @@ static void ai_watch_hr_update_cb(FAR lv_timer_t *timer)
   ret = max30102_read_fifo(g_hr_app.i2c_fd, &red, &ir);
   if (ret < 0)
     {
+      /* The sensor went away (unplugged/bus error): reset the probe
+       * verdict - the probe thread re-checks and the config runs
+       * again once it reappears.
+       */
+
+      g_hr_app.sensor_ok = false;
+      g_hr_probe_result = MAX30102_PROBE_PENDING;
       lv_label_set_text(g_hr_app.status_label,
                         LV_SYMBOL_WARNING " Read error");
       lv_obj_set_style_text_color(g_hr_app.status_label,
@@ -2601,12 +2770,12 @@ static void ai_watch_hr_update_cb(FAR lv_timer_t *timer)
         snprintf(buf, sizeof(buf), "%d", hr);
         lv_label_set_text(g_hr_app.hr_label, buf);
 
-        /* Send HR via BLE */
+        /* Send HR via BLE (async TX worker) */
 
         {
           int16_t hr_val = (int16_t)hr;
 
-          ai_watch_ble_send_sensor_data(0x03, &hr_val, 2);
+          ai_watch_ble_post(0x03, &hr_val, 2);
         }
       }
 
@@ -2616,12 +2785,12 @@ static void ai_watch_hr_update_cb(FAR lv_timer_t *timer)
         snprintf(buf, sizeof(buf), "%d%%", spo2);
         lv_label_set_text(g_hr_app.spo2_label, buf);
 
-        /* Send SpO2 via BLE */
+        /* Send SpO2 via BLE (async TX worker) */
 
         {
           int16_t spo2_val = (int16_t)spo2;
 
-          ai_watch_ble_send_sensor_data(0x04, &spo2_val, 2);
+          ai_watch_ble_post(0x04, &spo2_val, 2);
         }
       }
   }
@@ -2643,6 +2812,42 @@ static void ai_watch_hr_back_cb(lv_event_t *e)
   FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
 
   ai_watch_pop_page(watch);
+}
+
+static void ai_watch_hr_ask_ai_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+  int16_t ctx[2];
+  int ret;
+
+  (void)watch;
+
+  if (ai_watch_ble_get_state() != AI_WATCH_BLE_BSP_CONNECTED)
+    {
+      g_hr_app.askai_until_tick = 0;
+      lv_label_set_text(g_hr_app.status_label, "BLE not connected");
+      lv_obj_set_style_text_color(g_hr_app.status_label,
+                                  lv_color_make(255, 180, 0), 0);
+      return;
+    }
+
+  /* Context: [hr(2)][spo2(2)] little-endian, 0 = unknown */
+
+  ctx[0] = (g_hr_app.hr_bpm > 0) ? (int16_t)g_hr_app.hr_bpm : 0;
+  ctx[1] = (g_hr_app.spo2_pct > 0) ? (int16_t)g_hr_app.spo2_pct : 0;
+
+  ret = ai_watch_ble_send_ai_trigger(AI_WATCH_AI_TRIGGER_SRC_HR,
+                                     ctx, sizeof(ctx));
+  if (ret < 0)
+    {
+      printf("HR: ask-ai trigger failed: %d\n", ret);
+      return;
+    }
+
+  g_hr_app.askai_until_tick = lv_tick_get() +
+                              MAX30102_ASKAI_FEEDBACK_MS;
+  printf("HR: ask-ai trigger sent (hr=%d spo2=%d)\n",
+         ctx[0], ctx[1]);
 }
 
 static void ai_watch_create_hr_app(FAR struct ai_watch_s *watch)
@@ -2741,13 +2946,13 @@ static void ai_watch_create_hr_app(FAR struct ai_watch_s *watch)
   lv_obj_set_style_text_align(disclaimer, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(disclaimer, LV_ALIGN_BOTTOM_MID, 0, -60);
 
-  /* Back button */
+  /* Back button + Ask AI button (side by side at the bottom) */
 
   back_btn = lv_btn_create(screen);
-  lv_obj_set_size(back_btn, 120, 45);
+  lv_obj_set_size(back_btn, 110, 45);
   lv_obj_set_style_bg_color(back_btn, ai_watch_theme_btn_bg(theme), 0);
   lv_obj_set_style_radius(back_btn, 12, 0);
-  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, -30, -15);
   back_lbl = lv_label_create(back_btn);
   lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
   lv_obj_set_style_text_color(back_lbl,
@@ -2756,6 +2961,24 @@ static void ai_watch_create_hr_app(FAR struct ai_watch_s *watch)
   lv_obj_center(back_lbl);
   lv_obj_add_event_cb(back_btn, ai_watch_hr_back_cb,
                       LV_EVENT_CLICKED, watch);
+
+  {
+    FAR lv_obj_t *ask_btn;
+    FAR lv_obj_t *ask_lbl;
+
+    ask_btn = lv_btn_create(screen);
+    lv_obj_set_size(ask_btn, 110, 45);
+    lv_obj_set_style_bg_color(ask_btn, ai_watch_theme_accent(theme), 0);
+    lv_obj_set_style_radius(ask_btn, 12, 0);
+    lv_obj_align(ask_btn, LV_ALIGN_BOTTOM_RIGHT, -35, -15);
+    ask_lbl = lv_label_create(ask_btn);
+    lv_label_set_text(ask_lbl, "Ask AI");
+    lv_obj_set_style_text_color(ask_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(ask_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(ask_lbl);
+    lv_obj_add_event_cb(ask_btn, ai_watch_hr_ask_ai_cb,
+                        LV_EVENT_CLICKED, watch);
+  }
 
   /* Init state */
 
@@ -2766,6 +2989,28 @@ static void ai_watch_create_hr_app(FAR struct ai_watch_s *watch)
   g_hr_app.last_ir = 0;
   g_hr_app.hr_bpm = -1;
   g_hr_app.spo2_pct = -1;
+  g_hr_app.askai_until_tick = 0;
+
+  /* Presence probe runs on its own pthread so the LVGL thread never
+   * blocks on the absent-device I2C timeouts.
+   */
+
+  if (!g_hr_probe_running)
+    {
+      g_hr_probe_quit = false;
+      g_hr_probe_result = MAX30102_PROBE_PENDING;
+
+      if (pthread_create(&g_hr_probe_thread, NULL,
+                         ai_watch_hr_probe_thread, NULL) == 0)
+        {
+          g_hr_probe_running = true;
+        }
+      else
+        {
+          g_hr_probe_result = MAX30102_PROBE_ABSENT;
+          printf("HR: probe thread create failed\n");
+        }
+    }
 
   /* Update timer —100ms for100 Hz sampling */
 
@@ -2789,9 +3034,445 @@ static void ai_watch_destroy_hr_app(FAR struct ai_watch_s *watch)
       g_hr_app.i2c_fd = -1;
     }
 
+  /* Stop the probe thread; it wakes from its 100 ms slices, so the
+   * join here waits at most one slice unless a transfer is in flight.
+   */
+
+  if (g_hr_probe_running)
+    {
+      g_hr_probe_quit = true;
+      pthread_join(g_hr_probe_thread, NULL);
+      g_hr_probe_running = false;
+    }
+
+  g_hr_probe_result = MAX30102_PROBE_PENDING;
+
   memset(&g_hr_app, 0, sizeof(g_hr_app));
   g_hr_app.i2c_fd = -1;
   watch->app_page_screen = NULL;
+}
+
+/****************************************************************************
+ * Private Functions - Exercise App (motion service UI)
+ *
+ * Pure consumer of the background motion service (ai_watch_motion.c):
+ * every value on this page comes from the service snapshot; the page
+ * never touches the IMU itself. The recording toggle and the fall-test
+ * button drive the service for the M4 test-set capture and regression.
+ ****************************************************************************/
+
+/* Pure consumer of the background motion service (ai_watch_motion.c):
+ * every value on this page comes from the service snapshot; the page
+ * never touches the IMU itself. The recording toggle and the fall-test
+ * button drive the service for the M4 test-set capture and regression.
+ */
+
+struct ai_exercise_app_s
+{
+  FAR lv_obj_t *steps_label;
+  FAR lv_obj_t *info_label;       /* distance + activity class */
+  FAR lv_obj_t *status_label;     /* IMU state + fall detector state */
+  FAR lv_obj_t *mag_label;        /* live |a| readout */
+  FAR lv_obj_t *mag_bar;          /* live |a| bar (0..4000 mg) */
+  FAR lv_obj_t *rec_btn;
+  FAR lv_obj_t *rec_lbl;
+  FAR lv_timer_t *update_timer;
+  bool last_recording;
+};
+
+static struct ai_exercise_app_s g_ex_app;
+
+/* Full-screen modal countdown for the "suspected fall" alarm */
+
+struct ai_fall_ui_s
+{
+  FAR lv_obj_t *panel;
+  FAR lv_obj_t *cd_label;
+  bool visible;
+};
+
+static struct ai_fall_ui_s g_fall_ui;
+
+static void ai_watch_exercise_update_cb(FAR lv_timer_t *timer)
+{
+  struct ai_watch_motion_snapshot_s snap;
+  FAR const char *act_text;
+  FAR const char *fall_text;
+  char buf[96];
+
+  (void)timer;
+
+  ai_watch_motion_get_snapshot(&snap);
+
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)snap.steps_today);
+  lv_label_set_text(g_ex_app.steps_label, buf);
+
+  act_text = (snap.activity == AI_WATCH_MOTION_RUN) ? "Running" :
+             (snap.activity == AI_WATCH_MOTION_WALK) ? "Walking" :
+             "Rest";
+  snprintf(buf, sizeof(buf), "%lu m   " LV_SYMBOL_BULLET "   %s",
+           (unsigned long)snap.distance_m, act_text);
+  lv_label_set_text(g_ex_app.info_label, buf);
+
+  if (!snap.sensor_ok)
+    {
+      fall_text = "IMU: offline";
+    }
+  else
+    {
+      fall_text =
+        (snap.fall_state == FALL_STATE_ALARM) ? "Fall: countdown!" :
+        (snap.fall_state == FALL_STATE_IMPACT) ? "Fall: impact..." :
+        "Fall detect: Armed";
+    }
+
+  snprintf(buf, sizeof(buf), "%s   " LV_SYMBOL_BULLET
+           "   Window std: %u mg",
+           fall_text, (unsigned)snap.activity_std_mg);
+  lv_label_set_text(g_ex_app.status_label, buf);
+  lv_obj_set_style_text_color(g_ex_app.status_label,
+                              snap.sensor_ok ?
+                              lv_color_make(0, 200, 0) :
+                              lv_color_make(255, 180, 0), 0);
+
+  snprintf(buf, sizeof(buf), "|a|  %lu mg",
+           (unsigned long)snap.last_mag_mg);
+  lv_label_set_text(g_ex_app.mag_label, buf);
+  lv_bar_set_value(g_ex_app.mag_bar,
+                   (int32_t)((snap.last_mag_mg > 4000) ? 4000 :
+                             snap.last_mag_mg), LV_ANIM_OFF);
+
+  if (snap.recording)
+    {
+      snprintf(buf, sizeof(buf), "Stop (%lu)",
+               (unsigned long)snap.record_lines);
+    }
+  else
+    {
+      strncpy(buf, "Record", sizeof(buf) - 1);
+      buf[sizeof(buf) - 1] = '\0';
+    }
+
+  lv_label_set_text(g_ex_app.rec_lbl, buf);
+  g_ex_app.last_recording = snap.recording;
+}
+
+static void ai_watch_exercise_rec_cb(lv_event_t *e)
+{
+  (void)e;
+
+  if (g_ex_app.last_recording)
+    {
+      ai_watch_motion_record_stop();
+    }
+  else
+    {
+      if (!ai_watch_motion_record_start())
+        {
+          printf("Exercise: record start failed (sensor down?)\n");
+        }
+    }
+}
+
+static void ai_watch_exercise_test_cb(lv_event_t *e)
+{
+  (void)e;
+
+  if (!ai_watch_motion_test_trigger())
+    {
+      printf("Exercise: test trigger busy (fall already pending)\n");
+    }
+}
+
+static void ai_watch_exercise_back_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+
+  ai_watch_pop_page(watch);
+}
+
+static void ai_watch_create_exercise_app(FAR struct ai_watch_s *watch)
+{
+  FAR lv_obj_t *screen;
+  FAR lv_obj_t *title;
+  FAR lv_obj_t *steps_title;
+  FAR lv_obj_t *back_btn;
+  FAR lv_obj_t *back_lbl;
+  FAR lv_obj_t *test_btn;
+  FAR lv_obj_t *test_lbl;
+  int theme = watch->current_theme;
+
+  screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
+  lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+
+  title = lv_label_create(screen);
+  lv_label_set_text(title, "Exercise");
+  lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 22);
+
+  steps_title = lv_label_create(screen);
+  lv_label_set_text(steps_title, "Steps today");
+  lv_obj_set_style_text_color(steps_title,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(steps_title, &lv_font_montserrat_14, 0);
+  lv_obj_align(steps_title, LV_ALIGN_TOP_MID, 0, 62);
+
+  g_ex_app.steps_label = lv_label_create(screen);
+  lv_label_set_text(g_ex_app.steps_label, "0");
+  lv_obj_set_style_text_color(g_ex_app.steps_label,
+                              ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_font(g_ex_app.steps_label,
+                             &lv_font_montserrat_24, 0);
+  lv_obj_align(g_ex_app.steps_label, LV_ALIGN_TOP_MID, 0, 84);
+
+  g_ex_app.info_label = lv_label_create(screen);
+  lv_label_set_text(g_ex_app.info_label, "0 m   " LV_SYMBOL_BULLET
+                    "   Rest");
+  lv_obj_set_style_text_color(g_ex_app.info_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_ex_app.info_label,
+                             &lv_font_montserrat_16, 0);
+  lv_obj_align(g_ex_app.info_label, LV_ALIGN_TOP_MID, 0, 126);
+
+  g_ex_app.status_label = lv_label_create(screen);
+  lv_label_set_text(g_ex_app.status_label, "IMU: starting...");
+  lv_obj_set_style_text_color(g_ex_app.status_label,
+                              lv_color_make(255, 180, 0), 0);
+  lv_obj_set_style_text_font(g_ex_app.status_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(g_ex_app.status_label, LV_ALIGN_TOP_MID, 0, 162);
+
+  g_ex_app.mag_label = lv_label_create(screen);
+  lv_label_set_text(g_ex_app.mag_label, "|a|  -- mg");
+  lv_obj_set_style_text_color(g_ex_app.mag_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_ex_app.mag_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(g_ex_app.mag_label, LV_ALIGN_TOP_MID, 0, 196);
+
+  g_ex_app.mag_bar = lv_bar_create(screen);
+  lv_obj_set_size(g_ex_app.mag_bar, 330, 14);
+  lv_bar_set_range(g_ex_app.mag_bar, 0, 4000);
+  lv_bar_set_value(g_ex_app.mag_bar, 0, LV_ANIM_OFF);
+  lv_obj_align(g_ex_app.mag_bar, LV_ALIGN_TOP_MID, 0, 224);
+
+  /* Bottom row: Back / Record / Test */
+
+  back_btn = lv_btn_create(screen);
+  lv_obj_set_size(back_btn, 90, 45);
+  lv_obj_set_style_radius(back_btn, 12, 0);
+  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_LEFT, 25, -18);
+  back_lbl = lv_label_create(back_btn);
+  lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+  lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_center(back_lbl);
+  lv_obj_add_event_cb(back_btn, ai_watch_exercise_back_cb,
+                      LV_EVENT_CLICKED, watch);
+
+  g_ex_app.rec_btn = lv_btn_create(screen);
+  lv_obj_set_size(g_ex_app.rec_btn, 130, 45);
+  lv_obj_set_style_radius(g_ex_app.rec_btn, 12, 0);
+  lv_obj_set_style_bg_color(g_ex_app.rec_btn,
+                            lv_color_make(200, 60, 40), 0);
+  lv_obj_align(g_ex_app.rec_btn, LV_ALIGN_BOTTOM_MID, 0, -18);
+  g_ex_app.rec_lbl = lv_label_create(g_ex_app.rec_btn);
+  lv_label_set_text(g_ex_app.rec_lbl, "Record");
+  lv_obj_set_style_text_font(g_ex_app.rec_lbl,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(g_ex_app.rec_lbl, lv_color_white(), 0);
+  lv_obj_center(g_ex_app.rec_lbl);
+  lv_obj_add_event_cb(g_ex_app.rec_btn, ai_watch_exercise_rec_cb,
+                      LV_EVENT_CLICKED, NULL);
+
+  test_btn = lv_btn_create(screen);
+  lv_obj_set_size(test_btn, 90, 45);
+  lv_obj_set_style_radius(test_btn, 12, 0);
+  lv_obj_set_style_bg_color(test_btn, ai_watch_theme_accent(theme), 0);
+  lv_obj_align(test_btn, LV_ALIGN_BOTTOM_RIGHT, -25, -18);
+  test_lbl = lv_label_create(test_btn);
+  lv_label_set_text(test_lbl, "Test");
+  lv_obj_set_style_text_font(test_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(test_lbl, lv_color_white(), 0);
+  lv_obj_center(test_lbl);
+  lv_obj_add_event_cb(test_btn, ai_watch_exercise_test_cb,
+                      LV_EVENT_CLICKED, NULL);
+
+  g_ex_app.last_recording = false;
+  g_ex_app.update_timer = lv_timer_create(
+      ai_watch_exercise_update_cb, 250, watch);
+
+  watch->app_page_screen = screen;
+}
+
+static void ai_watch_destroy_exercise_app(FAR struct ai_watch_s *watch)
+{
+  if (g_ex_app.update_timer != NULL)
+    {
+      lv_timer_del(g_ex_app.update_timer);
+      g_ex_app.update_timer = NULL;
+    }
+
+  memset(&g_ex_app, 0, sizeof(g_ex_app));
+  watch->app_page_screen = NULL;
+}
+
+/****************************************************************************
+ * Private Functions - Fall Alarm Overlay
+ *
+ * Full-screen modal countdown shown while the motion service has a
+ * "suspected fall" pending. Cancelling is possible via the button or
+ * KEY2 (the button hook lives in ai_watch_button_update).
+ ****************************************************************************/
+
+static void ai_watch_fall_cancel_cb(lv_event_t *e)
+{
+  (void)e;
+
+  ai_watch_motion_fall_cancel();
+}
+
+static void ai_watch_fall_ui_show(void)
+{
+  if (g_fall_ui.panel == NULL)
+    {
+      FAR lv_obj_t *panel = lv_obj_create(lv_layer_top());
+      FAR lv_obj_t *title;
+      FAR lv_obj_t *hint;
+      FAR lv_obj_t *btn;
+      FAR lv_obj_t *btn_lbl;
+
+      lv_obj_set_size(panel, AI_WATCH_SCREEN_WIDTH,
+                      AI_WATCH_SCREEN_HEIGHT);
+      lv_obj_align(panel, LV_ALIGN_TOP_LEFT, 0, 0);
+      lv_obj_set_style_radius(panel, 0, 0);
+      lv_obj_set_style_border_width(panel, 0, 0);
+      lv_obj_set_style_bg_color(panel, lv_color_make(120, 12, 12), 0);
+      lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+      lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+
+      title = lv_label_create(panel);
+      lv_label_set_text(title,
+                        LV_SYMBOL_WARNING "  Suspected fall");
+      lv_obj_set_style_text_color(title, lv_color_white(), 0);
+      lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+      lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 96);
+
+      g_fall_ui.cd_label = lv_label_create(panel);
+      lv_label_set_text(g_fall_ui.cd_label, "15 s");
+      lv_obj_set_style_text_color(g_fall_ui.cd_label,
+                                  lv_color_white(), 0);
+      lv_obj_set_style_text_font(g_fall_ui.cd_label,
+                                 &lv_font_montserrat_24, 0);
+      lv_obj_align(g_fall_ui.cd_label, LV_ALIGN_TOP_MID, 0, 150);
+
+      hint = lv_label_create(panel);
+      lv_label_set_text(hint, "Tap CANCEL or press KEY2\n"
+                        "if you are fine");
+      lv_obj_set_style_text_color(hint, lv_color_white(), 0);
+      lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+      lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+      lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 210);
+
+      btn = lv_btn_create(panel);
+      lv_obj_set_size(btn, 220, 80);
+      lv_obj_set_style_radius(btn, 16, 0);
+      lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+      lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -70);
+      btn_lbl = lv_label_create(btn);
+      lv_label_set_text(btn_lbl, "CANCEL");
+      lv_obj_set_style_text_font(btn_lbl, &lv_font_montserrat_24, 0);
+      lv_obj_set_style_text_color(btn_lbl,
+                                  lv_color_make(120, 12, 12), 0);
+      lv_obj_center(btn_lbl);
+      lv_obj_add_event_cb(btn, ai_watch_fall_cancel_cb,
+                          LV_EVENT_CLICKED, NULL);
+
+      g_fall_ui.panel = panel;
+    }
+
+  lv_obj_clear_flag(g_fall_ui.panel, LV_OBJ_FLAG_HIDDEN);
+  g_fall_ui.visible = true;
+}
+
+static void ai_watch_fall_ui_hide(void)
+{
+  if (g_fall_ui.panel != NULL)
+    {
+      lv_obj_add_flag(g_fall_ui.panel, LV_OBJ_FLAG_HIDDEN);
+    }
+
+  g_fall_ui.visible = false;
+}
+
+/* Main-loop poll: drives the countdown overlay and converts finished
+ * fall events into the standard alert banner (+ the BLE report inside
+ * ai_watch_motion_poll_fall).
+ */
+
+static void ai_watch_fall_poll(FAR struct ai_watch_s *watch)
+{
+  struct ai_watch_motion_snapshot_s snap;
+  struct ai_watch_fall_report_s rep;
+  struct timespec ts;
+  uint32_t now_ms;
+
+  ai_watch_motion_get_snapshot(&snap);
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  now_ms = (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+
+  if (snap.fall_pending && snap.fall_state == FALL_STATE_ALARM)
+    {
+      int32_t remaining = (int32_t)(snap.fall_deadline_ms - now_ms);
+      char buf[16];
+
+      if (remaining < 0)
+        {
+          remaining = 0;
+        }
+
+      if (!g_fall_ui.visible)
+        {
+          ai_watch_fall_ui_show();
+        }
+
+      snprintf(buf, sizeof(buf), "%d s",
+               (int)((remaining + 999) / 1000));
+      lv_label_set_text(g_fall_ui.cd_label, buf);
+    }
+  else if (g_fall_ui.visible && !snap.fall_pending)
+    {
+      ai_watch_fall_ui_hide();
+    }
+
+  while (ai_watch_motion_poll_fall(&rep))
+    {
+      struct ai_watch_ble_alert_s alert;
+
+      memset(&alert, 0, sizeof(alert));
+      if (rep.event == AI_WATCH_FALL_CONFIRMED)
+        {
+          alert.type = AI_WATCH_ALERT_TYPE_FALL;
+          strncpy(alert.title, "Report sent to phone",
+                  sizeof(alert.title) - 1);
+        }
+      else if (rep.event == AI_WATCH_FALL_CANCELLED)
+        {
+          alert.type = AI_WATCH_ALERT_TYPE_FALL_INFO;
+          strncpy(alert.title, "Fall alert cancelled",
+                  sizeof(alert.title) - 1);
+        }
+      else
+        {
+          alert.type = AI_WATCH_ALERT_TYPE_FALL_INFO;
+          strncpy(alert.title, "Fall test: flow OK",
+                  sizeof(alert.title) - 1);
+        }
+
+      ai_watch_alert_show(watch, &alert);
+    }
 }
 
 /****************************************************************************
@@ -3104,6 +3785,330 @@ static void ai_watch_create_app_list_page(FAR struct ai_watch_s *watch)
 }
 
 /****************************************************************************
+ * Private Functions - AI Assistant App
+ *
+ * One app page: a Start button tells the phone to run a voice/AI round
+ * (DataUpload f3 AI_TRIGGER), the AI answer arrives as an AI_TEXT
+ * command and is shown here (a truncated copy pops the alert banner).
+ * An AI_TIMER command starts a countdown that keeps running with the
+ * page closed and fires a banner when it expires.
+ ****************************************************************************/
+
+#define AI_WATCH_AI_STATUS_TIMER_MS  500
+#define AI_WATCH_AI_WAIT_TIMEOUT_MS  60000
+
+struct ai_ai_app_s
+{
+  /* UI objects (valid only while the page is open) */
+
+  FAR lv_obj_t *status_label;
+  FAR lv_obj_t *result_label;
+  FAR lv_obj_t *timer_label;
+  bool waiting;                     /* trigger sent, reply pending */
+  uint32_t wait_sent_tick;
+  FAR lv_timer_t *update_timer;
+
+  /* AI countdown - survives page close/reopen */
+
+  bool cd_running;
+  uint32_t cd_total_s;
+  char cd_label[AI_WATCH_REMINDER_TITLE_MAX + 1];
+  struct timespec cd_deadline;
+};
+
+static struct ai_ai_app_s g_ai_app;
+
+static void ai_watch_ai_back_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+
+  ai_watch_pop_page(watch);
+}
+
+static void ai_watch_ai_start_cb(lv_event_t *e)
+{
+  int ret;
+
+  (void)e;
+
+  /* Future sources: the heart-rate page will call
+   * ai_watch_ble_send_ai_trigger(AI_WATCH_AI_TRIGGER_SRC_HR, ctx, len)
+   * with the latest HR/SpO2 values as context once that link is live.
+   */
+
+  if (ai_watch_ble_get_state() != AI_WATCH_BLE_BSP_CONNECTED)
+    {
+      g_ai_app.waiting = false;
+      lv_label_set_text(g_ai_app.status_label, "BLE not connected");
+      return;
+    }
+
+  ret = ai_watch_ble_send_ai_trigger(AI_WATCH_AI_TRIGGER_SRC_PAGE,
+                                     NULL, 0);
+  if (ret < 0)
+    {
+      g_ai_app.waiting = false;
+      lv_label_set_text(g_ai_app.status_label, "Send failed");
+      printf("AI: trigger send failed: %d\n", ret);
+      return;
+    }
+
+  g_ai_app.waiting = true;
+  g_ai_app.wait_sent_tick = lv_tick_get();
+  lv_label_set_text(g_ai_app.status_label, "Listening on phone...");
+}
+
+static void ai_watch_ai_update_cb(FAR lv_timer_t *timer)
+{
+  FAR struct ai_watch_s *watch = lv_timer_get_user_data(timer);
+  FAR struct ai_watch_ai_result_s *res = ai_watch_ble_get_ai_result();
+  enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
+  int theme = watch->current_theme;
+  char buf[48];
+
+  /* New AI result from the phone */
+
+  if (res->pending)
+    {
+      res->pending = false;
+      g_ai_app.waiting = false;
+      lv_obj_set_style_text_font(g_ai_app.result_label,
+                                 ai_watch_text_is_ascii(res->text) ?
+                                 &lv_font_montserrat_16 :
+                                 &ai_watch_font_cjk_16, 0);
+      lv_label_set_text(g_ai_app.result_label, res->text);
+    }
+
+  /* Status line */
+
+  if (g_ai_app.waiting &&
+      lv_tick_elaps(g_ai_app.wait_sent_tick) <
+      AI_WATCH_AI_WAIT_TIMEOUT_MS)
+    {
+      /* Keep the listening hint */
+    }
+  else
+    {
+      if (g_ai_app.waiting)
+        {
+          g_ai_app.waiting = false;
+        }
+
+      if (state != AI_WATCH_BLE_BSP_CONNECTED)
+        {
+          lv_obj_set_style_text_color(g_ai_app.status_label,
+                                      ai_watch_theme_secondary(theme), 0);
+          lv_label_set_text(g_ai_app.status_label,
+                            ai_watch_ble_get_status_text(state));
+        }
+      else
+        {
+          lv_obj_set_style_text_color(g_ai_app.status_label,
+                                      ai_watch_theme_accent(theme), 0);
+          lv_label_set_text(g_ai_app.status_label,
+                            "Connected - press Start");
+        }
+    }
+
+  /* Countdown line (ascii only; the label shows in the expiry banner) */
+
+  if (g_ai_app.cd_running)
+    {
+      struct timespec now;
+      uint32_t remain;
+      uint32_t hours;
+      uint32_t mins;
+      uint32_t secs;
+
+      clock_gettime(CLOCK_MONOTONIC, &now);
+
+      if (now.tv_sec < g_ai_app.cd_deadline.tv_sec)
+        {
+          remain = (uint32_t)(g_ai_app.cd_deadline.tv_sec - now.tv_sec);
+        }
+      else
+        {
+          remain = 0;
+        }
+
+      hours = remain / 3600;
+      mins = (remain % 3600) / 60;
+      secs = remain % 60;
+
+      if (hours != 0)
+        {
+          snprintf(buf, sizeof(buf), "Timer %lu:%02lu:%02lu",
+                   (unsigned long)hours, (unsigned long)mins,
+                   (unsigned long)secs);
+        }
+      else
+        {
+          snprintf(buf, sizeof(buf), "Timer %02lu:%02lu",
+                   (unsigned long)mins, (unsigned long)secs);
+        }
+
+      lv_obj_set_style_text_color(g_ai_app.timer_label,
+                                  ai_watch_theme_accent(theme), 0);
+      lv_label_set_text(g_ai_app.timer_label, buf);
+    }
+  else
+    {
+      lv_label_set_text(g_ai_app.timer_label, "");
+    }
+}
+
+static void ai_watch_create_ai_app(FAR struct ai_watch_s *watch)
+{
+  FAR lv_obj_t *screen;
+  FAR lv_obj_t *title;
+  FAR lv_obj_t *back_btn;
+  FAR lv_obj_t *back_lbl;
+  FAR lv_obj_t *start_btn;
+  FAR lv_obj_t *start_lbl;
+  int theme = watch->current_theme;
+
+  screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
+  lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+
+  title = lv_label_create(screen);
+  lv_label_set_text(title, "AI Assistant");
+  lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+
+  g_ai_app.status_label = lv_label_create(screen);
+  lv_label_set_text(g_ai_app.status_label,
+                    ai_watch_ble_get_status_text(ai_watch_ble_get_state()));
+  lv_obj_set_style_text_color(g_ai_app.status_label,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(g_ai_app.status_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(g_ai_app.status_label, LV_ALIGN_TOP_MID, 0, 58);
+
+  g_ai_app.timer_label = lv_label_create(screen);
+  lv_label_set_text(g_ai_app.timer_label, "");
+  lv_obj_set_style_text_color(g_ai_app.timer_label,
+                              ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_text_font(g_ai_app.timer_label,
+                             &lv_font_montserrat_16, 0);
+  lv_obj_align(g_ai_app.timer_label, LV_ALIGN_TOP_MID, 0, 82);
+
+  g_ai_app.result_label = lv_label_create(screen);
+  lv_label_set_text(g_ai_app.result_label,
+                    "No AI result yet.\nPress Start, then speak\n"
+                    "on the phone.");
+  lv_obj_set_style_text_color(g_ai_app.result_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_ai_app.result_label,
+                             &ai_watch_font_cjk_16, 0);
+  lv_label_set_long_mode(g_ai_app.result_label, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_ai_app.result_label, 350);
+  lv_obj_align(g_ai_app.result_label, LV_ALIGN_TOP_MID, 0, 112);
+
+  start_btn = lv_btn_create(screen);
+  lv_obj_set_size(start_btn, 170, 50);
+  lv_obj_set_style_bg_color(start_btn, ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_radius(start_btn, 14, 0);
+  lv_obj_align(start_btn, LV_ALIGN_BOTTOM_MID, 0, -80);
+  {
+    FAR lv_obj_t *mic_img = lv_img_create(start_btn);
+
+    lv_img_set_src(mic_img, &icon_mic_t4);
+    lv_obj_align(mic_img, LV_ALIGN_LEFT_MID, 14, 0);
+  }
+
+  start_lbl = lv_label_create(start_btn);
+  lv_label_set_text(start_lbl, "Start");
+  lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
+  lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_align(start_lbl, LV_ALIGN_RIGHT_MID, -18, 0);
+  lv_obj_add_event_cb(start_btn, ai_watch_ai_start_cb,
+                      LV_EVENT_CLICKED, watch);
+
+  back_btn = lv_btn_create(screen);
+  lv_obj_set_size(back_btn, 120, 45);
+  lv_obj_set_style_bg_color(back_btn, ai_watch_theme_btn_bg(theme), 0);
+  lv_obj_set_style_radius(back_btn, 12, 0);
+  lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+  back_lbl = lv_label_create(back_btn);
+  lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+  lv_obj_set_style_text_color(back_lbl,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(back_lbl);
+  lv_obj_add_event_cb(back_btn, ai_watch_ai_back_cb,
+                      LV_EVENT_CLICKED, watch);
+
+  g_ai_app.waiting = false;
+  g_ai_app.update_timer = lv_timer_create(
+      ai_watch_ai_update_cb, AI_WATCH_AI_STATUS_TIMER_MS, watch);
+
+  watch->app_page_screen = screen;
+}
+
+static void ai_watch_destroy_ai_app(FAR struct ai_watch_s *watch)
+{
+  if (g_ai_app.update_timer != NULL)
+    {
+      lv_timer_del(g_ai_app.update_timer);
+      g_ai_app.update_timer = NULL;
+    }
+
+  /* NOTE: the countdown keeps running with the page closed */
+
+  g_ai_app.status_label = NULL;
+  g_ai_app.result_label = NULL;
+  g_ai_app.timer_label = NULL;
+  g_ai_app.waiting = false;
+
+  /* NOTE: Do NOT delete app_page_screen here (see the timer app) */
+
+  watch->app_page_screen = NULL;
+}
+
+static void ai_watch_ai_countdown_poll(FAR struct ai_watch_s *watch)
+{
+  struct ai_watch_ai_timer_req_s req;
+  struct timespec now;
+
+  /* Start any newly requested countdown (a newer request replaces a
+   * running one).
+   */
+
+  while (ai_watch_ble_take_ai_timer(&req))
+    {
+      clock_gettime(CLOCK_MONOTONIC, &g_ai_app.cd_deadline);
+      g_ai_app.cd_deadline.tv_sec += req.duration_s;
+      g_ai_app.cd_running = true;
+      g_ai_app.cd_total_s = req.duration_s;
+      strlcpy(g_ai_app.cd_label, req.label, sizeof(g_ai_app.cd_label));
+
+      printf("AI: countdown %lu s \"%s\"\n",
+             (unsigned long)req.duration_s, req.label);
+    }
+
+  /* Fire the expiry banner */
+
+  if (g_ai_app.cd_running)
+    {
+      struct ai_watch_ble_alert_s alert;
+
+      clock_gettime(CLOCK_MONOTONIC, &now);
+
+      if (now.tv_sec >= g_ai_app.cd_deadline.tv_sec)
+        {
+          g_ai_app.cd_running = false;
+
+          memset(&alert, 0, sizeof(alert));
+          alert.type = AI_WATCH_BLE_CMD_AI_TIMER;
+          strlcpy(alert.title, g_ai_app.cd_label, sizeof(alert.title));
+          ai_watch_alert_show(watch, &alert);
+        }
+    }
+}
+
+/****************************************************************************
  * Private Functions - About/Init
  ****************************************************************************/
 
@@ -3269,7 +4274,13 @@ static void ai_watch_button_update(FAR struct ai_watch_s *watch,
         {
           watch->button_armed = false;
 
-          if (watch->current_page == AI_WATCH_PAGE_HOME)
+          if (g_fall_ui.visible)
+            {
+              /* KEY2 doubles as the fall-alert cancel button */
+
+              ai_watch_motion_fall_cancel();
+            }
+          else if (watch->current_page == AI_WATCH_PAGE_HOME)
             {
               /* On home page, KEY2 shows BLE status briefly.
                * BLE is managed automatically — no manual toggle.
@@ -3691,6 +4702,12 @@ int main(int argc, FAR char *argv[])
 
   /* Start BLE bring-up (asynchronous; state is polled in the main loop) */
 
+  /* Background motion service (onboard IMU): steps, activity and
+   * suspected-fall detection run from boot, independent of the UI.
+   */
+
+  ai_watch_motion_init();
+
   ai_watch_ble_init();
   ai_watch_update_bt_label(&watch);
 
@@ -3762,6 +4779,15 @@ int main(int argc, FAR char *argv[])
             }
         }
       }
+
+      /* AI countdown: start requested timers, fire expiry banners */
+
+      ai_watch_ai_countdown_poll(&watch);
+
+      /* Motion service: recording drain + BLE pacing + fall overlay */
+
+      ai_watch_motion_process();
+      ai_watch_fall_poll(&watch);
 
       ai_watch_unread_update(&watch);
 
