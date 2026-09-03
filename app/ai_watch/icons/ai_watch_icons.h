@@ -31,24 +31,6 @@ extern const lv_image_dsc_t icon_settings_t2;
 extern const lv_image_dsc_t icon_settings_t3;
 extern const lv_image_dsc_t icon_settings_t4;
 
-extern const lv_image_dsc_t icon_heart_rate_t0;
-extern const lv_image_dsc_t icon_heart_rate_t1;
-extern const lv_image_dsc_t icon_heart_rate_t2;
-extern const lv_image_dsc_t icon_heart_rate_t3;
-extern const lv_image_dsc_t icon_heart_rate_t4;
-
-extern const lv_image_dsc_t icon_blood_oxygen_t0;
-extern const lv_image_dsc_t icon_blood_oxygen_t1;
-extern const lv_image_dsc_t icon_blood_oxygen_t2;
-extern const lv_image_dsc_t icon_blood_oxygen_t3;
-extern const lv_image_dsc_t icon_blood_oxygen_t4;
-
-extern const lv_image_dsc_t icon_temp_humidity_t0;
-extern const lv_image_dsc_t icon_temp_humidity_t1;
-extern const lv_image_dsc_t icon_temp_humidity_t2;
-extern const lv_image_dsc_t icon_temp_humidity_t3;
-extern const lv_image_dsc_t icon_temp_humidity_t4;
-
 extern const lv_image_dsc_t icon_ai_t0;
 extern const lv_image_dsc_t icon_ai_t1;
 extern const lv_image_dsc_t icon_ai_t2;

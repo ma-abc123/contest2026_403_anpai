@@ -92,10 +92,6 @@
 
 /* DataUpload sensor types */
 
-#define AI_WATCH_BLE_SENSOR_TEMP        0x01  /* float32 LE, degC */
-#define AI_WATCH_BLE_SENSOR_HUM         0x02  /* float32 LE, %RH */
-#define AI_WATCH_BLE_SENSOR_HR          0x03  /* uint16 LE, bpm */
-#define AI_WATCH_BLE_SENSOR_SPO2        0x04  /* uint16 LE, % */
 #define AI_WATCH_BLE_SENSOR_STEPS       0x05  /* uint32 LE, steps today */
 #define AI_WATCH_BLE_SENSOR_ACTIVITY    0x06  /* uint8, AI_WATCH_MOTION_*
                                                * (0 rest / 1 walk / 2 run) */
@@ -112,7 +108,6 @@
 /* AI trigger payload: source(1) [+ optional context bytes] */
 
 #define AI_WATCH_AI_TRIGGER_SRC_PAGE    0x01  /* AI app page button */
-#define AI_WATCH_AI_TRIGGER_SRC_HR      0x02  /* reserved: heart-rate page */
 
 /* Command frame: [version(1)][cmd_type(1)][id(1)][flags(1)]
  *                [timestamp(4)][title_len(1)][title(N)]      (all LE)
@@ -399,9 +394,8 @@ int ai_watch_ble_post(uint8_t sensor_type,
  *   Tell the phone to start a voice/AI round: notify on DataUpload (f3)
  *   as sensor_type AI_WATCH_BLE_SENSOR_AI_TRIGGER with payload
  *   [source(1)][context(N)]:
- *   - source: AI_WATCH_AI_TRIGGER_SRC_* (page button, reserved sources)
- *   - context: optional bytes for that source (e.g. HR/SpO2 values from
- *     the heart-rate page once that link is live); may be 0 bytes.
+ *   - source: AI_WATCH_AI_TRIGGER_SRC_* (page button)
+ *   - context: optional bytes for that source; may be 0 bytes.
  *
  *   The phone answers with AI_TEXT / AI_TIMER / reminder commands.
  *
