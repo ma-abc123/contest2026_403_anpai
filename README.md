@@ -81,3 +81,5 @@ sftool -c SF32LB52 -p /dev/ttyUSB0 -b 1000000 \
 - **测试分析**：6 组实采数据回灌固件同源算法做阈值定标与验证
 
 完整对话日志见 `logs/`（按官方《AI Coding 日志归集与提交手册》导出）；过程性记录见 `docs/development/` 下按日期的开发日志。
+
+开发经验已沉淀为可复用的 AI Skill 并随仓提交：`.agents/skills/ai-watch-playbook/`——从 12 篇开发日志提炼的 AI Watch 开发手册（红线规则 + LVGL/BLE/传感器/跌倒算法/调试方法论），用 ZCode / Claude Code 打开本仓库即可自动加载使用。
