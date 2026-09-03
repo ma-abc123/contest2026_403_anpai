@@ -15,3 +15,9 @@ out/
 # Keep official AI Coding logs tracked.
 !logs/
 !logs/**
+
+# Firmware binaries and OS junk (never upload)
+*.bin
+.DS_Store
+Thumbs.db
+desktop.ini
