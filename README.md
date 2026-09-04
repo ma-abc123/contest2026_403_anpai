@@ -33,7 +33,7 @@ tools/             # fall_threshold_analysis.py：跌倒阈值离线定标脚本
 logs/              # AI Coding 日志（按官方手册导出提交）
 ```
 
-> 代码经 manifest `<linkfile>` 映射进 openvela 编译树（`packages/demos/contest2026_403_ai_watch/` 等），公共仓库零改动；仅 vendor/sifli 下有少量板级/桥接层修改（LSM6DS3 板级注册、BLE 桥接 indication 兼容）。
+> 代码经 manifest `<linkfile>` 映射进 openvela 编译树（`packages/demos/contest2026_403_ai_watch/` 等）。作品对公共仓有两处配套修改，已按规则向 `dev-ai-contest-2026` 分支提交 PR（组委会评审中）：[vendor_sifli#32](https://github.com/open-vela/vendor_sifli/pull/32)（SF32LB52 BLE 桥接 zblue 适配、LCPU patch 加载修复、控制器自愈、LCD 注册竞态、黄山派板级 rcS/ROMFS 调整——实机 BLE 连接与启动依赖此 PR）；[frameworks_runtimes_feature#4](https://github.com/open-vela/frameworks_runtimes_feature/pull/4)（move ctor 编译修复——全量构建依赖此 PR）。
 
 ## 四、运行方式
 
