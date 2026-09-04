@@ -28,6 +28,7 @@ app/ai_watch/      # AI Watch 主应用（LVGL UI、应用框架、运动服务�
   ├─ ai_watch_icons.*     # 图标资源（用户图标集生成）
   └─ fonts/, icons/       # CJK 字体与图标源
 board/ai_watch/    # 板级 defconfig（映射到 vendor/openvela/boards/contest2026_403_ai_watch）
+phone/             # 手机端配套 App 源码（Android/Kotlin/Compose，BLE 互联与 AI 闭环的另一半）
 docs/development/  # 开发日志（按日期）、手机端需求文档、排查文档
 tools/             # fall_threshold_analysis.py：跌倒阈值离线定标脚本
 logs/              # AI Coding 日志（按官方手册导出提交）
@@ -65,7 +66,7 @@ sftool -c SF32LB52 -p /dev/ttyUSB0 -b 1000000 \
   write_flash <绝对路径>/nuttx.bin@0x12010000
 ```
 
-上电后手表直接进表盘（串口 1M 波特可看启动日志）。无手机也可完整使用：表盘/菜单/工具/运动跌倒检测；连接手机 App 后启用时间同步、提醒、AI 闭环与事件上报。
+上电后手表直接进表盘（串口 1M 波特可看启动日志）。无手机也可完整使用：表盘/菜单/工具/运动跌倒检测；连接手机 App 后启用时间同步、提醒、AI 闭环与事件上报——手机端 App 源码与构建方式见 `phone/`。
 
 ### 4. 跌倒检测演示
 

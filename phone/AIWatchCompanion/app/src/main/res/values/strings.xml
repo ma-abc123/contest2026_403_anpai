@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AI Watch</string>
+    <string name="notif_channel_name">手表连接</string>
+    <string name="notif_channel_desc">保持与 AI Watch 的后台连接</string>
+</resources>
