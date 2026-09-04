@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 表带上侧 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M44,10 h20 a5,5 0 0 1 5,5 v16 h-30 v-16 a5,5 0 0 1 5,-5 z" />
+    <!-- 表带下侧 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M39,77 h30 v16 a5,5 0 0 1 -5,5 h-20 a5,5 0 0 1 -5,-5 z" />
+    <!-- 表圈（环） -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M54,30 a29,29 0 1,0 0.001,0 z M54,38 a21,21 0 1,1 -0.001,0 z" />
+    <!-- 指针 -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M54,59 L54,45 M54,59 L64,59" />
+    <!-- 传感器小点 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M45,44 a2.2,2.2 0 1,0 0.001,0 z" />
+</vector>
