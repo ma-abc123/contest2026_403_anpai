@@ -1,0 +1,234 @@
+From 45d25416cc67613d664bf3ca48f1743013af3d9e Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Sun, 30 Aug 2026 13:46:37 +0800
+Subject: [PATCH 1/8] feat(sf32lb52): BLE controller self-heal and SRAM
+ top-of-heap guard
+
+The LCPU bluetooth firmware occasionally dies ~1s into a connection
+(Hardware Error event, code 0) - flaky, seen across firmware variants,
+not cleared by power cycles.  Root cause is inside the closed LCPU
+image; the host can only recover.
+
+- sifli_allocateheap.c: keep the heap below the vendor-reserved top of
+  HCPU SRAM (0x2007FB00 and up): HCPU_CUSTOM_CONFIG (256B) plus the
+  HCPU<->LCPU mailbox window (2x512B, channel 1 carries the BT HCI
+  stream at fixed addresses the LCPU reads from its own RAM).  Heap
+  allocations reaching this window corrupt the controller stream.
+- sf32lb52_ble_bridge.c: on Hardware Error, power-cycle the LCPU and
+  rebuild the zblue host: controller_deinit (LCPU power off, adapter
+  to IDLE) -> bt_disable_mc (its HCI_RESET re-boots a fresh LCPU
+  through the adapter auto-enable path, so teardown completes cleanly)
+  -> bsp_start (full enable, GATT re-registration, advertising).
+  Rate-limited to once per 10s; runs on the application main loop.
+  Also: re-advertise failures back off 30s and try start-first so a
+  wedged controller is not hammered every second.
+
+Verified on device: controller death now self-recovers in ~3-5s and
+the phone's reconnect loop reattaches without user action.
+---
+ chips/sf32lb52/sf32lb52_ble_bridge.c | 113 ++++++++++++++++++++++++++-
+ chips/sf32lb52/sifli_allocateheap.c  |  15 +++-
+ 2 files changed, 123 insertions(+), 5 deletions(-)
+
+diff --git a/chips/sf32lb52/sf32lb52_ble_bridge.c b/chips/sf32lb52/sf32lb52_ble_bridge.c
+index 1e07383..5f11330 100644
+--- a/chips/sf32lb52/sf32lb52_ble_bridge.c
++++ b/chips/sf32lb52/sf32lb52_ble_bridge.c
+@@ -54,6 +54,7 @@
+ #include <zephyr/bluetooth/gatt.h>
+ #include <zephyr/bluetooth/uuid.h>
+ 
++#include "sf32lb52_bt_adapter.h"
+ #include "ai_watch_ble_bsp.h"
+ 
+ /****************************************************************************
+@@ -133,6 +134,22 @@ static struct
+   uint8_t cmdq_len[AI_WATCH_BLE_CMD_QUEUE_LEN];
+   volatile uint8_t cmdq_head;           /* writer index */
+   volatile uint8_t cmdq_tail;           /* reader index */
++
++  /* Re-advertise backoff. After a failed resume attempt (e.g. the
++   * controller is unresponsive following an HCI Hardware Error) wait
++   * before poking it again: one attempt can block the main loop for
++   * HCI_CMD_TIMEOUT (10s) waiting for a command completion.
++   */
++
++  int resume_failures;                  /* consecutive failed resumes */
++  long resume_retry_after;              /* CLOCK_MONOTONIC sec gate */
++
++  /* Controller hardware-error self-heal: the RX thread sets the flag,
++   * the application main loop performs the recovery (blocking HCI is
++   * safe there). */
++
++  volatile bool hw_error_pending;
++  long last_recover_sec;                /* CLOCK_MONOTONIC sec gate */
+ } g_bridge;
+ 
+ /****************************************************************************
+@@ -503,6 +520,8 @@ static void bridge_bt_ready(uint8_t dev_id, int err)
+  * Public Functions - wrapper implementation (see ai_watch_ble_bsp.h)
+  ****************************************************************************/
+ 
++static void bridge_hw_error_notify(uint8_t dev_id);
++
+ int ai_watch_ble_bsp_start(void)
+ {
+   int err;
+@@ -514,6 +533,7 @@ int ai_watch_ble_bsp_start(void)
+ 
+   g_bridge.started = true;
+   g_bridge.enabled = true;
++  bt_hci_hw_error_cb_register(bridge_hw_error_notify);
+ 
+   /* Do NOT register conn callbacks here: in this zblue port
+    * bt_conn_cb_register_mc() dereferences hdev->conn_ctx, which only
+@@ -543,6 +563,63 @@ enum ai_watch_ble_bsp_state_e ai_watch_ble_bsp_get_state(void)
+   return g_bridge.state;
+ }
+ 
++/* Called by the zblue RX thread when the controller reports a
++ * Hardware Error event (the LCPU bluetooth firmware died).  Only sets
++ * a flag; the recovery itself runs on the application main loop.
++ * Registered in ai_watch_ble_bsp_start().
++ */
++static void bridge_hw_error_notify(uint8_t dev_id)
++{
++  (void)dev_id;
++  g_bridge.hw_error_pending = true;
++}
++
++bool ai_watch_ble_bsp_take_hw_error(void)
++{
++  bool pending = g_bridge.hw_error_pending;
++
++  g_bridge.hw_error_pending = false;
++  return pending;
++}
++
++void ai_watch_ble_bsp_recover(void)
++{
++  struct timespec now;
++  int ret;
++
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  if (now.tv_sec < g_bridge.last_recover_sec + 10)
++    {
++      return;                           /* rate limit: one per 10s */
++    }
++
++  g_bridge.last_recover_sec = now.tv_sec;
++  syslog(LOG_ERR, "aiwatch-ble: controller hardware error - recovering\n");
++
++  /* 1. Power the LCPU off and drop the adapter to IDLE. */
++
++  sf32lb52_bt_controller_deinit();
++  g_bridge.conn = NULL;
++  g_bridge.started = false;
++  g_bridge.state = AI_WATCH_BLE_BSP_OFF;
++
++  /* 2. Tear the zblue host down.  Its HCI_RESET goes through the
++   * adapter auto-enable path, which re-boots a fresh LCPU (patches +
++   * RF calibration) before the reset - so the teardown completes
++   * cleanly and the host state is fully released. */
++
++  ret = bt_disable_mc(0);
++  if (ret != 0)
++    {
++      syslog(LOG_ERR, "aiwatch-ble: host disable failed: %d\n", ret);
++    }
++
++  /* 3. Full bring-up: bt_enable_mc -> bt_ready -> GATT service +
++   * advertising.  The phone's retry loop reconnects on its own. */
++
++  ai_watch_ble_bsp_start();
++}
++
+ bool ai_watch_ble_bsp_take_timesync(
+     FAR struct ai_watch_ble_bsp_timesync_s *out)
+ {
+@@ -633,24 +710,52 @@ int ai_watch_ble_bsp_notify(uint8_t chr, FAR const void *data,
+ 
+ void ai_watch_ble_bsp_resume_advertising(void)
+ {
++  struct timespec now;
++  int err;
++
+   if (!g_bridge.enabled || !g_bridge.started ||
+       g_bridge.state != AI_WATCH_BLE_BSP_DISCONNECTED)
+     {
+       return;
+     }
+ 
++  /* Backoff after a failed attempt: a wedged controller makes each
++   * attempt block the main loop for up to HCI_CMD_TIMEOUT.
++   */
++
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  if (g_bridge.resume_failures > 0 &&
++      now.tv_sec < g_bridge.resume_retry_after)
++    {
++      return;
++    }
++
+   /* A ONE_TIME advertising set is stopped - but not deleted - when a
+    * connection is accepted. bt_le_adv_start() then fails with -EALREADY
+-   * for as long as that stale set is registered (adv_create_legacy).
++   * for as long as that stale set is registered (adv_create_legacy);
+    * bt_le_adv_stop() takes the delete branch for a set that is no
+-   * longer advertising, so clear it before starting fresh.
++   * longer advertising. Try starting directly first so the healthy
++   * path issues no stop command at all; on -EALREADY clear the stale
++   * set and retry. On a controller timeout (-ETIMEDOUT) there is no
++   * set to clean up - do not spend another blocking command on it.
+    */
+ 
+-  bt_le_adv_stop();
++  err = bridge_adv_start();
++  if (err == -EALREADY)
++    {
++      bt_le_adv_stop();
++      err = bridge_adv_start();
++    }
+ 
+-  if (bridge_adv_start() == 0)
++  if (err == 0)
+     {
+       g_bridge.state = AI_WATCH_BLE_BSP_ADVERTISING;
++      g_bridge.resume_failures = 0;
++    }
++  else
++    {
++      g_bridge.resume_failures++;
++      g_bridge.resume_retry_after = now.tv_sec + 30;
+     }
+ }
+ 
+diff --git a/chips/sf32lb52/sifli_allocateheap.c b/chips/sf32lb52/sifli_allocateheap.c
+index 62371c5..0860e8b 100644
+--- a/chips/sf32lb52/sifli_allocateheap.c
++++ b/chips/sf32lb52/sifli_allocateheap.c
+@@ -44,7 +44,20 @@ extern void BSP_Board_PreInit(void);
+ 
+ #define SRAM_START  0x20000000
+ #define SRAM_SIZE   0x00080000    /* 512 KB */
+-#define SRAM_END    (SRAM_START + SRAM_SIZE)
++
++/* The top of HCPU SRAM is reserved by the vendor memory map (mem_map.h)
++ * and must never be handed to the heap:
++ *   0x2007FB00-0x2007FBFF  HCPU_CUSTOM_CONFIG (256B, consumed by the
++ *                          closed LCPU/ROM side)
++ *   0x2007FC00-0x2007FFFF  HPSYS_MBOX_BUF (2 x 512B); channel 1 carries
++ *                          the BT HCI stream at fixed addresses that the
++ *                          LCPU reads from its own RAM space.
++ * Heap allocations reaching this window corrupt the BT stream and the
++ * controller dies with "Hardware error, code 0" on the next connection.
++ */
++
++#define HCPU_TOP_RESERVED   0x500
++#define SRAM_END    (SRAM_START + SRAM_SIZE - HCPU_TOP_RESERVED)
+ 
+ /* PSRAM memory configuration for SF32LB52 (MPI1 SBUS) */
+ 
+-- 
+2.34.1
+

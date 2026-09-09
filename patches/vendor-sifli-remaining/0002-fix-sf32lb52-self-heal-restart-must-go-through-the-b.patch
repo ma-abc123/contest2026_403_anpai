@@ -1,0 +1,117 @@
+From ba95dd5d6bc836b99632b068e5e93c1c3f7d074d Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Sun, 30 Aug 2026 14:22:37 +0800
+Subject: [PATCH 2/8] fix(sf32lb52): self-heal restart must go through the bth4
+ driver path
+
+Device test of the self-heal showed the recovery sequence breaking:
+after sf32lb52_bt_controller_deinit() the adapter sits in IDLE and the
+send path's ensure_controller_enabled() only handles INITED->ENABLED,
+so bt_disable_mc's HCI_RESET fails and the subsequent bt_enable_mc is
+rejected with -ENODEV (bt_dev_alloc returns NULL while the half-torn
+hdev from the failed disable is still around).
+
+- bth4.c: export sf32lb52_bth4_controller_restart() - full deinit
+  (LCPU power off), controller_init (re-init mailbox), RX callback
+  re-registration (controller_init clears the adapter env) and enable
+  (fresh LCPU: patch install, RF calibration, ring sync).  Lives in
+  bth4.c because the RX callback is static to that file.
+- bridge recover(): restart the controller BEFORE bt_disable_mc so the
+  host teardown sees a responsive controller and completes cleanly.
+- version string: the 4.4.2/4.4.3 bumps silently missed (sed on an
+  already-relabelled constant); firmware reported 4.4.1 while carrying
+  self-heal code.  Now really 4.4.3 (verified in the binary).
+
+Verified: binary version string correct; recovery path reworked.
+---
+ chips/sf32lb52/sf32lb52_ble_bridge.c | 17 +++++++++++--
+ chips/sf32lb52/sf32lb52_bth4.c       | 37 ++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/chips/sf32lb52/sf32lb52_ble_bridge.c b/chips/sf32lb52/sf32lb52_ble_bridge.c
+index 5f11330..4fa12ac 100644
+--- a/chips/sf32lb52/sf32lb52_ble_bridge.c
++++ b/chips/sf32lb52/sf32lb52_ble_bridge.c
+@@ -596,9 +596,22 @@ void ai_watch_ble_bsp_recover(void)
+   g_bridge.last_recover_sec = now.tv_sec;
+   syslog(LOG_ERR, "aiwatch-ble: controller hardware error - recovering\n");
+ 
+-  /* 1. Power the LCPU off and drop the adapter to IDLE. */
++  /* 1. Restart the controller: power the LCPU off, re-init the mailbox,
++   *    re-register the RX callback and boot a fresh LCPU (patches + RF
++   *    calibration + ring sync).  After this the controller answers HCI
++   *    again, so the host teardown below completes cleanly. */
++
++  {
++    extern int sf32lb52_bth4_controller_restart(void);
++
++    ret = sf32lb52_bth4_controller_restart();
++    if (ret != 0)
++      {
++        syslog(LOG_ERR, "aiwatch-ble: controller restart failed: %d\n",
++               ret);
++      }
++  }
+ 
+-  sf32lb52_bt_controller_deinit();
+   g_bridge.conn = NULL;
+   g_bridge.started = false;
+   g_bridge.state = AI_WATCH_BLE_BSP_OFF;
+diff --git a/chips/sf32lb52/sf32lb52_bth4.c b/chips/sf32lb52/sf32lb52_bth4.c
+index 933f322..926bd65 100644
+--- a/chips/sf32lb52/sf32lb52_bth4.c
++++ b/chips/sf32lb52/sf32lb52_bth4.c
+@@ -160,6 +160,7 @@ struct sf32lb52_bt_priv_s
+ };
+ 
+ static int sf32lb52_bt_open(struct bt_driver_s *drv);
++int sf32lb52_bth4_controller_restart(void);
+ static int sf32lb52_bt_send(struct bt_driver_s *drv,
+                             enum bt_buf_type_e type,
+                             void *data, size_t len);
+@@ -625,6 +626,42 @@ static int sf32lb52_bt_send(struct bt_driver_s *drv,
+   return len;
+ }
+ 
++/* Full controller restart used by the Hardware-Error self-heal: power
++ * the LCPU off, re-init the mailbox, re-register the RX callback
++ * (controller_init clears the adapter env) and boot a fresh LCPU
++ * (patch install + RF calibration + ring sync).  After this the
++ * controller answers HCI again and the zblue host can tear itself
++ * down cleanly.  Must run from a context where blocking is OK.
++ */
++int sf32lb52_bth4_controller_restart(void)
++{
++  int ret;
++
++  ret = sf32lb52_bt_controller_deinit();
++  if (ret < 0 && ret != -EPERM)
++    {
++      syslog(LOG_ERR, "sf32lb52 bth4 restart: deinit failed: %d\n", ret);
++      return ret;
++    }
++
++  ret = sf32lb52_bt_controller_init();
++  if (ret < 0)
++    {
++      syslog(LOG_ERR, "sf32lb52 bth4 restart: init failed: %d\n", ret);
++      return ret;
++    }
++
++  ret = sf32lb52_hci_register_callback(sf32lb52_bt_recv_cb);
++  if (ret < 0)
++    {
++      syslog(LOG_ERR, "sf32lb52 bth4 restart: register cb failed: %d\n",
++             ret);
++      return ret;
++    }
++
++  return sf32lb52_bt_controller_enable();
++}
++
+ static int sf32lb52_bt_ensure_controller_enabled(uint16_t opcode)
+ {
+   int ret;
+-- 
+2.34.1
+

@@ -1,0 +1,36 @@
+From a437c81ec8d67488443a7e95f11dc2e4b415ad91 Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Sun, 30 Aug 2026 14:32:45 +0800
+Subject: [PATCH 3/8] fix(sf32lb52): rate limiter must not swallow the first
+ self-heal
+
+last_recover_sec is zero-initialised and CLOCK_MONOTONIC starts at 0,
+so  silently dropped every first recovery attempt
+within the first 10s of uptime - exactly when the connection-time
+Hardware Error fires (~4s after boot).  The pending flag was already
+consumed, so the self-heal never ran and the watch stayed in LOST.
+Zero now means 'never recovered' and bypasses the gate.
+---
+ chips/sf32lb52/sf32lb52_ble_bridge.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/chips/sf32lb52/sf32lb52_ble_bridge.c b/chips/sf32lb52/sf32lb52_ble_bridge.c
+index 4fa12ac..305c3e6 100644
+--- a/chips/sf32lb52/sf32lb52_ble_bridge.c
++++ b/chips/sf32lb52/sf32lb52_ble_bridge.c
+@@ -588,7 +588,11 @@ void ai_watch_ble_bsp_recover(void)
+   int ret;
+ 
+   clock_gettime(CLOCK_MONOTONIC, &now);
+-  if (now.tv_sec < g_bridge.last_recover_sec + 10)
++  /* last_recover_sec == 0 means "never recovered" - CLOCK_MONOTONIC
++   * starts at 0, so a plain `now < last + 10` would silently swallow
++   * the first recovery attempt during the first 10s of uptime. */
++  if (g_bridge.last_recover_sec != 0 &&
++      now.tv_sec < g_bridge.last_recover_sec + 10)
+     {
+       return;                           /* rate limit: one per 10s */
+     }
+-- 
+2.34.1
+
