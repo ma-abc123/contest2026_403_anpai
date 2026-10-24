@@ -42,6 +42,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -110,6 +111,11 @@ static volatile uint8_t g_txq_tail;
 static uint32_t g_txq_dropped;
 static pthread_t g_tx_thread;
 static volatile bool g_tx_thread_ok;
+
+/* INIT_FAILED auto-recovery bookkeeping (see ai_watch_ble_process) */
+
+static int s_initfail_tries;            /* consecutive auto-recover attempts */
+static struct timespec s_initfail_next; /* earliest next attempt, monotonic */
 
 /****************************************************************************
  * Private Functions - DataUpload TX worker
@@ -719,9 +725,59 @@ void ai_watch_ble_process(void)
 
   if (ai_watch_ble_bsp_take_hw_error())
     {
+      s_initfail_tries = 0;
+      s_initfail_next.tv_sec = 0;
       ai_watch_ble_bsp_recover();
       return;
     }
+
+  /* INIT_FAILED auto-recovery: a boot-time advertising failure (the LCPU
+   * firmware wedging at the advertising-enable command, no Hardware
+   * Error event) leaves the bridge dead until a power cycle - recover()
+   * restarts the controller and re-runs the whole bring-up. Attempts are
+   * capped so a permanently broken controller cannot freeze the UI on
+   * every backoff; reaching a link-active state or toggling the switch
+   * resets the cap. OFF is deliberately NOT a reset: recover() passes
+   * through it during the async re-bring-up. */
+
+  {
+    enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
+
+    if (state == AI_WATCH_BLE_BSP_ADVERTISING ||
+        state == AI_WATCH_BLE_BSP_CONNECTED ||
+        state == AI_WATCH_BLE_BSP_DISCONNECTED)
+      {
+        s_initfail_tries = 0;
+        s_initfail_next.tv_sec = 0;
+      }
+    else if (state == AI_WATCH_BLE_BSP_INIT_FAILED &&
+             s_initfail_tries < 3)
+      {
+        struct timespec now;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        if (s_initfail_next.tv_sec == 0)
+          {
+            /* first sighting: give the bring-up 10 s to settle before
+             * the first attempt (monotonic 0 only before scheduling) */
+
+            s_initfail_next = now;
+            s_initfail_next.tv_sec += 10;
+          }
+        else if (now.tv_sec >= s_initfail_next.tv_sec)
+          {
+            s_initfail_tries++;
+            s_initfail_next = now;
+            s_initfail_next.tv_sec += 30;
+            syslog(LOG_WARNING,
+                   "aiwatch-ble: INIT_FAILED, auto-recover attempt %d\n",
+                   s_initfail_tries);
+            ai_watch_ble_bsp_recover();
+            return;
+          }
+      }
+  }
 
   /* Auto-reconnect: after a link loss, retry re-advertising once per
    * second from this (application) thread until it succeeds - the
@@ -751,6 +807,12 @@ void ai_watch_ble_process(void)
 
 void ai_watch_ble_set_enabled(bool enabled)
 {
+  /* A manual toggle is fresh evidence the user is watching - start the
+   * INIT_FAILED auto-recovery cap over. */
+
+  s_initfail_tries = 0;
+  s_initfail_next.tv_sec = 0;
+
   ai_watch_ble_bsp_set_enabled(enabled);
 }
 
