@@ -720,10 +720,10 @@ void ai_watch_ble_process(void)
 
   ai_ble_check_due();
 
-  /* Controller self-heal: if the LCPU bluetooth firmware reported a
-   * hardware error, power-cycle it and rebuild the host stack. */
+  /* Controller self-heal: recover hardware-error events and HCI command
+   * timeouts outside the controller RX/command callback context. */
 
-  if (ai_watch_ble_bsp_take_hw_error())
+  if (ai_watch_ble_bsp_take_controller_fault())
     {
       s_initfail_tries = 0;
       s_initfail_next.tv_sec = 0;
@@ -731,16 +731,11 @@ void ai_watch_ble_process(void)
       return;
     }
 
-  /* INIT_FAILED auto-recovery: a boot-time advertising failure (the LCPU
-   * firmware wedging at an advertising-enable command, no Hardware
-   * Error event) leaves the bridge dead until a power cycle - recover()
-   * restarts the controller and re-runs the whole bring-up. The LCPU
-   * failure is ~50% per bring-up (2026-10-24 logs), so five attempts
-   * give ~97% of boots a working radio; the cap still bounds the UI
-   * freeze a permanently broken controller would cause. Reaching a
-   * link-active state or toggling the switch resets the cap. OFF is
-   * deliberately NOT a reset: recover() passes through it during the
-   * async re-bring-up. */
+  /* INIT_FAILED auto-recovery covers initialization failures that do not
+   * produce a Hardware Error or command-timeout callback. Retries stay
+   * bounded; reaching a link-active state or toggling the switch resets
+   * the cap. OFF is deliberately NOT a reset because recover() passes
+   * through it during asynchronous re-bring-up. */
 
   {
     enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
