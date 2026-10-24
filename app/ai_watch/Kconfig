@@ -31,4 +31,15 @@ config EXAMPLES_AI_WATCH_HEAPSIZE
 	depends on MM_TASK_HEAP
 	default MM_TASK_HEAP_DEFAULT_SIZE
 
+config AI_WATCH_ROMDUMP
+	bool "One-shot LCPU ROM dump at first BLE advertising"
+	default n
+	---help---
+		Diagnostic: dump the LCPU mask ROM (HCPU view 0x20800000,
+		384 KiB, where the closed-source Bluetooth controller firmware
+		executes) and the LPSYS shared window (0x20400000, 64 KiB) to
+		the console as hex lines with CRC32 markers, for offline
+		reverse engineering.  Blocks the main loop for ~20 s when
+		triggered; diagnostic builds only.
+
 endif
