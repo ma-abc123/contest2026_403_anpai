@@ -732,13 +732,15 @@ void ai_watch_ble_process(void)
     }
 
   /* INIT_FAILED auto-recovery: a boot-time advertising failure (the LCPU
-   * firmware wedging at the advertising-enable command, no Hardware
+   * firmware wedging at an advertising-enable command, no Hardware
    * Error event) leaves the bridge dead until a power cycle - recover()
-   * restarts the controller and re-runs the whole bring-up. Attempts are
-   * capped so a permanently broken controller cannot freeze the UI on
-   * every backoff; reaching a link-active state or toggling the switch
-   * resets the cap. OFF is deliberately NOT a reset: recover() passes
-   * through it during the async re-bring-up. */
+   * restarts the controller and re-runs the whole bring-up. The LCPU
+   * failure is ~50% per bring-up (2026-10-24 logs), so five attempts
+   * give ~97% of boots a working radio; the cap still bounds the UI
+   * freeze a permanently broken controller would cause. Reaching a
+   * link-active state or toggling the switch resets the cap. OFF is
+   * deliberately NOT a reset: recover() passes through it during the
+   * async re-bring-up. */
 
   {
     enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
@@ -751,7 +753,7 @@ void ai_watch_ble_process(void)
         s_initfail_next.tv_sec = 0;
       }
     else if (state == AI_WATCH_BLE_BSP_INIT_FAILED &&
-             s_initfail_tries < 3)
+             s_initfail_tries < 5)
       {
         struct timespec now;
 
