@@ -753,9 +753,23 @@ void ai_watch_ble_process(void)
         /* r5 sampler ring FIRST (timeline before the fault), then the
          * LPSYS window (assert record, patch hooks, cfg), then the
          * register blocks - all while the failed controller is still
-         * up; recover() tears the LCPU down right after this. */
+         * up; recover() tears the LCPU down right after this.
+         *
+         * Full LPS dumps are rate-limited to the first two faults per
+         * boot: the wedge is fully characterized by now (r7/r8: hook
+         * independent, opcode agnostic) and each 2x64 KiB hex dump
+         * freezes the watch for seconds in front of the user.  The
+         * sampler ring and the fast register blocks stay on every
+         * fault - they are cheap and catch anything new. */
+
+        static int s_fault_full_dumps;
+
         ai_watch_reg_sampler_dump_ring("fault");
-        ai_watch_romdump_run_lps();
+        if (s_fault_full_dumps < 2)
+          {
+            s_fault_full_dumps++;
+            ai_watch_romdump_run_lps();
+          }
         ai_watch_romdump_run_regs();
       }
 #endif

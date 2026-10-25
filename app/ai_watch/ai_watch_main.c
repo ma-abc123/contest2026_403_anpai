@@ -51,7 +51,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.16-c2e0"
+#define AI_WATCH_VERSION            "4.8.18-e1-legacy"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
