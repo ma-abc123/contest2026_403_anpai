@@ -219,6 +219,14 @@ void ai_watch_romdump_run_regs(void)
    * zero-fill for a region whose lines never made it out).  MAC is
    * LCPU-private; SWD remains the only way to see it. */
 
+  /* MAC (0x40090000) intentionally NOT read here.  r6 request was to
+   * capture it at bring-up failures, but the c2e1 build proved the
+   * abort is context-dependent: it hard-faulted at a 0x2036 bring-up
+   * fault while r4-era connection faults read it fine (zeros) and the
+   * healthy sampler reads it every 100 ms.  A bus abort here hangs
+   * the board before recovery; MAC evidence at bring-up faults has to
+   * come from the SWD stage instead. */
+
   static const struct romdump_region_s regs[3] =
     {
       { "RCC", 0x40000000UL, 0x40 },
