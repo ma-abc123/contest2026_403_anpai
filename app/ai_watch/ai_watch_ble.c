@@ -730,11 +730,14 @@ void ai_watch_ble_process(void)
 #ifdef CONFIG_AI_WATCH_ROMDUMP
       {
         extern void ai_watch_romdump_run_lps(void);
+        extern void ai_watch_romdump_run_regs(void);
 
         /* Snapshot the LPSYS window (assert record, patch hooks, cfg)
-         * while the failed controller is still up - recover() tears
-         * the LCPU down right after this. */
+         * plus the LPSYS Bluetooth register blocks (LPSYS_RCC, BT_RFC,
+         * BT_PHY, BT_MAC) while the failed controller is still up -
+         * recover() tears the LCPU down right after this. */
         ai_watch_romdump_run_lps();
+        ai_watch_romdump_run_regs();
       }
 #endif
       ai_watch_ble_bsp_recover();

@@ -204,6 +204,46 @@ void ai_watch_romdump_run_lps(void)
   syslog(LOG_INFO, "ROMDUMP: LPS snapshot complete\n");
 }
 
+void ai_watch_romdump_run_regs(void)
+{
+  /* Fault-time snapshot of the LPSYS Bluetooth register blocks the
+   * reverse-engineering round 4 flagged as the SWD-stage targets, now
+   * that C/A1/D experiments all failed to converge.  All four are
+   * mapped LPSYS peripherals reachable from the HCPU (hwp_lpsys_rcc is
+   * already used by boot code); reading them beats needing an SWD
+   * probe for the same data.  Called from the BLE fault path alongside
+   * the LPS snapshot, before the recovery tears the controller down.
+   */
+
+  static const struct romdump_region_s regs[4] =
+    {
+      { "RCC", 0x40000000UL, 0x40 },
+      { "RFC", 0x40082800UL, 0x40 },
+      { "PHY", 0x40084000UL, 0x40 },
+      { "MAC", 0x40090000UL, 0x40 }
+    };
+
+  int fd;
+  int i;
+
+  fd = open("/dev/console", O_WRONLY);
+  if (fd < 0)
+    {
+      syslog(LOG_ERR, "ROMDUMP: cannot open console\n");
+      return;
+    }
+
+  syslog(LOG_INFO, "ROMDUMP: fault-time LPSYS register snapshot\n");
+
+  for (i = 0; i < 4; i++)
+    {
+      romdump_region(fd, &regs[i]);
+    }
+
+  close(fd);
+  syslog(LOG_INFO, "ROMDUMP: register snapshot complete\n");
+}
+
 #else /* CONFIG_AI_WATCH_ROMDUMP */
 
 typedef int romdump_unused_t;
