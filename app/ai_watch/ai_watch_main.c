@@ -51,7 +51,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.11-g2"
+#define AI_WATCH_VERSION            "4.8.12-faultcap"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -106,10 +106,6 @@
 #define AI_WATCH_MENU_MAX_ICONS     19
 #define AI_WATCH_MENU_ICON_SIZE     160  /* largest tier size */
 #define AI_WATCH_MENU_RING_SPACING  140
-
-#ifdef CONFIG_AI_WATCH_ROMDUMP
-void ai_watch_romdump_run(void);
-#endif
 
 /* Snap animation duration */
 
@@ -3645,9 +3641,6 @@ int main(int argc, FAR char *argv[])
       {
         static enum ai_watch_ble_bsp_state_e last_ble_state =
           AI_WATCH_BLE_BSP_OFF;
-#ifdef CONFIG_AI_WATCH_ROMDUMP
-        static bool romdump_done;
-#endif
 
         enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
 
@@ -3669,28 +3662,6 @@ int main(int argc, FAR char *argv[])
               ai_watch_alert_show(&watch, &alert);
             }
         }
-
-#ifdef CONFIG_AI_WATCH_ROMDUMP
-        /* One-shot LCPU firmware dump for offline analysis.  Unconditional
-         * ~90 s after boot (main loop period ~10 ms): works even when the
-         * controller never reaches advertising, to compare the ROM window
-         * across healthy and dead phases.  Blocks the loop for ~45 s;
-         * diagnostic builds only. */
-
-        if (!romdump_done)
-          {
-            static unsigned romdump_wait;
-
-            romdump_wait++;
-
-            if (romdump_wait >= 9000)
-              {
-                romdump_done = true;
-                printf("ROMDUMP trigger, state=%d\n", (int)state);
-                ai_watch_romdump_run();
-              }
-          }
-#endif
       }
 
       /* AI countdown: start requested timers, fire expiry banners */

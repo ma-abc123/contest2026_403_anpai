@@ -727,6 +727,16 @@ void ai_watch_ble_process(void)
     {
       s_initfail_tries = 0;
       s_initfail_next.tv_sec = 0;
+#ifdef CONFIG_AI_WATCH_ROMDUMP
+      {
+        extern void ai_watch_romdump_run_lps(void);
+
+        /* Snapshot the LPSYS window (assert record, patch hooks, cfg)
+         * while the failed controller is still up - recover() tears
+         * the LCPU down right after this. */
+        ai_watch_romdump_run_lps();
+      }
+#endif
       ai_watch_ble_bsp_recover();
       return;
     }

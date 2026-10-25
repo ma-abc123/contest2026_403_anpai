@@ -170,6 +170,40 @@ void ai_watch_romdump_run(void)
   syslog(LOG_INFO, "ROMDUMP: complete\n");
 }
 
+void ai_watch_romdump_run_lps(void)
+{
+  /* Fault-time snapshot of the LPSYS window only (assert record at
+   * 0x20407FE0, patch hooks, cfg): called from the BLE fault path
+   * BEFORE the recovery tears the LCPU down, so the on-fault state is
+   * preserved for offline analysis. */
+
+  static const struct romdump_region_s regions[2] =
+    {
+      { "LPS_A", ROMDUMP_LPS_BASE, ROMDUMP_LPS_SIZE },
+      { "LPS_B", ROMDUMP_LPS_BASE, ROMDUMP_LPS_SIZE }
+    };
+
+  int fd;
+  int i;
+
+  fd = open("/dev/console", O_WRONLY);
+  if (fd < 0)
+    {
+      syslog(LOG_ERR, "ROMDUMP: cannot open console\n");
+      return;
+    }
+
+  syslog(LOG_INFO, "ROMDUMP: fault-time LPS snapshot, watch is frozen\n");
+
+  for (i = 0; i < 2; i++)
+    {
+      romdump_region(fd, &regions[i]);
+    }
+
+  close(fd);
+  syslog(LOG_INFO, "ROMDUMP: LPS snapshot complete\n");
+}
+
 #else /* CONFIG_AI_WATCH_ROMDUMP */
 
 typedef int romdump_unused_t;
