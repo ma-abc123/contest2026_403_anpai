@@ -53,6 +53,14 @@
 #define ROMDUMP_ROM_SIZE         (384 * 1024)
 #define ROMDUMP_LPS_BASE         0x20400000UL
 #define ROMDUMP_LPS_SIZE         (64 * 1024)
+/* HPSYS mailbox windows, HCPU side of the HCI transport:
+ * 0x2007FC00 = HCPU2LCPU_CH2 (rev-B config context), 0x2007FE00 =
+ * HCPU2LCPU_CH1 (command ring: circular_buf, rd mirror at +0x08 is
+ * LCPU-written).  r7's wedge question "did the LCPU ever see the
+ * pending command" can only be answered from this window - the LPS
+ * dump does not cover HPSYS RAM. */
+#define ROMDUMP_H2L_BASE         0x2007FC00UL
+#define ROMDUMP_H2L_SIZE         0x400
 #define ROMDUMP_CHUNK            16
 #define ROMDUMP_CRC32_POLY       0xedb88320UL
 
@@ -183,10 +191,12 @@ void ai_watch_romdump_run_lps(void)
    * BEFORE the recovery tears the LCPU down, so the on-fault state is
    * preserved for offline analysis. */
 
-  static const struct romdump_region_s regions[2] =
+  static const struct romdump_region_s regions[4] =
     {
       { "LPS_A", ROMDUMP_LPS_BASE, ROMDUMP_LPS_SIZE },
-      { "LPS_B", ROMDUMP_LPS_BASE, ROMDUMP_LPS_SIZE }
+      { "LPS_B", ROMDUMP_LPS_BASE, ROMDUMP_LPS_SIZE },
+      { "H2L_A", ROMDUMP_H2L_BASE, ROMDUMP_H2L_SIZE },
+      { "H2L_B", ROMDUMP_H2L_BASE, ROMDUMP_H2L_SIZE }
     };
 
   int fd;
@@ -201,7 +211,7 @@ void ai_watch_romdump_run_lps(void)
 
   syslog(LOG_INFO, "ROMDUMP: fault-time LPS snapshot, watch is frozen\n");
 
-  for (i = 0; i < 2; i++)
+  for (i = 0; i < 4; i++)
     {
       romdump_region(fd, &regions[i]);
     }
@@ -280,6 +290,15 @@ void ai_watch_romdump_run_regs(void)
 #define SAMP_HCI_RD      0x20405C08UL
 #define SAMP_HCI_WR      0x20405C0CUL
 #define SAMP_ASSERT      0x20407FE0UL
+/* HCPU2LCPU_CH1 command ring mirrors (see ROMDUMP_H2L_BASE): +0x08 is
+ * the LCPU-consumed read index, +0x0C the HCPU-written write index.
+ * Read them passively: the bridge invalidates this window before every
+ * TX-ring read and cleans it after every write, so plain volatile
+ * reads are fresh enough.  Do NOT invalidate here - an invalidate
+ * racing the bridge's ring init drops the init's still-dirty header
+ * line and the LCPU then reads garbage pointers (c2e1's 0x0C03 x3). */
+#define SAMP_H2L_RD      0x2007FE08UL
+#define SAMP_H2L_WR      0x2007FE0CUL
 
 void ai_watch_reg_sampler_dump_ring(const char *tag);
 void ai_watch_reg_sampler_dump_full(const char *tag);
@@ -291,6 +310,7 @@ struct samp_entry
   uint32_t mac0, mac18, mac20;
   uint32_t rfc8, phy0;
   uint32_t rd, wr;
+  uint32_t h2l_rd, h2l_wr;
   uint32_t flag;
 };
 
@@ -337,6 +357,8 @@ static void samp_take(struct samp_entry *e)
   e->phy0  = samp_rd32(SAMP_PHY_BASE + 0x00);
   e->rd    = samp_rd32(SAMP_HCI_RD);
   e->wr    = samp_rd32(SAMP_HCI_WR);
+  e->h2l_rd = samp_rd32(SAMP_H2L_RD);
+  e->h2l_wr = samp_rd32(SAMP_H2L_WR);
   e->flag  = samp_rd32(SAMP_ASSERT);
 }
 
@@ -367,9 +389,11 @@ static FAR void *samp_thread(FAR void *arg)
 
               syslog(LOG_INFO,
                      "REGLIVE t=%u rcc0=%08x rcc4=%08x mac0=%08x "
-                     "mac18=%08x rfc8=%08x rd=%08x wr=%08x flag=%u\n",
+                     "mac18=%08x rfc8=%08x rd=%08x wr=%08x "
+                     "h2l=%08x/%08x flag=%u\n",
                      e->t, e->rcc0, e->rcc4, e->mac0, e->mac18,
-                     e->rfc8, e->rd, e->wr, e->flag);
+                     e->rfc8, e->rd, e->wr, e->h2l_rd, e->h2l_wr,
+                     e->flag);
             }
 
           if (s_healthy_pending > 0 &&
@@ -426,10 +450,11 @@ void ai_watch_reg_sampler_dump_ring(const char *tag)
       syslog(LOG_INFO,
              "REGRING tag=%s idx=%d t=%u rcc0=%08x rcc4=%08x "
              "rcc10=%08x rcc14=%08x mac0=%08x mac18=%08x mac20=%08x "
-             "rfc8=%08x phy0=%08x rd=%08x wr=%08x flag=%u\n",
+             "rfc8=%08x phy0=%08x rd=%08x wr=%08x h2l_rd=%08x "
+             "h2l_wr=%08x flag=%u\n",
              tag, i, s->t, s->rcc0, s->rcc4, s->rcc10, s->rcc14,
              s->mac0, s->mac18, s->mac20, s->rfc8, s->phy0,
-             s->rd, s->wr, s->flag);
+             s->rd, s->wr, s->h2l_rd, s->h2l_wr, s->flag);
     }
 }
 
