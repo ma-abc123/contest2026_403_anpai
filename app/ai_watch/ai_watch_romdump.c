@@ -206,21 +206,18 @@ void ai_watch_romdump_run_lps(void)
 
 void ai_watch_romdump_run_regs(void)
 {
-  /* Fault-time snapshot of the LPSYS Bluetooth register blocks the
-   * reverse-engineering round 4 flagged as the SWD-stage targets, now
-   * that C/A1/D experiments all failed to converge.  All four are
-   * mapped LPSYS peripherals reachable from the HCPU (hwp_lpsys_rcc is
-   * already used by boot code); reading them beats needing an SWD
-   * probe for the same data.  Called from the BLE fault path alongside
-   * the LPS snapshot, before the recovery tears the controller down.
-   */
+  /* Fault-time snapshot of the LPSYS Bluetooth register blocks.  Only
+   * RCC/RFC/PHY are readable from the HCPU: BT_MAC (0x40090000) hard-
+   * faults on ANY HCPU access, healthy or faulted (verified both ways
+   * 2026-10-25 - the earlier "MAC reads all zero" was the parser's
+   * zero-fill for a region whose lines never made it out).  MAC is
+   * LCPU-private; SWD remains the only way to see it. */
 
-  static const struct romdump_region_s regs[4] =
+  static const struct romdump_region_s regs[3] =
     {
       { "RCC", 0x40000000UL, 0x40 },
       { "RFC", 0x40082800UL, 0x40 },
-      { "PHY", 0x40084000UL, 0x40 },
-      { "MAC", 0x40090000UL, 0x40 }
+      { "PHY", 0x40084000UL, 0x40 }
     };
 
   int fd;
@@ -235,7 +232,7 @@ void ai_watch_romdump_run_regs(void)
 
   syslog(LOG_INFO, "ROMDUMP: fault-time LPSYS register snapshot\n");
 
-  for (i = 0; i < 4; i++)
+  for (i = 0; i < 3; i++)
     {
       romdump_region(fd, &regs[i]);
     }
