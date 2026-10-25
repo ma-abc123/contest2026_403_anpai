@@ -654,6 +654,23 @@ int ai_watch_ble_init(void)
       pthread_attr_destroy(&attr);
     }
 
+#ifdef CONFIG_AI_WATCH_ROMDUMP
+  {
+    extern void ai_watch_reg_sampler_start(void);
+
+    /* r5 discriminator result: with cal, 12+ consecutive bring-up
+     * deaths tonight; without cal, ready on the 4th try (radio
+     * invisible though - cal is mandatory for TX).  Cal restored for
+     * H2/H3; the cal-vs-bringup-death correlation goes to the
+     * analyst. */
+
+    /* r5 register sampler: 100 ms RCC/MAC/RFC/PHY + HCI ring offsets
+     * into a 32-entry ring, 1 Hz REGLIVE lines, gated on bridge state
+     * (no reads while the LCPU is halted during recovery). */
+    ai_watch_reg_sampler_start();
+  }
+#endif
+
   return ai_watch_ble_bsp_start();
 }
 
@@ -729,13 +746,15 @@ void ai_watch_ble_process(void)
       s_initfail_next.tv_sec = 0;
 #ifdef CONFIG_AI_WATCH_ROMDUMP
       {
+        extern void ai_watch_reg_sampler_dump_ring(const char *tag);
         extern void ai_watch_romdump_run_lps(void);
         extern void ai_watch_romdump_run_regs(void);
 
-        /* Snapshot the LPSYS window (assert record, patch hooks, cfg)
-         * plus the LPSYS Bluetooth register blocks (LPSYS_RCC, BT_RFC,
-         * BT_PHY, BT_MAC) while the failed controller is still up -
-         * recover() tears the LCPU down right after this. */
+        /* r5 sampler ring FIRST (timeline before the fault), then the
+         * LPSYS window (assert record, patch hooks, cfg), then the
+         * register blocks - all while the failed controller is still
+         * up; recover() tears the LCPU down right after this. */
+        ai_watch_reg_sampler_dump_ring("fault");
         ai_watch_romdump_run_lps();
         ai_watch_romdump_run_regs();
       }

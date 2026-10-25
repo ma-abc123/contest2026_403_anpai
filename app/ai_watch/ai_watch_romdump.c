@@ -32,12 +32,18 @@
 #ifdef CONFIG_AI_WATCH_ROMDUMP
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <nuttx/arch.h>
+
+#include "ai_watch_ble_bsp.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -239,6 +245,218 @@ void ai_watch_romdump_run_regs(void)
 
   close(fd);
   syslog(LOG_INFO, "ROMDUMP: register snapshot complete\n");
+}
+
+/****************************************************************************
+ * r5 register sampler (H1/H2/H3, analyst-provided design, NuttX port)
+ *
+ * 100 ms samples of the LPSYS Bluetooth register blocks + HCI ring
+ * offsets + assert flag into a 32-entry RAM ring; 1 Hz REGLIVE line so
+ * the timeline survives even a later crash.  REGRING (whole ring) at
+ * fault latch, REGFULL (full blocks) at BLE ready / connected / fault.
+ *
+ * Sampling is GATED on the bridge state: only ADVERTISING / CONNECTED
+ * / DISCONNECTED are sampled.  During recover() the LCPU is halted and
+ * at bt_enable failure windows the controller state is undefined -
+ * reading BT_MAC there has hard-faulted the HCPU before (reg2 era),
+ * and a userspace thread cannot survive a bus abort.
+ *
+ ****************************************************************************/
+
+#define SAMP_RING_N      32
+#define SAMP_MS          100
+#define SAMP_RCC_BASE    0x40000000UL
+#define SAMP_MAC_BASE    0x40090000UL
+#define SAMP_RFC_BASE    0x40082800UL
+#define SAMP_PHY_BASE    0x40084000UL
+#define SAMP_HCI_RD      0x20405C08UL
+#define SAMP_HCI_WR      0x20405C0CUL
+#define SAMP_ASSERT      0x20407FE0UL
+
+void ai_watch_reg_sampler_dump_ring(const char *tag);
+void ai_watch_reg_sampler_dump_full(const char *tag);
+
+struct samp_entry
+{
+  uint32_t t;
+  uint32_t rcc0, rcc4, rcc10, rcc14;
+  uint32_t mac0, mac18, mac20;
+  uint32_t rfc8, phy0;
+  uint32_t rd, wr;
+  uint32_t flag;
+};
+
+static struct samp_entry s_samp_ring[SAMP_RING_N];
+static int s_samp_head;
+static int s_samp_count;
+static volatile bool s_samp_run;
+static int s_healthy_pending;          /* dumps owed since bt_ready */
+static uint32_t s_last_healthy_ms;
+
+static uint32_t samp_now_ms(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
+static uint32_t samp_rd32(uint32_t addr)
+{
+  return *(volatile uint32_t *)addr;
+}
+
+static bool samp_state_ok(void)
+{
+  enum ai_watch_ble_bsp_state_e st = ai_watch_ble_bsp_get_state();
+
+  return st == AI_WATCH_BLE_BSP_ADVERTISING ||
+         st == AI_WATCH_BLE_BSP_CONNECTED ||
+         st == AI_WATCH_BLE_BSP_DISCONNECTED;
+}
+
+static void samp_take(struct samp_entry *e)
+{
+  e->t     = samp_now_ms();
+  e->rcc0  = samp_rd32(SAMP_RCC_BASE + 0x00);
+  e->rcc4  = samp_rd32(SAMP_RCC_BASE + 0x04);
+  e->rcc10 = samp_rd32(SAMP_RCC_BASE + 0x10);
+  e->rcc14 = samp_rd32(SAMP_RCC_BASE + 0x14);
+  e->mac0  = samp_rd32(SAMP_MAC_BASE + 0x00);
+  e->mac18 = samp_rd32(SAMP_MAC_BASE + 0x18);
+  e->mac20 = samp_rd32(SAMP_MAC_BASE + 0x20);
+  e->rfc8  = samp_rd32(SAMP_RFC_BASE + 0x08);
+  e->phy0  = samp_rd32(SAMP_PHY_BASE + 0x00);
+  e->rd    = samp_rd32(SAMP_HCI_RD);
+  e->wr    = samp_rd32(SAMP_HCI_WR);
+  e->flag  = samp_rd32(SAMP_ASSERT);
+}
+
+static FAR void *samp_thread(FAR void *arg)
+{
+  int ticks = 0;
+
+  (void)arg;
+
+  while (s_samp_run)
+    {
+      if (samp_state_ok())
+        {
+          struct samp_entry *e = &s_samp_ring[s_samp_head];
+
+          samp_take(e);
+          s_samp_head = (s_samp_head + 1) % SAMP_RING_N;
+          if (s_samp_count < SAMP_RING_N)
+            {
+              s_samp_count++;
+            }
+
+          ticks++;
+
+          if (ticks % 10 == 0)
+            {
+              /* 1 Hz live line: survives later crashes/hangs. */
+
+              syslog(LOG_INFO,
+                     "REGLIVE t=%u rcc0=%08x rcc4=%08x mac0=%08x "
+                     "mac18=%08x rfc8=%08x rd=%08x wr=%08x flag=%u\n",
+                     e->t, e->rcc0, e->rcc4, e->mac0, e->mac18,
+                     e->rfc8, e->rd, e->wr, e->flag);
+            }
+
+          if (s_healthy_pending > 0 &&
+              e->t - s_last_healthy_ms >= 10000u)
+            {
+              s_last_healthy_ms = e->t;
+              s_healthy_pending--;
+              ai_watch_reg_sampler_dump_full("healthy");
+            }
+        }
+
+      usleep(SAMP_MS * 1000);
+    }
+
+  return NULL;
+}
+
+void ai_watch_reg_sampler_start(void)
+{
+  pthread_attr_t attr;
+  pthread_t tid;
+
+  if (s_samp_run)
+    {
+      return;
+    }
+
+  s_samp_run = true;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 4096);
+  if (pthread_create(&tid, &attr, samp_thread, NULL) != 0)
+    {
+      s_samp_run = false;
+      syslog(LOG_ERR, "REGRING: sampler thread create failed\n");
+    }
+  pthread_attr_destroy(&attr);
+}
+
+void ai_watch_reg_sampler_notify_ready(void)
+{
+  s_healthy_pending = 3;
+  s_last_healthy_ms = samp_now_ms() - 10000u;  /* dump immediately */
+}
+
+void ai_watch_reg_sampler_dump_ring(const char *tag)
+{
+  int start = (s_samp_head - s_samp_count + SAMP_RING_N) % SAMP_RING_N;
+  int i;
+
+  for (i = 0; i < s_samp_count; i++)
+    {
+      struct samp_entry *s = &s_samp_ring[(start + i) % SAMP_RING_N];
+
+      syslog(LOG_INFO,
+             "REGRING tag=%s idx=%d t=%u rcc0=%08x rcc4=%08x "
+             "rcc10=%08x rcc14=%08x mac0=%08x mac18=%08x mac20=%08x "
+             "rfc8=%08x phy0=%08x rd=%08x wr=%08x flag=%u\n",
+             tag, i, s->t, s->rcc0, s->rcc4, s->rcc10, s->rcc14,
+             s->mac0, s->mac18, s->mac20, s->rfc8, s->phy0,
+             s->rd, s->wr, s->flag);
+    }
+}
+
+void ai_watch_reg_sampler_dump_full(const char *tag)
+{
+  static const struct
+  {
+    const char *name;
+    uint32_t base;
+    int words;
+  } blocks[4] =
+    {
+      { "rcc", SAMP_RCC_BASE, 8 },   /* 0x20 - no mirror */
+      { "mac", SAMP_MAC_BASE, 16 },
+      { "rfc", SAMP_RFC_BASE, 16 },
+      { "phy", SAMP_PHY_BASE, 16 }
+    };
+
+  int b;
+  int i;
+
+  for (b = 0; b < 4; b++)
+    {
+      char line[16 * 9 + 1];
+      int pos = 0;
+
+      line[0] = '\0';
+      for (i = 0; i < blocks[b].words; i++)
+        {
+          pos += snprintf(line + pos, sizeof(line) - pos, " %08x",
+                          samp_rd32(blocks[b].base + 4u * i));
+        }
+      syslog(LOG_INFO, "REGFULL tag=%s blk=%s%s\n", tag,
+             blocks[b].name, line);
+    }
 }
 
 #else /* CONFIG_AI_WATCH_ROMDUMP */
