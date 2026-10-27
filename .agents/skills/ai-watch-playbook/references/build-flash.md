@@ -3,11 +3,14 @@
 ## 环境（每次新终端）
 
 ```bash
-export PATH="$HOME/opt/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi/bin:$PATH"
+cd /home/ma/openvela-contest403
+export PATH="/home/ma/bin:$PWD/prebuilts/tools/linux/x86_64:/usr/bin:$PATH"
+export TMPDIR=/home/ma/tmp
 ```
 
-- GCC 10.3 编不了本分支（vendor libc++ 是 LLVM 17，需要 GCC≥12 内建 trait），
-  **必须用 Arm GNU 14.2.Rel1**。
+- 工具链由 `-S nuttx` 的 toolchain 文件从 `prebuilts/gcc/linux-x86_64/arm-none-eabi`
+  （现役 13.4）自动选中，不需要额外 PATH；`~/opt/arm-gnu-toolchain-14.2` 是历史遗留。
+- 需要 GCC≥12（vendor libc++ 是 LLVM 17，依赖内建 trait），GCC 10.3 编不了本分支。
 - `repo sync` 不会拉 LFS：缺 lib 时到 `vendor/sifli/boards/sf32lb52/libs` 执行
   `git lfs pull`。
 - 公共仓补丁需手动 `git am`（frameworks/runtimes/feature、vendor/sifli）。
@@ -16,19 +19,11 @@ export PATH="$HOME/opt/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi/bin:$PAT
 
 ## 编译
 
-```bash
-# openvela 工作区根目录（参赛仓的上一级）
-cmake -B cmake_out/contest2026_403_ai_watch -DNUTTX_BUILD=y \
-  -DBOARD_CONFIG=../vendor/openvela/boards/contest2026_403_ai_watch/configs/ai_watch \
-  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations \
-   -Wno-error=implicit-function-declaration -Wno-error=int-conversion \
-   -Wno-error=incompatible-pointer-types -Wno-error=return-mismatch \
-   -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
-cmake --build cmake_out/contest2026_403_ai_watch --parallel 4
-# 产物 cmake_out/contest2026_403_ai_watch/nuttx.bin；全量 ~2 分钟(-j4)
-```
+命令的**权威写法**见工作区 `AGENTS.md`「编译 / 烧录」（仓库内 `README.md`「2. 编译」同款）：
+构建树是 `cmake_out/prod`、`-G Ninja -S nuttx`，日常 `cmake --build cmake_out/prod -j 12`。
+本节不再重复命令，只记坑——两处各写一份就会再次漂移（历史上就写成过两个不存在的目录）。
 
-- EXTRA_FLAGS 不是可选的：GCC 14 把 vendor 老代码的隐式声明等升级成错误；
+- EXTRA_FLAGS 不是可选的：GCC 13/14 把 vendor 老代码的隐式声明等升级成错误；
   四件套放行后仍报错的才是真 bug（全工程仅一个源码 bug：feature_utils.h:212
   move 构造多了 const）。
 - **menuconfig 是唯一不可自动化的步骤**——优先直接改 defconfig 再重配。

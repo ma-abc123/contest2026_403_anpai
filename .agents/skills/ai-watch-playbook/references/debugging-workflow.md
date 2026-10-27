@@ -6,6 +6,10 @@
 
 - picocom `--logfile` 落盘到 `~/huangshan-logs/ai-watch-YYYYMMDD-HHMMSS.log`；
   串口 1M 波特。
+- 要常驻抓取就用 `contest2026_403_anpai/tools/serial_watch.py`：开端口后立刻释放
+  DTR/RTS、掉线自动续录、行首打时间戳 → `~/huangshan-logs/live.log`，
+  停止用 `pkill -f serial_watch.py`。**pyserial 默认拉起 DTR/RTS 会把板子摁在复位
+  （黑屏 + 串口沉默）**，一次性脚本 `capture_r3.py` 踩过这个坑（见 10-25b 日志）。
 - 固件日志行必须自带证据：可 grep 前缀（`REC,` / `MOTION:` / `BLE:` /
   `aiwatch-ble:`）+ 关键数字（时间戳、字节数、角度、mg）。
 - 时间统一 `CLOCK_MONOTONIC` 毫秒，跨线程可比。

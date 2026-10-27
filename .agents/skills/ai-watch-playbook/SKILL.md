@@ -60,5 +60,11 @@ description: AI Watch（openvela/NuttX + LVGL + zblue，立创黄山派 SF32LB52
   `app/ai_watch/`，经 linkfile 映射到 `packages/demos/contest2026_403_ai_watch/`；
   板级在 `board/ai_watch/configs/ai_watch/defconfig`，映射到
   `vendor/openvela/boards/contest2026_403_ai_watch/`）
-- 构建树：`cmake_out/contest2026_403_ai_watch`；串口日志：`~/huangshan-logs/`
+- 构建树：`cmake_out/prod`（**不是**旧文档写的 `contest2026_403_ai_watch`）；
+  命令见工作区 `AGENTS.md`「编译 / 烧录」或仓库 `README.md`「2. 编译」
+- 脚本只有这四份，别去 `.repo/manifests` / 桌面副本改：
+  `tools/serial_watch.py`（串口常驻抓取，必须释放 DTR/RTS）、
+  `tools/fall_threshold_analysis.py`（跌倒定标）、
+  `app/ai_watch/icons/convert_icons.py`、`app/ai_watch/fonts/gen_cjk_font.sh`
+- 串口日志：`~/huangshan-logs/`
 - 原始开发手册：`docs/development/SF32LB52_openvela_dev-ai-contest-2026_开发流程.md`
