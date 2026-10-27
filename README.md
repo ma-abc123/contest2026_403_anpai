@@ -49,14 +49,14 @@ repo sync -c -j8
 ### 2. 编译（openvela 工作区根目录）
 
 ```bash
-cmake -B cmake_out/contest2026_403_ai_watch -DNUTTX_BUILD=y \
-  -DBOARD_CONFIG=../vendor/openvela/boards/contest2026_403_ai_watch/configs/ai_watch \
-  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=return-mismatch -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
-cmake --build cmake_out/contest2026_403_ai_watch --parallel 4
-# 产物：cmake_out/contest2026_403_ai_watch/nuttx.bin
+cmake -G Ninja -S nuttx -B cmake_out/prod -DNUTTX_BUILD=y \
+  -DBOARD_CONFIG="$PWD/vendor/openvela/boards/contest2026_403_ai_watch/configs/ai_watch" \
+  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
+cmake --build cmake_out/prod -j 12
+# 产物：cmake_out/prod/nuttx.bin
 ```
 
-（等价于 `./build.sh contest2026_403_anpai/board/ai_watch/configs/ai_watch`；应用经 `CONFIG_EXAMPLES_AI_WATCH=y` 启用，已写入 defconfig。）
+（已配置过的树只需 `cmake --build cmake_out/prod -j 12`。注意 `-Wno-error=return-mismatch` 在 GCC 13.4 上不存在，不要加。若容器禁用 `utimensat`，需把 touch 包装器目录前置到 PATH 并把 `TMPDIR` 指到大分区——这是开发容器的限制，普通 Linux 不需要。应用经 `CONFIG_EXAMPLES_AI_WATCH=y` 启用，已写入 defconfig。）
 
 ### 3. 烧录与运行
 
