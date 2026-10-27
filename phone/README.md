@@ -1,6 +1,6 @@
 # AI Watch 手机端配套应用（AIWatchCompanion）
 
-手表端 AI Watch 的手机伴侣 App（v3.0.0）：通过 BLE GATT 与手表（广播名
+手表端 AI Watch 的手机伴侣 App（v3.0.1）：通过 BLE GATT 与手表（广播名
 `AI-Watch-403`）通信，是"AI 语音闭环、提醒/通知下发、运动与跌倒事件接收"
 的另一半。
 

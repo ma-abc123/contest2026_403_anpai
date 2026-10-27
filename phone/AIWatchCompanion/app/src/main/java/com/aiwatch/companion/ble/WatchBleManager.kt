@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanRecord
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
@@ -20,6 +21,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -40,6 +42,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -81,10 +85,19 @@ data class WatchState(
 
 /**
  * 手表连接管理器（应用级单例）：
- * 扫描(名称前缀/服务UUID过滤) → 连接(15s超时) → MTU≥247 → 订阅 f1/f3 → 读 Status → TimeSync → 就绪
- * 断线自动重连（指数退避 2s→30s 封顶，持续重试）；用户主动断开不重连；
+ * 扫描(名称前缀/128 位服务UUID) → 连接(30s超时) → MTU≥247 → 订阅 f1/f3 → 读 Status → TimeSync → 就绪
+ * 断线自动重连（指数退避 2s→4s→8s→15s→30s 封顶，持续重试）；用户主动断开不重连；
  * 蓝牙开关重开 / 应用回前台立即重连；时区变化补发校时；8 小时周期兜底校时。
  * 所有 GATT 写操作经串行队列，0x11 队列满按 2s 退避重试。
+ *
+ * v3.0.1 重连修复（缺陷报告 2026-10-27）：
+ * - 不再用缓存 BluetoothDevice 盲连：手表断连后要 10~40s 才恢复广播，盲连必失败；
+ *   重连一律重新扫描，用 ScanResult.device 连接。
+ * - 连接超时 15s→30s（对齐 Android 自身超时），放弃时先 disconnect、400ms 后再 close，
+ *   避免在 pending connect 上 close 造成协议栈残留（后续连回 status=133 且不自愈）。
+ * - 断开即清空 device / statusChar / dataUploadChar / 各类挂起结果。
+ * - 连续 2 次 status=133 → 冷却 1s 后重新扫描，不再原地重试。
+ * - 用户点击连接不清空退避阶梯（只有从"用户主动断开"恢复时才清零）。
  */
 @SuppressLint("MissingPermission")
 class WatchBleManager(
@@ -92,16 +105,23 @@ class WatchBleManager(
     val log: WatchLog,
 ) {
     companion object {
-        const val CONNECT_TIMEOUT_MS = 15_000L      // §2 GATT 层连接超时建议 15s
+        const val CONNECT_TIMEOUT_MS = 30_000L      // v3.0.1：对齐 Android connectGatt 自身超时（原 15s 早退会留下半开连接）
         const val STEP_TIMEOUT_MS = 12_000L         // 初始化单步超时
         const val BASE_RETRY_MS = 2_000L            // §2 指数退避 2s 起
         const val MAX_RETRY_MS = 30_000L            // 封顶 30s
+        const val GATT_CLOSE_GRACE_MS = 400L        // v3.0.1：disconnect 后等 close 完成，再发起下一次连接
+        const val USER_CLOSE_GRACE_MS = 3_000L      // v3.0.1：用户主动断开时等 DISCONNECTED 回调，3s 兜底 close
+        const val RECOVERY_COOLDOWN_MS = 1_000L     // v3.0.1：连续 133 后的冷却
+        const val FOREGROUND_CHECK_MIN_MS = 10_000L // v3.0.1：回前台链路校验最小间隔
         const val PERIODIC_SYNC_MS = 8L * 3600_000L // §3.2 建议 6~12h 兜底，取 8h
-        const val SCAN_WINDOW_MS = 20_000L          // 单轮扫描窗口
+        const val SCAN_WINDOW_MS = 30_000L          // v3.0.1：覆盖手表断连后 10~40s 的广播恢复窗口
         const val WRITE_TIMEOUT_MS = 10_000L        // 单次写等待
         const val ENQUEUE_TIMEOUT_MS = 90_000L      // 入队结果等待（容忍重连）
         const val REQUEST_MTU = 247                 // §2 要求 ≥247
         const val MOTION_LOG_EVERY = 25             // v3：0x12 高频帧日志节流（8Hz 下约 3s 一条）
+
+        /** v3.0.1：重连退避阶梯 2s→4s→8s→15s→30s（与《手机端BLE重连退避需求-2026-10-24》一致） */
+        private val RETRY_LADDER_MS = longArrayOf(2_000L, 4_000L, 8_000L, 15_000L, 30_000L)
     }
 
     // v3：motion 帧日志节流计数
@@ -149,6 +169,12 @@ class WatchBleManager(
     private val retryAttempt = AtomicInteger(0)
     private val pendingCount = AtomicInteger(0)
 
+    // v3.0.1：连接耗时统计 / 133 连击计数 / 回前台校验节流
+    @Volatile
+    private var connectStartedAtMs = 0L
+    private var lastForegroundCheckMs = 0L
+    private val gatt133Count = AtomicInteger(0)
+
     private var statusChar: BluetoothGattCharacteristic? = null
     private var dataUploadChar: BluetoothGattCharacteristic? = null
 
@@ -191,7 +217,11 @@ class WatchBleManager(
                                 reconnectJob?.cancel(); reconnectJob = null
                                 stopScanInternal()
                                 failPendingOps()
-                                closeGattQuietly()
+                                releaseGatt(0L)
+                                device = null
+                                statusChar = null
+                                dataUploadChar = null
+                                gatt133Count.set(0)
                                 periodicSyncJob?.cancel(); periodicSyncJob = null
                                 // 手表侧蓝牙开关关闭导致设备消失：视为可恢复事件
                                 _state.update {
@@ -250,7 +280,13 @@ class WatchBleManager(
     // 公开操作
     // =====================================================================
 
-    /** 用户点击「扫描并连接」/ 应用启动恢复 */
+    /**
+     * 用户点击「扫描并连接」/ 应用启动恢复。
+     *
+     * v3.0.1：一律重新扫描，不再用缓存 device 盲连——手表断连后需要 10~40s 才恢复广播，
+     * 盲连正好落在空窗里，必然失败并留下半开 GATT client。
+     * 仅当从「用户主动断开」态恢复时清零退避阶梯；连续失败期间反复点击保留计数（避免"越点越连不上"）。
+     */
     fun scanAndConnect() {
         if (!hasBlePermissions()) {
             _events.tryEmit("缺少蓝牙权限，无法扫描")
@@ -263,12 +299,21 @@ class WatchBleManager(
             log.error("蓝牙适配器不可用或未开启")
             return
         }
+        if (_state.value.phase == Phase.CONNECTED) {
+            _events.tryEmit("已连接 ${_state.value.deviceName ?: BleProto.DEVICE_NAME_PREFIX}")
+            return
+        }
+        val resumeFromIdle = userDisconnected
         userDisconnected = false
-        retryAttempt.set(0)
+        if (resumeFromIdle) retryAttempt.set(0)     // 新会话清零；重连点击不清零
         reconnectJob?.cancel()
         reconnectJob = null
-        val dev = device
-        if (dev != null) connectDirect(dev) else beginScan()
+        stopScanInternal()
+        failPendingOps()
+        releaseGatt(0L)                             // 摘掉可能残留的半开连接
+        device = null                               // 关键：不再盲连缓存地址
+        log.event("收到连接请求 → 重新扫描（退避计数 ${retryAttempt.get()}）")
+        beginScan()
         updateService()
     }
 
@@ -279,7 +324,12 @@ class WatchBleManager(
         scanJob?.cancel(); scanJob = null
         stopScanInternal()
         failPendingOps()
-        closeGattQuietly()
+        // v3.0.1：只 disconnect，等 DISCONNECTED 回调后再 close；3s 兜底强制关闭
+        releaseGatt(USER_CLOSE_GRACE_MS)
+        device = null
+        statusChar = null
+        dataUploadChar = null
+        gatt133Count.set(0)
         periodicSyncJob?.cancel(); periodicSyncJob = null
         _state.update { it.copy(phase = Phase.IDLE, retryAttempt = 0, nextRetryAtMs = 0L) }
         log.event("用户主动断开，停止自动重连")
@@ -360,18 +410,39 @@ class WatchBleManager(
         return enqueueWrite(BleProto.COMMAND_UUID, BleProto.buildClearAll(), "Command(f4)", "清除手表全部提醒")
     }
 
-    /** 应用回到前台：立即触发一轮重连 */
+    /**
+     * 应用回到前台（v3.0.1 重写）：
+     * - CONNECTED：读一次 Status 校验链路——手机侧可能漏收 DISCONNECTED 回调而长期"假在线"，读失败即重连；
+     * - RECONNECTING / BLUETOOTH_OFF / IDLE（非用户断开）：立即发起一轮，不等退避；
+     * - SCANNING / CONNECTING / INITIALIZING：连接正在进行，保持不动，避免打断。
+     */
     fun onAppForeground() {
         if (userDisconnected) return
-        val p = _state.value.phase
-        if (p == Phase.RECONNECTING || p == Phase.BLUETOOTH_OFF) {
-            val ad = adapter
-            if (ad != null && ad.isEnabled) {
-                log.event("应用回前台，立即重连")
-                reconnectJob?.cancel()
+        val ad = adapter
+        if (ad == null || !ad.isEnabled) return
+        val now = SystemClock.elapsedRealtime()
+        when (_state.value.phase) {
+            Phase.CONNECTED -> {
+                if (now - lastForegroundCheckMs < FOREGROUND_CHECK_MIN_MS) return
+                lastForegroundCheckMs = now
+                scope.launch {
+                    val pair = readCharacteristic(statusChar)
+                    if (pair == null || pair.second != 0) {
+                        val why = pair?.let { "status=0x%02X".format(it.second) } ?: "无响应"
+                        log.error("回前台链路校验失败（$why）→ 重新扫描连接")
+                        handleDisconnected(0x08)
+                    } else {
+                        log.event("回前台链路校验通过")
+                    }
+                }
+            }
+            Phase.RECONNECTING, Phase.BLUETOOTH_OFF, Phase.IDLE -> {
+                log.event("应用回前台，立即发起重连（当前 ${_state.value.phase}）")
+                reconnectJob?.cancel(); reconnectJob = null
                 retryAttempt.set(0)
                 attemptReconnect()
             }
+            else -> log.event("应用回前台，连接进行中（${_state.value.phase}），保持")
         }
     }
 
@@ -419,8 +490,10 @@ class WatchBleManager(
         }
         if (!hasBlePermissions()) return
         stopScanInternal()
-        _state.update { it.copy(phase = Phase.SCANNING, scanHits = emptyList()) }
-        log.event("开始扫描（${BleProto.DEVICE_NAME_PREFIX} 前缀 / 服务 UUID 过滤）")
+        _state.update {
+            it.copy(phase = Phase.SCANNING, scanHits = emptyList(), retryAttempt = retryAttempt.get())
+        }
+        log.event("开始扫描（${BleProto.DEVICE_NAME_PREFIX} 前缀 / 128 位服务 UUID，第 ${retryAttempt.get() + 1} 轮）")
 
         val scanner = try {
             ad.bluetoothLeScanner
@@ -438,12 +511,13 @@ class WatchBleManager(
 
         val cb = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val name = result.device?.name
-                val serviceUuids = result.scanRecord?.serviceUuids
-                val uuidMatch = serviceUuids?.any { it.uuid == BleProto.SERVICE_UUID } == true
+                val dev = result.device ?: return
+                // v3.0.1：取名字可能抛 SecurityException（权限被撤销时），不能让扫描回调崩掉
+                val name = runCatching { dev.name }.getOrNull()
                 val nameMatch = name?.startsWith(BleProto.DEVICE_NAME_PREFIX) == true
+                val uuidMatch = scanRecordHasService(result.scanRecord)
                 if (!uuidMatch && !nameMatch) return
-                val addr = result.device?.address ?: return
+                val addr = dev.address
                 val firstHit = !hits.containsKey(addr)
                 hits[addr] = ScanHit(name, addr, result.rssi)
                 _state.update { s -> s.copy(scanHits = hits.values.toList()) }
@@ -452,7 +526,6 @@ class WatchBleManager(
                 }
                 // 命中即连（首台自动连接；其余展示在列表中供手动选择）
                 if (firstHit && _state.value.phase == Phase.SCANNING) {
-                    val dev = result.device ?: return
                     device = dev
                     stopScanInternal()
                     scope.launch { connectDirect(dev) }
@@ -462,6 +535,7 @@ class WatchBleManager(
             override fun onScanFailed(errorCode: Int) {
                 log.error("扫描失败 code=$errorCode")
                 scope.launch {
+                    stopScanInternal()
                     if (!userDisconnected) {
                         scheduleReconnect()
                     } else {
@@ -488,17 +562,43 @@ class WatchBleManager(
             delay(SCAN_WINDOW_MS)
             if (_state.value.phase == Phase.SCANNING) {
                 stopScanInternal()
-                log.event("本轮扫描结束（${hits.size} 台匹配）")
+                log.event("本轮扫描结束（${hits.size} 台匹配），未完成连接")
                 if (!userDisconnected) {
-                    if (device == null && hits.isNotEmpty()) {
-                        device = adapter?.getRemoteDevice(hits.values.first().address)
-                    }
+                    // v3.0.1：不再把扫到的地址缓存成 device，下一轮照样重新扫描
                     scheduleReconnect()
                 } else {
                     _state.update { it.copy(phase = Phase.IDLE) }
                 }
             }
         }
+    }
+
+    /**
+     * v3.0.1：ScanRecord.getServiceUuids() 只覆盖 16/32 位 UUID，128 位服务 UUID 不在其中，
+     * 需要解析原始广播包（AD type 0x06/0x07，128 位 UUID 按小端存放）。
+     * 仅作辅助匹配，主路径仍是设备名前缀——解析异常不影响原有行为。
+     */
+    private fun scanRecordHasService(rec: ScanRecord?): Boolean {
+        val data = runCatching { rec?.bytes }.getOrNull() ?: return false
+        var i = 0
+        while (i + 1 < data.size) {
+            val len = data[i].toInt() and 0xFF
+            if (len == 0) break
+            if (i + len >= data.size) break
+            val type = data[i + 1].toInt() and 0xFF
+            if (type == 0x06 || type == 0x07) {   // 128 位服务 UUID：完整 / 不完整列表
+                var p = i + 2
+                while (p + 16 <= i + 1 + len) {
+                    val bb = ByteBuffer.wrap(data, p, 16).order(ByteOrder.LITTLE_ENDIAN)
+                    val lsb = bb.long     // 前 8 字节 = 低 64 位
+                    val msb = bb.long     // 后 8 字节 = 高 64 位
+                    if (UUID(msb, lsb) == BleProto.SERVICE_UUID) return true
+                    p += 16
+                }
+            }
+            i += len + 1
+        }
+        return false
     }
 
     private fun stopScanInternal() {
@@ -515,41 +615,64 @@ class WatchBleManager(
     // 连接 / 重连
     // =====================================================================
 
+    /**
+     * v3.0.1：连接前先摘掉旧连接，并在协程里串行完成 disconnect → 等 close 回流 → connectGatt。
+     * 绝不在 pending connect 上 close——厂商栈会因此把该设备标记为异常，后续 connectGatt 恒回 133。
+     * 冷却期内 phase 仍是 CONNECTING，用户此时点连接会被 scanAndConnect 取消。
+     */
     private fun connectDirect(dev: BluetoothDevice) {
         failPendingOps()
-        closeGattQuietly()
+        stepTimeoutJob?.cancel(); stepTimeoutJob = null
+        // 先同步摘掉旧 gatt，让旧回调立刻失效（避免"旧连接 DISCONNECTED → 又触发一轮重连"的竞态）
+        val old = detachGatt()
         _state.update {
             it.copy(
                 phase = Phase.CONNECTING,
-                deviceName = dev.name ?: BleProto.DEVICE_NAME_PREFIX,
+                deviceName = runCatching { dev.name }.getOrNull() ?: BleProto.DEVICE_NAME_PREFIX,
                 deviceAddress = dev.address,
             )
         }
-        log.event("连接 ${dev.name ?: dev.address} …")
-        val newGatt = try {
-            dev.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } catch (e: Exception) {
-            log.error("connectGatt 异常: ${e.message}")
-            null
+        log.event("连接 ${_state.value.deviceName}（${dev.address}），第 ${retryAttempt.get() + 1} 次尝试")
+        connectStartedAtMs = SystemClock.elapsedRealtime()
+
+        scope.launch {
+            if (old != null) {
+                log.event("释放上一次 GATT 连接（${GATT_CLOSE_GRACE_MS}ms 冷却）")
+                runCatching { old.disconnect() }
+                delay(GATT_CLOSE_GRACE_MS)
+                runCatching { old.close() }
+                delay(100)   // close 回流
+            }
+            if (_state.value.phase != Phase.CONNECTING) return@launch
+            val newGatt = try {
+                dev.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } catch (e: Exception) {
+                log.error("connectGatt 异常: ${e.message}")
+                null
+            }
+            if (newGatt == null) {
+                scheduleReconnect()
+                return@launch
+            }
+            gatt = newGatt
+            armStepTimeout(CONNECT_TIMEOUT_MS, "连接超时(${CONNECT_TIMEOUT_MS / 1000}s)，本轮放弃")
         }
-        if (newGatt == null) {
-            scheduleReconnect()
-            return
-        }
-        gatt = newGatt
-        armStepTimeout(CONNECT_TIMEOUT_MS, "连接超时(15s)")
     }
 
-    private fun scheduleReconnect() {
+    /**
+     * @param overrideDelayMs 非空时覆盖退避阶梯（用于 133 恢复等特殊场景）
+     */
+    private fun scheduleReconnect(overrideDelayMs: Long? = null) {
         reconnectJob?.cancel()
         val attempt = retryAttempt.getAndIncrement()
-        val delayMs = minOf(BASE_RETRY_MS shl minOf(attempt, 4), MAX_RETRY_MS)
+        val delayMs = overrideDelayMs
+            ?: RETRY_LADDER_MS[minOf(attempt, RETRY_LADDER_MS.size - 1)]
         val nextAt = System.currentTimeMillis() + delayMs
         _state.update { it.copy(phase = Phase.RECONNECTING, retryAttempt = attempt + 1, nextRetryAtMs = nextAt) }
         if (attempt == 0) {
-            log.event("进入自动重连：${delayMs / 1000}s 后第 1 次尝试")
+            log.event("进入自动重连：${delayMs} ms 后第 1 次尝试")
         } else {
-            log.event("重连退避 ${delayMs / 1000}s（第 ${attempt + 1} 次）")
+            log.event("重连退避 ${delayMs} ms（第 ${attempt + 1} 次）")
         }
         reconnectJob = scope.launch {
             delay(delayMs)
@@ -565,24 +688,51 @@ class WatchBleManager(
             log.error("蓝牙已关闭，等待蓝牙重新开启后自动重连")
             return
         }
-        val dev = device
-        when {
-            dev == null -> beginScan()
-            retryAttempt.get() >= 3 -> beginScan() // 连续直连失败，改走扫描定位
-            else -> connectDirect(dev)
-        }
+        // v3.0.1：一律重新扫描。手表断连后要 10~40s 才恢复广播，对缓存地址盲连必然失败；
+        // 而失败后放弃 pending connect 正是协议栈残留（后续恒 133）的来源。
+        device = null
+        beginScan()
     }
 
-    private fun handleDisconnected(status: Int) {
+    /**
+     * @param fromCallback true = 收到 onConnectionStateChange(DISCONNECTED)，链路已断，可立即 close；
+     *                     false = 本地超时/异常发起，连接可能仍在 pending，必须先 disconnect 再延迟 close。
+     */
+    private fun handleDisconnected(status: Int, fromCallback: Boolean = false) {
         stepTimeoutJob?.cancel(); stepTimeoutJob = null
         periodicSyncJob?.cancel(); periodicSyncJob = null
         failPendingOps()
-        closeGattQuietly()
+        releaseGatt(if (fromCallback) 0L else GATT_CLOSE_GRACE_MS)
+        // v3.0.1：断开即清空缓存设备与特征，确保下一次一定走"扫描 → 发现 → 连接"
+        device = null
+        statusChar = null
+        dataUploadChar = null
+        val elapsed = if (connectStartedAtMs > 0) SystemClock.elapsedRealtime() - connectStartedAtMs else 0L
+
+        // v3.0.1：连续 133 单独处理——不要原地重试，冷却 1s 后重新扫描
+        val hit133 = status == 0x85 || status == 133
+        if (hit133) {
+            val n = gatt133Count.incrementAndGet()
+            log.error("GATT_ERROR(133) 第 $n 次（本轮耗时 ${elapsed}ms）")
+            if (n >= 2) {
+                gatt133Count.set(0)
+                retryAttempt.set(0)
+                log.error("连续 133：协议栈可能残留 client，冷却 ${RECOVERY_COOLDOWN_MS}ms 后重新扫描")
+                if (!userDisconnected) {
+                    scheduleReconnect(RECOVERY_COOLDOWN_MS)
+                }
+                updateService()
+                return
+            }
+        } else {
+            gatt133Count.set(0)
+        }
+
         if (userDisconnected) {
             _state.update { it.copy(phase = Phase.IDLE, retryAttempt = 0, nextRetryAtMs = 0L) }
             log.event("已断开")
         } else {
-            log.error("连接断开：${BleProto.gattStatusMessage(status)}，进入自动重连")
+            log.error("连接断开：${BleProto.gattStatusMessage(status)}，本轮耗时 ${elapsed}ms，进入自动重连")
             _events.tryEmit("连接断开，自动重连中")
             scheduleReconnect()
         }
@@ -599,6 +749,11 @@ class WatchBleManager(
     }
 
     private fun failPendingOps() {
+        // v3.0.1：丢弃断线前积压的写任务，避免重连成功后补发过期指令
+        while (true) {
+            val w = writeQueue.tryReceive().getOrNull() ?: break
+            w.deferred.complete(-100)
+        }
         writeResults.values.forEach { it.complete(-100) }
         writeResults.clear()
         descriptorResults.values.forEach { it.complete(-100) }
@@ -608,16 +763,24 @@ class WatchBleManager(
         readySignal.value = false
     }
 
-    private fun closeGattQuietly() {
-        val g = gatt ?: return
+    /** 摘掉 gatt 引用：后续回调会因 `g !== gatt` 被忽略 */
+    private fun detachGatt(): BluetoothGatt? {
+        val g = gatt
         gatt = null
-        try {
-            g.disconnect()
-        } catch (_: Exception) {
-        }
-        try {
-            g.close()
-        } catch (_: Exception) {
+        return g
+    }
+
+    /**
+     * v3.0.1：释放旧连接。
+     * 先 detach 让旧回调失效，再 disconnect；graceMs 后 close（异步，不阻塞调用方）。
+     * @param graceMs 0 = 链路已断可立即 close；>0 = 等状态机/协议栈回流后再 close
+     */
+    private fun releaseGatt(graceMs: Long) {
+        val g = detachGatt() ?: return
+        scope.launch {
+            runCatching { g.disconnect() }
+            if (graceMs > 0) delay(graceMs)
+            runCatching { g.close() }
         }
     }
 
@@ -628,11 +791,26 @@ class WatchBleManager(
     private val gattCallback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            val elapsed = if (connectStartedAtMs > 0) SystemClock.elapsedRealtime() - connectStartedAtMs else 0L
             scope.launch {
-                if (g !== gatt) return@launch
+                if (g !== gatt) {
+                    log.event("忽略过期 GATT 回调（newState=$newState status=0x%02X）".format(status))
+                    return@launch
+                }
+                // v3.0.1：status 必须进日志——133 与 0 的差别直接决定重连策略
+                log.event(
+                    "连接状态变更 newState=$newState status=0x%02X（本轮 ${elapsed}ms，第 ${retryAttempt.get() + 1} 次）"
+                        .format(status)
+                )
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
-                        log.event("GATT 已连接 (status=0x%02X)".format(status))
+                        if (status != BluetoothGatt.GATT_SUCCESS) {
+                            log.error("链路已建立但 status=0x%02X，按失败处理".format(status))
+                            handleDisconnected(status, fromCallback = true)
+                            return@launch
+                        }
+                        gatt133Count.set(0)
+                        log.event("GATT 已连接，开始服务发现")
                         _state.update { it.copy(phase = Phase.INITIALIZING) }
                         armStepTimeout(STEP_TIMEOUT_MS, "服务发现超时")
                         try {
@@ -646,7 +824,7 @@ class WatchBleManager(
                         }
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
-                        handleDisconnected(status)
+                        handleDisconnected(status, fromCallback = true)
                     }
                 }
             }
