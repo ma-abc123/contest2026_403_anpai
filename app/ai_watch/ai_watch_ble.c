@@ -62,6 +62,14 @@
 #define AI_WATCH_BLE_TXQ_DATA_MAX   30
 #define AI_WATCH_BLE_TX_BACKOFF_MS  2000
 
+/* INIT_FAILED auto-recovery pacing: the first attempt runs 10 s after the
+ * failure is first seen, then the interval follows
+ * ai_ble_initfail_backoff() and tops out at AI_WATCH_BLE_INITFAIL_LAST_S.
+ */
+
+#define AI_WATCH_BLE_INITFAIL_FIRST_S   10
+#define AI_WATCH_BLE_INITFAIL_LAST_S    300
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -160,6 +168,37 @@ static FAR void *ai_ble_tx_worker(FAR void *arg)
     }
 
   return NULL;
+}
+
+/****************************************************************************
+ * Private Functions - INIT_FAILED recovery pacing
+ ****************************************************************************/
+
+/* Seconds between consecutive INIT_FAILED recovery attempts. The first
+ * two keep the historical 30 s cadence; after that the interval doubles
+ * up to AI_WATCH_BLE_INITFAIL_LAST_S, so a bring-up that keeps failing
+ * costs one controller teardown per 5 min instead of hammering the HCI
+ * path (each recover() blocks the main loop for up to a command timeout).
+ */
+
+static uint32_t ai_ble_initfail_backoff(int tries)
+{
+  if (tries <= 2)
+    {
+      return 30;
+    }
+
+  if (tries == 3)
+    {
+      return 60;
+    }
+
+  if (tries == 4)
+    {
+      return 120;
+    }
+
+  return AI_WATCH_BLE_INITFAIL_LAST_S;
 }
 
 /****************************************************************************
@@ -778,10 +817,15 @@ void ai_watch_ble_process(void)
     }
 
   /* INIT_FAILED auto-recovery covers initialization failures that do not
-   * produce a Hardware Error or command-timeout callback. Retries stay
-   * bounded; reaching a link-active state or toggling the switch resets
-   * the cap. OFF is deliberately NOT a reset because recover() passes
-   * through it during asynchronous re-bring-up. */
+   * produce a Hardware Error or command-timeout callback. The retry is
+   * deliberately UNBOUNDED: the watch runs on a battery and cannot be
+   * power-cycled on site, so the old 5-attempt cap turned a transient
+   * bring-up failure into a radio that stayed silent until the battery
+   * died. The interval instead escalates to 5 min, which keeps the HCI
+   * load of a permanently broken controller negligible. Reaching a
+   * link-active state or toggling the switch restarts the ladder. OFF is
+   * deliberately NOT a reset because recover() passes through it during
+   * the asynchronous re-bring-up. */
 
   {
     enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
@@ -793,10 +837,10 @@ void ai_watch_ble_process(void)
         s_initfail_tries = 0;
         s_initfail_next.tv_sec = 0;
       }
-    else if (state == AI_WATCH_BLE_BSP_INIT_FAILED &&
-             s_initfail_tries < 5)
+    else if (state == AI_WATCH_BLE_BSP_INIT_FAILED)
       {
         struct timespec now;
+        uint32_t backoff_s;
 
         clock_gettime(CLOCK_MONOTONIC, &now);
 
@@ -806,16 +850,22 @@ void ai_watch_ble_process(void)
              * the first attempt (monotonic 0 only before scheduling) */
 
             s_initfail_next = now;
-            s_initfail_next.tv_sec += 10;
+            s_initfail_next.tv_sec += AI_WATCH_BLE_INITFAIL_FIRST_S;
           }
         else if (now.tv_sec >= s_initfail_next.tv_sec)
           {
-            s_initfail_tries++;
+            if (s_initfail_tries < 1000000)
+              {
+                s_initfail_tries++;
+              }
+
+            backoff_s = ai_ble_initfail_backoff(s_initfail_tries);
             s_initfail_next = now;
-            s_initfail_next.tv_sec += 30;
+            s_initfail_next.tv_sec += backoff_s;
             syslog(LOG_WARNING,
-                   "aiwatch-ble: INIT_FAILED, auto-recover attempt %d\n",
-                   s_initfail_tries);
+                   "aiwatch-ble: INIT_FAILED, auto-recover attempt %d"
+                   " (next in %lu s)\n",
+                   s_initfail_tries, (unsigned long)backoff_s);
             ai_watch_ble_bsp_recover();
             return;
           }
@@ -850,8 +900,8 @@ void ai_watch_ble_process(void)
 
 void ai_watch_ble_set_enabled(bool enabled)
 {
-  /* A manual toggle is fresh evidence the user is watching - start the
-   * INIT_FAILED auto-recovery cap over. */
+  /* A manual toggle is fresh evidence the user is watching - restart the
+   * INIT_FAILED auto-recovery ladder. */
 
   s_initfail_tries = 0;
   s_initfail_next.tv_sec = 0;
