@@ -47,9 +47,12 @@ description: AI Watch（openvela/NuttX + LVGL + zblue，立创黄山派 SF32LB52
 | 编译 / 烧录 / 版本与备份 / 新终端环境 | references/build-flash.md |
 | LVGL 页面 / 菜单 / 图标 / 字体 / 条幅 / 线程规则 | references/lvgl-ui.md |
 | I2C 传感器 / 后台探测 / DHT22 / 引脚归属 | references/sensors-i2c.md |
-| BLE 桥接 / 协议设计 / 上报 / 自愈 / 控制器崩溃 | references/ble.md |
+| BLE 桥接 / 协议设计 / 上报 / 自愈 / 控制器崩溃 | references/ble.md（末节：稳定性硬依赖与改动边界） |
 | 跌倒 / 计步算法与阈值调优 | references/fall-detection.md |
 | 板端问题排查（从日志找根因） | references/debugging-workflow.md |
+
+动 BLE、vendor/sifli、zblue、内存布局或 `BT_*` Kconfig 前，先读
+`references/ble.md` 末节「稳定性修复的硬依赖与改动边界」（含电池/电量显示的影响结论）。
 
 ## 项目速查
 
