@@ -86,9 +86,9 @@ verdict: PENDING → OK / ABSENT
 - 读出已是物理单位：accel **mg**（0.488/LSB @±16g）、gyro **mdps**
   （70/LSB）。换算因子是**全局静态变量**——`SNIOC_START_SELFTEST` 会把它
   改坏（0.122/1000），永远别调 selftest。
-- 无 ODR/量程 ioctl；`sensor_read` = 22 次单字节寄存器读（~42ms）→
-  25ms 轮询周期实际只有 **~15Hz**。要更高率需改突发读（0x22..0x2D
-  一条事务）或绕过驱动裸 I2C。
+- 无 ODR/量程 ioctl；`sensor_read` 原为 **17 次单字节寄存器读 = 34 次加锁**
+  （~42ms，此前记的"22 次"是错的）。2026-10-28 已改为两次块读，见文末
+  「IMU burst 读」一节。
 - 结构体 `struct lsm6dsl_sensor_data_s`（include/nuttx/sensors/lsm6dsl.h）。
 
 ## 上报约定
@@ -96,3 +96,77 @@ verdict: PENDING → OK / ABSENT
 传感器数据经 BLE f3 上报（帧 [version][sensor_type][payload]，见
 references/ble.md）；上报频率受 indicate 确认开销限制，周期类一律走
 TX 队列线程（见 ble.md），LVGL 定时器回调里只做 `ai_watch_ble_post()`。
+
+## IMU 读出成本与 burst 读（2026-10-28 实测，含一次自我纠正）
+
+**先纠正一个错数**：曾记录 `sensor_read` 一轮 42ms、I2C1 占用率 168%。
+设备端探针实测**逐字节读只要 3.12ms**（max 6.90ms，偶发 95ms 尖峰），
+44ms 循环里只占 ~7%。42ms 很可能把"整个循环周期"当成了"读耗时"。
+**"总线超载 168%"不成立**，据此排的优先级要重估。
+
+寄存器确实连续，可一次读两块：
+
+- `0x20..0x2D` 连续 **14 字节**：温度 2 + 陀螺 6 + 加速度 6
+- `0x40..0x42` 连续 **3 字节**：时间戳（`0x2E..0x3F` 属 sensor hub，不能合并）
+
+`CTRL3_C.IF_INC` 默认=1（自增）。实测：
+
+| 读法 | 单次读 | 循环周期 |
+|---|---|---|
+| 逐字节 17 次 | 3.12 ms | 44-49 ms |
+| 块读 2 次 | 1.02 ms | 41 ms |
+
+块读只省 **~3ms / 44ms，约 9%**，属微优化，不是救命优化。
+
+## 连接期 `Hardware error code 0`：不要把锅甩给 I2C（重要）
+
+曾观察到"块读版连接崩溃更多"，据此认定 `I2C_M_NOSTOP`（`i2c_mem_ops`）
+有害。**该结论不成立**：把驱动整体退回锚点（逐字节读）后同一时段重测，
+仍是 5/10 建链崩溃；把真基线固件（4.8.25）在同一时段重测，也是 5/10 且
+伴随 2 次 `Hardware error`。而更早另一时段基线是 6/8、0 次。
+
+结论：**建链崩溃率由 LCPU 控制器的恢复相位主导，不是固件差异。**
+刚 wedge 过、刚重新广播的窗口最差；同一固件换时段能差出两倍。所以：
+
+- 判连接稳定性**必须同一时段交替测**，或多轮交替，否则全是噪声；
+- 别拿单批 10 次的结果当证据下结论；
+- `I2C_M_NOSTOP` / `i2c_mem_ops` 在本板 IMU 上**未被证实有害**，但也
+  没有收益（耗时与两段式相同），保持两段式即可。
+
+## LTR-303ALS-01 光感：应用层直读，已打通（2026-10-28）
+
+- 地址 **0x29**，与 IMU 共用 I2C1 和 PA30 的 HR3V3（IMU 能跑就说明这条供电已通）。
+- **寄存器映射（DS86-2013-0004，已用实机转储核对）**：
+
+  | 地址 | 寄存器 | 出厂值 |
+  |---|---|---|
+  | 0x80 | ALS_CONTR | 0x00（待机） |
+  | 0x85 | ALS_MEAS_RATE | 0x03（100ms 积分 / 500ms 重复） |
+  | 0x86 | PART_ID | 0xA0 |
+  | 0x87 | MANUFAC_ID | 0x05（Lite-On） |
+  | 0x88-0x8B | CH1_0/CH1_1/CH0_0/CH0_1 | 0x00 |
+  | 0x8C | ALS_STATUS | 0x00 |
+  | 0x8F | INTERRUPT | 0x08 |
+
+  **坑：0x81..0x84 是空洞，MEAS_RATE 在 0x85 而不是 0x81。** 按 LTR-308
+  （`ltr308_uorb.c`，0x53/PART_ID 0x06/数据 0x0D）的习惯去猜会整体错位 4，
+  读出来的"PART_ID"会是 0x00。**先转储 0x80..0x8F 再写代码**。
+- 点灯判据：转储应为 `00 00 00 00 00 03 a0 05 00 00 00 00 00 00 00 08`
+  （与出厂默认逐字节一致）。
+- 不需要内核驱动：应用层 `open("/dev/i2c1")` + `I2CIOC_TRANSFER`，两条
+  msg（先写寄存器地址、再 `I2C_M_READ` 读），与 IMU 的两段式读法同源。
+- 生效：`ALS_CONTR=0x01`（gain 1x + active），`MEAS_RATE=0x03`。
+- lux（gain 1x / 100ms）：`ratio=CH1/(CH0+CH1)`；
+  <0.45 → `1.7743*CH0+1.1059*CH1`；<0.64 → `4.2785*CH0-1.9548*CH1`；
+  <0.85 → `0.5926*CH0+0.1185*CH1`；否则 0。实测室内 37-42 lux。
+
+## 面板亮度：透传 setpower 即可，不需要新设备节点
+
+- CO5300 是自发光 AMOLED，**本板无背光 PWM**（`BSP_LCDC_USING_QADSPI`
+  分支里 PA01 是 VADD_EN，不是 PWM）。唯一旋钮是面板寄存器 **0x51**
+  （`LCD_SetBrightness()`，入参百分比，内部换算到 `REG_BRIGHTNESS_MAX`）。
+- `sf32lb_lcd_setpower()` 原来把 1..100 全部塌缩成"开屏"，已改为在
+  `DisplayOn` 之后调用 `p_ops->SetBrightness(&hlcdc, power)`。
+- 应用层：`open("/dev/lcd0")` + `ioctl(LCDDEVIO_SETPOWER, 0..100)`
+  （`lcd_dev.h` 里 `_LCDIOC(5)`）。全树只有 ioctl 调 `setpower`，启动路径
+  不传中间值，所以改语义安全。

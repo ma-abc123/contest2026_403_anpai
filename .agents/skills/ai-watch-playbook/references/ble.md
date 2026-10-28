@@ -133,3 +133,55 @@ f4 Command   Write         [ver][cmd][id][flags][ts u32][len][title]
   2. 边充电边连接时的 RF/ADC 噪声；
   3. 电池摆放是否靠近天线（可能失谐，影响距离/RSSI）；
   4. 低电压时不要启动 flash 写擦（与 P1-3 联动，防止掉电写坏）。
+
+## 亮度/面板写入绝不能从光感线程发起（2026-10-28 定位，真凶）
+
+**这是 2026-10-28 那一串"蓝牙回归"的真正原因。**
+
+`sf32lb_lcd.c` 与 `co5300.c` **全程没有任何锁**（搜 mutex/sem/lock 只有注释命中）。
+所以只要在**非 LVGL 线程**里调 `ioctl(/dev/lcd0, LCDDEVIO_SETPOWER)`：
+
+```
+光感线程 → light_apply() → ioctl → sf32lb_lcd_setpower()
+        → p_ops->SetBrightness() → LCD_WriteReg() → HAL_LCDC_WriteU32Reg()
+```
+
+就会在 LVGL 正在刷帧的任意时刻重配同一个 LCDC 外设。后果不是花屏，而是
+**控制器在射频启动那一步死掉**：
+
+```
+aiwatch-ble: disconnected, reason 0x13
+CC opcode=0x2005/0x2006/0x2008/0x2009 全部 status=0x00   ← 广播重建正常
+CMD opcode=0x200a  (LE Set Scan Enable)
+<wrn> Controller unresponsive ... timeout with err -11
+lcpu evidence: revid=3 (legacy patch path) assert_over=2
+```
+
+修法（已落地，`4.8.32-safebright`）：光感线程只算目标档位存进
+`g_pending_level`，真正的面板写入由主线程 `ai_watch_light_poll()` 执行——
+和 LVGL 刷屏同一线程，天然互斥。
+
+效果（同一判据 `tools/ble_connect_probe.py`，N=6）：
+
+| 版本 | 结果 |
+|---|---|
+| 4.8.31（亮度写在光感线程里） | **0/6** |
+| 4.8.32-safebright（写入挪到主线程） | **3/6 + 3/6**，且手机实测一次连上、全程零错误 |
+
+**规矩**：
+1. 任何写 `/dev/lcd0` 的代码，只能在跑 `lv_timer_handler()` 的那个线程里执行。
+2. 需要从别的线程改亮度，就"传值不传调用"：线程写变量，主线程落地。
+3. 这个故障的症状长得完全像 BLE 问题（控制器 assert、广播起不来），
+   所以**改显示相关代码后出现 BLE 异常，先查 LCDC 的线程归属**。
+
+## 附：一条被推翻的早期结论（保留以免重犯）
+
+此前曾把同样的症状归因于"启动期时序"（在设置页构建里加
+`lv_obj_update_layout()` + 长 printf，把 UI 构建拖慢 400 ms，随后广播失败）。
+当时只有"能不能广播"的判据、没有"能不能连"的判据，且两个版本都带着上面
+那个 LCDC 竞态，**归因不成立**。真正的差别是写入线程，不是启动耗时。
+
+仍然成立的两条方法论：
+- **能不能广播 ≠ 能不能连**：判连接必须用 `tools/ble_connect_probe.py`
+  （建链 + 订阅 + 校时 + 通知全走完），`boot_check.sh` 只看广播，不够。
+- 启动路径不要塞调试性重活，但不要把锅甩给它，除非有 A/B 证据。
