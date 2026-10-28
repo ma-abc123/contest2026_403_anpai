@@ -82,7 +82,7 @@ for r in "${REPOS[@]}"; do
   untracked=$(git -C "$d" -c core.preloadIndex=false status --porcelain 2>/dev/null | grep -c '^??' || true)
   ahead=$(git -C "$d" rev-list --count "$TAG"..HEAD 2>/dev/null || echo '?')
   printf '  %-30s tag=%s  HEAD=%s  领先锚点=%s  已跟踪改动=%s  未跟踪=%s\n' \
-    "$r" "$(git -C "$d" rev-parse --short "$TAG")" \
+    "$r" "$(git -C "$d" rev-parse --short "${TAG}^{commit}")" \
     "$(git -C "$d" rev-parse --short HEAD)" "$ahead" "$tracked" "$untracked"
 done
 
