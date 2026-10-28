@@ -29,6 +29,7 @@ if(CONFIG_EXAMPLES_AI_WATCH)
     ai_watch_icons.c
     ai_watch_ble.c
     ai_watch_motion.c
+    ai_watch_light.c
     ai_watch_romdump.c
     fonts/ai_watch_font_cjk_16.c
     STACKSIZE

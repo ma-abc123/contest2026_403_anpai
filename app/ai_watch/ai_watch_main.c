@@ -46,12 +46,13 @@
 #include "fonts/ai_watch_font_cjk_16.h"
 #include "ai_watch_ble.h"
 #include "ai_watch_motion.h"
+#include "ai_watch_light.h"
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.25-persist"
+#define AI_WATCH_VERSION            "4.8.32-safebright"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -229,10 +230,16 @@ struct ai_watch_s
   /* Display objects - Settings page */
 
   FAR lv_obj_t *settings_screen;
+  FAR lv_obj_t *settings_list;
   FAR lv_obj_t *bt_switch;
-  FAR lv_obj_t *theme_roller;
+  FAR lv_obj_t *theme_seg_bar;
+  FAR lv_obj_t *theme_seg[AI_WATCH_THEME_COUNT];
+  FAR lv_obj_t *theme_seg_label[AI_WATCH_THEME_COUNT];
   FAR lv_obj_t *about_label;
   FAR lv_obj_t *ble_state_label;
+  FAR lv_obj_t *brightness_slider;
+  FAR lv_obj_t *brightness_value;
+  FAR lv_obj_t *auto_switch;
 
   /* Display objects - Dynamic app page */
 
@@ -260,6 +267,7 @@ struct ai_watch_s
   FAR lv_indev_t *touch_indev;
   bool touch_active;
   bool gesture_handled;         /* back-home fired mid-drag */
+  bool gesture_lock;            /* a slider owns the current touch */
 
   bool touch_available;
   int touch_start_x;
@@ -270,6 +278,10 @@ struct ai_watch_s
 
   struct timespec touch_next_poll;
   int touch_poll_remaining;
+
+  /* Settings page auto-brightness refresh */
+
+  struct timespec next_bright_poll;
 
   /* RTC state */
 
@@ -984,6 +996,58 @@ static lv_color_t ai_watch_theme_btn_bg(int theme)
     }
 }
 
+/* Recolour the two bar widgets of the settings page. They carry their own
+ * part-level colours (track, indicator, knob, segment fill) that the generic
+ * "walk the children and set the text colour" pass in ai_watch_update_theme()
+ * cannot express.
+ */
+
+static void ai_watch_settings_bar_paint(FAR struct ai_watch_s *watch, int theme)
+{
+  int i;
+
+  if (watch->brightness_slider != NULL)
+    {
+      lv_obj_set_style_bg_color(watch->brightness_slider,
+                                ai_watch_theme_secondary(theme), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(watch->brightness_slider, LV_OPA_30,
+                              LV_PART_MAIN);
+      lv_obj_set_style_bg_color(watch->brightness_slider,
+                                ai_watch_theme_accent(theme), LV_PART_INDICATOR);
+      lv_obj_set_style_bg_opa(watch->brightness_slider, LV_OPA_COVER,
+                              LV_PART_INDICATOR);
+      lv_obj_set_style_bg_color(watch->brightness_slider,
+                                ai_watch_theme_accent(theme), LV_PART_KNOB);
+      lv_obj_set_style_bg_opa(watch->brightness_slider, LV_OPA_COVER,
+                              LV_PART_KNOB);
+      lv_obj_set_style_border_color(watch->brightness_slider,
+                                    ai_watch_theme_bg(theme), LV_PART_KNOB);
+      lv_obj_set_style_text_color(watch->brightness_value,
+                                  ai_watch_theme_accent(theme), 0);
+    }
+
+  for (i = 0; i < AI_WATCH_THEME_COUNT; i++)
+    {
+      FAR lv_obj_t *seg = watch->theme_seg[i];
+      bool selected;
+
+      if (seg == NULL)
+        {
+          continue;
+        }
+
+      selected = (i == theme);
+
+      lv_obj_set_style_bg_color(seg,
+                                selected ? ai_watch_theme_accent(theme) :
+                                           ai_watch_theme_secondary(theme), 0);
+      lv_obj_set_style_bg_opa(seg, selected ? LV_OPA_COVER : LV_OPA_20, 0);
+      lv_obj_set_style_text_color(watch->theme_seg_label[i],
+                                  selected ? ai_watch_theme_bg(theme) :
+                                             ai_watch_theme_text(theme), 0);
+    }
+}
+
 static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
 {
   uint32_t settings_child_count;
@@ -1036,13 +1100,15 @@ static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
       lv_obj_set_style_bg_color(watch->settings_screen,
                                 ai_watch_theme_bg(theme), 0);
 
-      settings_child_count =
-          lv_obj_get_child_count(watch->settings_screen);
+      settings_child_count = lv_obj_get_child_count(watch->settings_list);
+
+      lv_obj_set_style_bg_color(watch->settings_list,
+                                ai_watch_theme_secondary(theme),
+                                LV_PART_SCROLLBAR);
 
       for (i = 0; i < settings_child_count; i++)
         {
-          FAR lv_obj_t *child =
-              lv_obj_get_child(watch->settings_screen, i);
+          FAR lv_obj_t *child = lv_obj_get_child(watch->settings_list, i);
 
           if (child == watch->about_label)
             {
@@ -1054,22 +1120,26 @@ static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
               lv_obj_set_style_text_color(
                   child, ai_watch_theme_accent(theme), 0);
             }
-          else if (child == watch->bt_switch)
+          else if (child == watch->bt_switch || child == watch->auto_switch)
             {
-              lv_obj_set_style_bg_color(watch->bt_switch,
+              lv_obj_set_style_bg_color(child,
                                         ai_watch_theme_secondary(theme),
                                         LV_PART_MAIN);
-              lv_obj_set_style_bg_color(watch->bt_switch,
+              lv_obj_set_style_bg_color(child,
                                         ai_watch_theme_accent(theme),
                                         LV_PART_INDICATOR |
                                         LV_STATE_CHECKED);
             }
-          else if (child != watch->theme_roller)
+          else if (child != watch->theme_seg_bar &&
+                   child != watch->brightness_slider &&
+                   child != watch->brightness_value)
             {
               lv_obj_set_style_text_color(
                   child, ai_watch_theme_text(theme), 0);
             }
         }
+
+      ai_watch_settings_bar_paint(watch, theme);
     }
 }
 
@@ -1390,7 +1460,7 @@ static void ai_watch_create_timer_app(FAR struct ai_watch_s *watch)
   lv_label_set_text(title, "Timer");
   lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
   lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 22);
 
   time_lbl = lv_label_create(screen);
   lv_label_set_text(time_lbl, "00:00.00");
@@ -2368,13 +2438,27 @@ static void ai_watch_fall_poll(FAR struct ai_watch_s *watch)
  * Private Functions - UI Callbacks
  ****************************************************************************/
 
+/* Segmented theme bar. The tapped segment's sibling index is the theme id,
+ * so one callback serves all three without per-segment user data.
+ */
+
 static void ai_watch_settings_theme_cb(lv_event_t *e)
 {
   FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
-  FAR lv_obj_t *roller = lv_event_get_target(e);
-  int theme = lv_roller_get_selected(roller);
+  FAR lv_obj_t *target = lv_event_get_target(e);
+  int index = (int)lv_obj_get_index(target);
 
-  ai_watch_update_theme(watch, theme);
+  if (index < 0 || index >= AI_WATCH_THEME_COUNT)
+    {
+      return;
+    }
+
+  if (index == watch->current_theme)
+    {
+      return;
+    }
+
+  ai_watch_update_theme(watch, index);
 }
 
 static void ai_watch_settings_bt_cb(lv_event_t *e)
@@ -2384,6 +2468,135 @@ static void ai_watch_settings_bt_cb(lv_event_t *e)
 
   ai_watch_ble_set_enabled(checked);
   printf("Settings: Bluetooth switched %s\n", checked ? "ON" : "OFF");
+}
+
+/* Set while the code rewrites its own widgets, so a programmatic change is not
+ * mistaken for a user action (which would flip auto mode off by accident).
+ */
+
+static bool g_settings_sync;
+
+static void ai_watch_settings_show_level(FAR struct ai_watch_s *watch,
+                                         int percent)
+{
+  char buf[8];
+
+  g_settings_sync = true;
+  lv_slider_set_value(watch->brightness_slider, percent, LV_ANIM_OFF);
+  g_settings_sync = false;
+
+  snprintf(buf, sizeof(buf), "%d%%", percent);
+  lv_label_set_text(watch->brightness_value, buf);
+}
+
+static void ai_watch_settings_bright_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+  lv_event_code_t code = lv_event_get_code(e);
+  int percent;
+
+  if (code == LV_EVENT_PRESSED)
+    {
+      /* A horizontal drag on this bar is a level change, not the back-home
+       * swipe. The flag is cleared by the touch poller once the finger is
+       * lifted, which is after LVGL has finished with the gesture.
+       */
+
+      watch->gesture_lock = true;
+      return;
+    }
+
+  if (g_settings_sync)
+    {
+      return;
+    }
+
+  if (code != LV_EVENT_VALUE_CHANGED && code != LV_EVENT_RELEASED)
+    {
+      return;
+    }
+
+  percent = (int)lv_slider_get_value(watch->brightness_slider);
+
+  if (code == LV_EVENT_RELEASED)
+    {
+      printf("Settings: brightness %d%%\n", percent);
+      return;
+    }
+
+  /* Live preview: the panel follows the knob while it moves. Touching the bar
+   * is also the gesture that hands brightness control to the user.
+   */
+
+  ai_watch_light_set_level(percent);
+  ai_watch_settings_show_level(watch, percent);
+
+  if (lv_obj_has_state(watch->auto_switch, LV_STATE_CHECKED))
+    {
+      g_settings_sync = true;
+      lv_obj_remove_state(watch->auto_switch, LV_STATE_CHECKED);
+      g_settings_sync = false;
+    }
+}
+
+static void ai_watch_settings_auto_cb(lv_event_t *e)
+{
+  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
+  bool checked;
+
+  if (g_settings_sync)
+    {
+      return;
+    }
+
+  checked = lv_obj_has_state(watch->auto_switch, LV_STATE_CHECKED);
+  ai_watch_light_set_auto(checked);
+
+  if (checked)
+    {
+      /* Re-seat the bar on the level the sensor is about to take over. */
+
+      ai_watch_settings_show_level(watch, ai_watch_light_level());
+    }
+
+  printf("Settings: auto brightness %s\n", checked ? "ON" : "OFF");
+}
+
+/* Keep the bar honest while auto mode is driving the panel: the sensor can
+ * change the level behind the UI's back. Skipped while a finger is down so a
+ * drag is never fought by a refresh.
+ */
+
+static void ai_watch_settings_poll(FAR struct ai_watch_s *watch)
+{
+  struct timespec now;
+
+  if (watch->current_page != AI_WATCH_PAGE_SETTINGS ||
+      watch->brightness_slider == NULL)
+    {
+      return;
+    }
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  if (!ai_watch_deadline_reached(&now, &watch->next_bright_poll))
+    {
+      return;
+    }
+
+  watch->next_bright_poll = now;
+  ai_watch_advance_deadline(&watch->next_bright_poll, 500);
+
+  if (!ai_watch_light_auto() || watch->touch_active)
+    {
+      return;
+    }
+
+  if (ai_watch_light_level() !=
+      (int)lv_slider_get_value(watch->brightness_slider))
+    {
+      ai_watch_settings_show_level(watch, ai_watch_light_level());
+    }
 }
 
 static void ai_watch_home_click_cb(lv_event_t *e)
@@ -2396,18 +2609,43 @@ static void ai_watch_home_click_cb(lv_event_t *e)
     }
 }
 
-/****************************************************************************
- * Private Functions - Settings Page
- ****************************************************************************/
+/* Settings page geometry. The list scrolls, so rows are placed with explicit
+ * offsets in the list's content coordinates; with 24 px side padding the
+ * usable width is 342 px on the 390 px panel.
+ */
+
+#define AI_WATCH_SETTINGS_LIST_Y        46
+#define AI_WATCH_SETTINGS_LIST_H        350
+#define AI_WATCH_SETTINGS_ROW_BT        6
+#define AI_WATCH_SETTINGS_ROW_BT_STATE  42
+#define AI_WATCH_SETTINGS_ROW_THEME     88
+#define AI_WATCH_SETTINGS_BAR_THEME     122
+#define AI_WATCH_SETTINGS_ROW_BRIGHT    190
+#define AI_WATCH_SETTINGS_BAR_BRIGHT    224
+#define AI_WATCH_SETTINGS_ROW_AUTO      306
+#define AI_WATCH_SETTINGS_ROW_ABOUT     366
+#define AI_WATCH_SETTINGS_BAR_H         44
+#define AI_WATCH_SETTINGS_SEG_W         110
+#define AI_WATCH_SETTINGS_SEG_STEP      116
 
 static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch)
 {
+  static FAR const char *const theme_names[AI_WATCH_THEME_COUNT] =
+  {
+    "Dark", "Light", "Blue"
+  };
+
   FAR lv_obj_t *screen = lv_obj_create(NULL);
   FAR lv_obj_t *title;
+  FAR lv_obj_t *list;
   FAR lv_obj_t *bt_label;
   FAR lv_obj_t *theme_label;
+  FAR lv_obj_t *brightness_label;
+  FAR lv_obj_t *auto_label;
   FAR lv_obj_t *hint;
+  char buf[8];
   int theme = watch->current_theme;
+  int i;
 
   lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
   watch->settings_screen = screen;
@@ -2417,55 +2655,151 @@ static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch)
   lv_label_set_text(title, "Settings");
   lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
   lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-  bt_label = lv_label_create(screen);
+  /* Scrollable column: the page no longer has to fit into one 450 px screen */
+
+  list = lv_obj_create(screen);
+  watch->settings_list = list;
+  lv_obj_set_size(list, LV_PCT(100), AI_WATCH_SETTINGS_LIST_H);
+  lv_obj_align(list, LV_ALIGN_TOP_MID, 0, AI_WATCH_SETTINGS_LIST_Y);
+  lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(list, 0, 0);
+  lv_obj_set_style_radius(list, 0, 0);
+  lv_obj_set_style_pad_hor(list, 24, 0);
+  lv_obj_set_style_pad_top(list, 0, 0);
+  lv_obj_set_style_pad_bottom(list, 16, 0);
+  lv_obj_set_scroll_dir(list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_width(list, 5, LV_PART_SCROLLBAR);
+  lv_obj_set_style_radius(list, 3, LV_PART_SCROLLBAR);
+  lv_obj_set_style_bg_opa(list, LV_OPA_50, LV_PART_SCROLLBAR);
+  lv_obj_set_style_bg_color(list, ai_watch_theme_secondary(theme),
+                            LV_PART_SCROLLBAR);
+
+  bt_label = lv_label_create(list);
   lv_label_set_text(bt_label, "Bluetooth");
   lv_obj_set_style_text_color(bt_label, ai_watch_theme_text(theme), 0);
-  lv_obj_set_style_text_font(bt_label, &lv_font_montserrat_16, 0);
-  lv_obj_align(bt_label, LV_ALIGN_TOP_LEFT, 30, 80);
+  lv_obj_set_style_text_font(bt_label, &lv_font_montserrat_20, 0);
+  lv_obj_align(bt_label, LV_ALIGN_TOP_LEFT, 0, AI_WATCH_SETTINGS_ROW_BT);
 
   /* Bluetooth switch - wired to the real BLE bridge; advertising and
    * connections stop when it is off.
    */
 
-  watch->bt_switch = lv_switch_create(screen);
+  watch->bt_switch = lv_switch_create(list);
   lv_obj_add_state(watch->bt_switch, LV_STATE_CHECKED);
   lv_obj_add_event_cb(watch->bt_switch, ai_watch_settings_bt_cb,
                       LV_EVENT_VALUE_CHANGED, watch);
-  lv_obj_align(watch->bt_switch, LV_ALIGN_TOP_RIGHT, -30, 72);
+  lv_obj_align(watch->bt_switch, LV_ALIGN_TOP_RIGHT, 0,
+               AI_WATCH_SETTINGS_ROW_BT - 4);
 
-  watch->ble_state_label = lv_label_create(screen);
+  watch->ble_state_label = lv_label_create(list);
   lv_label_set_text(watch->ble_state_label,
                     ai_watch_ble_get_status_text(ai_watch_ble_get_state()));
   lv_obj_set_style_text_color(watch->ble_state_label,
                               ai_watch_theme_accent(theme), 0);
   lv_obj_set_style_text_font(watch->ble_state_label,
                              &lv_font_montserrat_14, 0);
-  lv_obj_align(watch->ble_state_label, LV_ALIGN_TOP_RIGHT, -30, 114);
+  lv_obj_align(watch->ble_state_label, LV_ALIGN_TOP_RIGHT, 0,
+               AI_WATCH_SETTINGS_ROW_BT_STATE);
 
-  theme_label = lv_label_create(screen);
+  theme_label = lv_label_create(list);
   lv_label_set_text(theme_label, "Theme");
   lv_obj_set_style_text_color(theme_label, ai_watch_theme_text(theme), 0);
-  lv_obj_set_style_text_font(theme_label, &lv_font_montserrat_16, 0);
-  lv_obj_align(theme_label, LV_ALIGN_TOP_LEFT, 30, 145);
+  lv_obj_set_style_text_font(theme_label, &lv_font_montserrat_20, 0);
+  lv_obj_align(theme_label, LV_ALIGN_TOP_LEFT, 0, AI_WATCH_SETTINGS_ROW_THEME);
 
-  watch->theme_roller = lv_roller_create(screen);
-  lv_roller_set_options(watch->theme_roller,
-                       "Dark\n"
-                       "Light\n"
-                       "Blue",
-                       LV_ROLLER_MODE_NORMAL);
-  lv_obj_set_width(watch->theme_roller, 150);
-  lv_obj_align(watch->theme_roller, LV_ALIGN_TOP_MID, 0, 175);
-  lv_roller_set_visible_row_count(watch->theme_roller, 2);
-  lv_roller_set_selected(watch->theme_roller, watch->current_theme,
-                         LV_ANIM_OFF);
+  /* Three equal segments in one rounded bar, selected one filled with the
+   * accent colour. Painted by ai_watch_settings_bar_paint().
+   */
 
-  lv_obj_add_event_cb(watch->theme_roller, ai_watch_settings_theme_cb,
+  watch->theme_seg_bar = lv_obj_create(list);
+  lv_obj_set_size(watch->theme_seg_bar, LV_PCT(100), AI_WATCH_SETTINGS_BAR_H);
+  lv_obj_align(watch->theme_seg_bar, LV_ALIGN_TOP_LEFT, 0,
+               AI_WATCH_SETTINGS_BAR_THEME);
+  lv_obj_set_style_bg_opa(watch->theme_seg_bar, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(watch->theme_seg_bar, 0, 0);
+  lv_obj_set_style_pad_all(watch->theme_seg_bar, 0, 0);
+  lv_obj_clear_flag(watch->theme_seg_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (i = 0; i < AI_WATCH_THEME_COUNT; i++)
+    {
+      FAR lv_obj_t *seg = lv_obj_create(watch->theme_seg_bar);
+      FAR lv_obj_t *seg_text;
+
+      watch->theme_seg[i] = seg;
+
+      lv_obj_set_size(seg, AI_WATCH_SETTINGS_SEG_W, AI_WATCH_SETTINGS_BAR_H);
+      lv_obj_align(seg, LV_ALIGN_TOP_LEFT, i * AI_WATCH_SETTINGS_SEG_STEP, 0);
+      lv_obj_set_style_radius(seg, AI_WATCH_SETTINGS_BAR_H / 2, 0);
+      lv_obj_set_style_border_width(seg, 0, 0);
+      lv_obj_set_style_pad_all(seg, 0, 0);
+      lv_obj_clear_flag(seg, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_add_event_cb(seg, ai_watch_settings_theme_cb,
+                          LV_EVENT_CLICKED, watch);
+
+      seg_text = lv_label_create(seg);
+      watch->theme_seg_label[i] = seg_text;
+      lv_label_set_text(seg_text, theme_names[i]);
+      lv_obj_set_style_text_font(seg_text, &lv_font_montserrat_16, 0);
+      lv_obj_center(seg_text);
+    }
+
+  brightness_label = lv_label_create(list);
+  lv_label_set_text(brightness_label, "Brightness");
+  lv_obj_set_style_text_color(brightness_label,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(brightness_label, &lv_font_montserrat_20, 0);
+  lv_obj_align(brightness_label, LV_ALIGN_TOP_LEFT, 0,
+               AI_WATCH_SETTINGS_ROW_BRIGHT);
+
+  watch->brightness_value = lv_label_create(list);
+  snprintf(buf, sizeof(buf), "%d%%", ai_watch_light_level());
+  lv_label_set_text(watch->brightness_value, buf);
+  lv_obj_set_style_text_font(watch->brightness_value,
+                             &lv_font_montserrat_20, 0);
+  lv_obj_align(watch->brightness_value, LV_ALIGN_TOP_RIGHT, 0,
+               AI_WATCH_SETTINGS_ROW_BRIGHT);
+
+  /* One continuous 1..100 bar: dragging previews the change live, tapping
+   * jumps straight to that level. Both take brightness away from the sensor.
+   */
+
+  watch->brightness_slider = lv_slider_create(list);
+  lv_obj_set_size(watch->brightness_slider, LV_PCT(100),
+                  AI_WATCH_SETTINGS_BAR_H);
+  lv_obj_align(watch->brightness_slider, LV_ALIGN_TOP_LEFT, 0,
+               AI_WATCH_SETTINGS_BAR_BRIGHT);
+  lv_slider_set_range(watch->brightness_slider, 1, 100);
+  lv_slider_set_value(watch->brightness_slider, ai_watch_light_level(),
+                      LV_ANIM_OFF);
+  lv_obj_set_style_radius(watch->brightness_slider,
+                          AI_WATCH_SETTINGS_BAR_H / 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(watch->brightness_slider,
+                          AI_WATCH_SETTINGS_BAR_H / 2, LV_PART_INDICATOR);
+  lv_obj_set_style_border_width(watch->brightness_slider, 3, LV_PART_KNOB);
+  lv_obj_add_event_cb(watch->brightness_slider,
+                      ai_watch_settings_bright_cb, LV_EVENT_ALL, watch);
+
+  auto_label = lv_label_create(list);
+  lv_label_set_text(auto_label, "Auto brightness");
+  lv_obj_set_style_text_color(auto_label, ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(auto_label, &lv_font_montserrat_20, 0);
+  lv_obj_align(auto_label, LV_ALIGN_TOP_LEFT, 0, AI_WATCH_SETTINGS_ROW_AUTO);
+
+  watch->auto_switch = lv_switch_create(list);
+  if (ai_watch_light_auto())
+    {
+      lv_obj_add_state(watch->auto_switch, LV_STATE_CHECKED);
+    }
+
+  lv_obj_add_event_cb(watch->auto_switch, ai_watch_settings_auto_cb,
                       LV_EVENT_VALUE_CHANGED, watch);
+  lv_obj_align(watch->auto_switch, LV_ALIGN_TOP_RIGHT, 0,
+               AI_WATCH_SETTINGS_ROW_AUTO - 4);
 
-  watch->about_label = lv_label_create(screen);
+  watch->about_label = lv_label_create(list);
   lv_label_set_text(watch->about_label,
                     "AI Watch v" AI_WATCH_VERSION "\n"
                     "Board: SF32LB52\n"
@@ -2473,14 +2807,22 @@ static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch)
                     "RTC: Checking...");
   lv_obj_set_style_text_color(watch->about_label,
                               ai_watch_theme_secondary(theme), 0);
-  lv_obj_set_style_text_font(watch->about_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(watch->about_label, LV_ALIGN_CENTER, 0, 50);
+  lv_obj_set_style_text_font(watch->about_label, &lv_font_montserrat_16, 0);
+  lv_obj_align(watch->about_label, LV_ALIGN_TOP_LEFT, 0,
+               AI_WATCH_SETTINGS_ROW_ABOUT);
+
+  /* Fixed footer: the title and these hints stay put while the list scrolls */
 
   hint = lv_label_create(screen);
-  lv_label_set_text(hint, LV_SYMBOL_LEFT " Back (KEY2)");
+  lv_label_set_text(hint, LV_SYMBOL_LEFT " Back (KEY2)   "
+                           LV_SYMBOL_UP LV_SYMBOL_DOWN " Scroll");
   lv_obj_set_style_text_color(hint, ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, 0);
-  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+  ai_watch_settings_bar_paint(watch, theme);
+
+  clock_gettime(CLOCK_MONOTONIC, &watch->next_bright_poll);
 }
 
 /****************************************************************************
@@ -3360,18 +3702,21 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
         {
           watch->touch_active = true;
           watch->gesture_handled = false;
+          watch->gesture_lock = false;
           watch->touch_start_x = point.x;
           watch->touch_start_y = point.y;
           watch->touch_start_time = now;
         }
       else if (!watch->gesture_handled &&
+               !watch->gesture_lock &&
                watch->current_page != AI_WATCH_PAGE_HOME &&
                watch->current_page != AI_WATCH_PAGE_APP_LIST)
         {
           /* App and settings pages: return home as soon as the drag
            * shows unambiguous horizontal intent - no release timing
            * needed. The hex app-list page is excluded so its own drag
-           * handling is not affected.
+           * handling is not affected, and gesture_lock keeps a drag on
+           * the brightness bar from being read as a back swipe.
            */
 
           int dx = point.x - watch->touch_start_x;
@@ -3391,10 +3736,17 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
       int dy = point.y - watch->touch_start_y;
       int64_t elapsed_ms =
           ai_watch_elapsed_ms(&now, &watch->touch_start_time);
+      bool locked = watch->gesture_lock;
 
       watch->touch_active = false;
+      watch->gesture_lock = false;
 
-      if (watch->gesture_handled)
+      /* The release has to be suppressed too: LVGL delivers it before this
+       * poll runs, so a horizontal drag on the bar would otherwise be scored
+       * as a deliberate back swipe by the fallback below.
+       */
+
+      if (watch->gesture_handled || locked)
         {
           return;
         }
@@ -3581,6 +3933,13 @@ int main(int argc, FAR char *argv[])
       watch.touch_next_poll.tv_sec += 1;
     }
 
+  /* Ambient light + panel brightness. Runs before the UI is built so the
+   * boot default (auto brightness on) is already in effect when the first
+   * frame lands.
+   */
+
+  ai_watch_light_init();
+
   ai_watch_create_ui(&watch);
   ai_watch_button_initialize(&watch);
 
@@ -3674,6 +4033,13 @@ int main(int argc, FAR char *argv[])
       ai_watch_fall_poll(&watch);
 
       ai_watch_unread_update(&watch);
+      ai_watch_settings_poll(&watch);
+
+      /* Panel writes happen here, on the same thread that runs the LVGL
+       * flush, never from the sensor worker.
+       */
+
+      ai_watch_light_poll();
 
       idle = lv_timer_handler();
 
