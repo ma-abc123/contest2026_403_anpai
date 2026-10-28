@@ -14,8 +14,9 @@ description: AI Watch（openvela/NuttX + LVGL + zblue，立创黄山派 SF32LB52
    主循环每 ~10ms 一转，一次 1-2s 的阻塞 = 触摸全死而 KEY2（GPIO 轮询）正常。
    "触摸死、按键活"的唯一常见解释就是主循环被阻塞，见到先往这个方向查。
    慢操作一律：后台 pthread + mutex 快照 + 主循环 process() 消费。
-2. **对不在线的 I2C 设备做一次探测 = 阻塞 1-2s**：SiFli HAL 的
-   `I2C_TIMEOUT_ADDR/BUSY` 各 1000ms。探测永远放后台线程，用
+2. **对不在线的 I2C 设备做一次探测 = 阻塞最长 5s**：`sifli_i2c.c:41` 的
+   `I2C_XFER_TIMEOUT = 5000`（每次 transfer 的超时；2026-10-28 更正，此前写
+   1000ms 系误记，低估 5 倍）。探测永远放后台线程，用
    PENDING/OK/ABSENT 三态 + 100ms 切片 sleep 保证可 join，absent 后 5s 退避。
 3. **`bt_gatt_indicate` 在本移植上同步阻塞约一个连接间隔（~100-150ms/次）**。
    一切周期性上报必须走独立 TX 线程 + 队列 + 失败退避 2s；首发失败禁止在
@@ -31,9 +32,18 @@ description: AI Watch（openvela/NuttX + LVGL + zblue，立创黄山派 SF32LB52
    references/debugging-workflow.md。
 7. **LVGL 不是线程安全**：一切 UI 调用只在主循环线程；后台线程只写共享数据，
    由主循环渲染。对象所有权与页面生命周期规则见 references/lvgl-ui.md。
-8. **git 安全**：禁 `git reset --hard` / `git checkout --` / 随意
+8. **git 安全**：日常禁 `git reset --hard` / `git checkout --` / 随意
    `repo sync`；提交由用户主导；apps、vendor/sifli、contest 仓是**独立
-   git 仓**，提交要分仓做。
+   git 仓**，提交要分仓做。**唯一例外是回退到锚点**——用
+   `tools/revert-to-baseline.sh`（默认 dry-run，`--apply` 才动；回退前自动建
+   `wip-before-revert-<时间戳>` 分支 + `git stash`）。锚点清单与实测证据见
+   `docs/development/锚点-2026-10-28-IMU-burst前基线回退手册.md`。
+   **回退时绝不用 `git stash -u` 或 `git clean -fd`**：
+   `vendor/openvela/boards/contest2026_403_ai_watch` 是一个**未跟踪的软链**
+   （指向 `contest2026_403_anpai/board/ai_watch`），构建依赖它；被 stash 收走
+   或 clean 删掉后，`ninja` 会报一个与源码毫无关系的错，极难定位。
+   2026-10-28 实测确认：`git reset --hard` **本身不删未跟踪文件**，
+   所以"只 reset、不 clean"是安全的，这也是脚本的写法依据。
 9. **诚实标注**：没实机验证的功能必须写"未验证"，不假装；开发日志按日期
    放 `docs/development/`，必须含根因记录与验收表。
 10. **报错要看到最后一行再下结论**；vendor 老代码的编译错误先用
