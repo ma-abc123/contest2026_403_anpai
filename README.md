@@ -6,12 +6,13 @@
 
 **AI Watch** 是一台跑着 openvela（NuttX 内核）的智能腕表：在黄山派开发板的屏幕、触摸、按键之上，实现了一套手表应用平台与手机互联协议，并围绕"运动与安全"做出了核心亮点——**基于板载六轴传感器的疑似跌倒检测**：检测到疑似跌倒后全屏 15 秒倒计时，可按键/触摸取消，超时自动上报手机；检测算法（合加速度冲击、自由落体、姿态翻转、冲击后静止四要素）先经 6 组真实测试集离线定标再上板（详见开发日志 2026-09-02）。
 
-功能一览（截至 v4.8.5）：
+功能一览（截至 v4.8.39）：
 
 - **表盘与应用平台**：翻页表盘、六边形应用菜单（hex menu）、三主题、手势导航 + KEY2
 - **运动与跌倒检测**：计步/距离、静止/步行/跑步分类、疑似跌倒检测与告警流程、原始数据采集模式（串口全量 CSV + BLE 抽样流）
 - **手机互联（BLE GATT）**：时间同步、提醒/通知下发与到点条幅、传感器数据与事件上报、AI 语音闭环触发
 - **AI 助手**：手表一键触发 → 手机 ASR/LLM → 结果回显，可落地为提醒/倒计时
+- **显示与设置**：LTR-303 环境光自动亮度（1–100 手动可调）、滚动设置页（亮度条 / 主题条）、电池电量图标与百分比
 - **实用工具**：倒计时、提醒（含到点条幅）
 
 ## 二、选题方向
@@ -22,15 +23,17 @@
 
 ```
 app/ai_watch/      # AI Watch 主应用（LVGL UI、应用框架、运动服务、BLE 协议层）
-  ├─ ai_watch_main.c      # 应用框架、页面、按键/触摸、跌倒告警 UI
+  ├─ ai_watch_main.c      # 应用框架、页面、按键/触摸、跌倒告警 UI、设置页
   ├─ ai_watch_motion.c/h  # 后台运动服务：采样线程、计步/活动/跌倒算法、数据采集
   ├─ ai_watch_ble.c/h     # 协议层：TimeSync/命令解析/提醒存储/上行队列
+  ├─ ai_watch_light.c/h   # LTR-303 环境光采样与自动亮度（亮度由主线程落地，避免与 LVGL 抢 LCDC）
+  ├─ ai_watch_battery.c/h # GPADC ch7 电池电压采样、滤波与电量估算
   ├─ ai_watch_icons.*     # 图标资源（用户图标集生成）
   └─ fonts/, icons/       # CJK 字体与图标源
 board/ai_watch/    # 板级 defconfig（映射到 vendor/openvela/boards/contest2026_403_ai_watch）
 phone/             # 手机端配套 App 源码（Android/Kotlin/Compose，BLE 互联与 AI 闭环的另一半）
 docs/development/  # 开发日志（按日期）、手机端需求文档、排查文档
-tools/             # fall_threshold_analysis.py：跌倒阈值离线定标脚本
+tools/             # fall_threshold_analysis.py 跌倒阈值定标；ble_session_stats.py BLE 会话统计
 logs/              # AI Coding 日志（按官方手册导出提交）
 ```
 
@@ -83,4 +86,4 @@ sftool -c SF32LB52 -p /dev/ttyUSB0 -b 1000000 \
 
 完整对话日志见 `logs/`（按官方《AI Coding 日志归集与提交手册》导出）；过程性记录见 `docs/development/` 下按日期的开发日志。
 
-开发经验已沉淀为可复用的 AI Skill 并随仓提交：`.agents/skills/ai-watch-playbook/`——从 12 篇开发日志提炼的 AI Watch 开发手册（红线规则 + LVGL/BLE/传感器/跌倒算法/调试方法论），用 ZCode / Claude Code 打开本仓库即可自动加载使用。
+开发经验已沉淀为可复用的 AI Skill 并随仓提交：`.agents/skills/ai-watch-playbook/`——从 `docs/development/` 下的开发日志提炼的 AI Watch 开发手册（红线规则 + LVGL/BLE/传感器/跌倒算法/调试方法论），用 ZCode / Claude Code 打开本仓库即可自动加载使用。
