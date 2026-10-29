@@ -47,12 +47,13 @@
 #include "ai_watch_ble.h"
 #include "ai_watch_motion.h"
 #include "ai_watch_light.h"
+#include "ai_watch_battery.h"
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.32-safebright"
+#define AI_WATCH_VERSION            "4.8.39-blesettle"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -221,6 +222,10 @@ struct ai_watch_s
   FAR lv_obj_t *date_label;
   FAR lv_obj_t *unread_label;
   FAR lv_obj_t *bt_label;
+  FAR lv_obj_t *battery_shell;
+  FAR lv_obj_t *battery_fill;
+  FAR lv_obj_t *battery_label;
+  int          battery_shown_pct;
 
   /* Display objects - App list page */
 
@@ -1048,6 +1053,59 @@ static void ai_watch_settings_bar_paint(FAR struct ai_watch_s *watch, int theme)
     }
 }
 
+/* Battery gauge geometry. The shell is 26x13 with a 2 px border, leaving a
+ * 22x9 well; the fill grows from 1 px to 20 px as the charge goes 0..100%.
+ */
+
+#define AI_WATCH_BATT_FILL_MAX  20
+#define AI_WATCH_BATT_LOW_PCT   20
+#define AI_WATCH_BATT_LOW_COLOR 0xe53935
+
+static void ai_watch_battery_update(FAR struct ai_watch_s *watch)
+{
+  int pct;
+  int width;
+  lv_color_t color;
+  char buf[12];
+
+  if (watch->battery_label == NULL || watch->battery_fill == NULL)
+    {
+      return;
+    }
+
+  pct = ai_watch_battery_percent();
+  if (pct < 0)
+    {
+      return;
+    }
+
+  if (pct == watch->battery_shown_pct)
+    {
+      return;
+    }
+
+  watch->battery_shown_pct = pct;
+
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  lv_label_set_text(watch->battery_label, buf);
+
+  width = pct * AI_WATCH_BATT_FILL_MAX / 100;
+  if (width < 2)
+    {
+      width = 2;
+    }
+
+  lv_obj_set_width(watch->battery_fill, width);
+
+  color = (pct <= AI_WATCH_BATT_LOW_PCT)
+              ? lv_color_hex(AI_WATCH_BATT_LOW_COLOR)
+              : ai_watch_theme_accent(watch->current_theme);
+
+  lv_obj_set_style_bg_color(watch->battery_fill, color, 0);
+  lv_obj_set_style_border_color(watch->battery_shell, color, 0);
+  lv_obj_set_style_text_color(watch->battery_label, color, 0);
+}
+
 static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
 {
   uint32_t settings_child_count;
@@ -1080,6 +1138,11 @@ static void ai_watch_update_theme(FAR struct ai_watch_s *watch, int theme)
                               ai_watch_theme_accent(theme), 0);
   lv_obj_set_style_text_color(watch->home_hint_label,
                               ai_watch_theme_secondary(theme), 0);
+
+  /* Repaint the gauge in the new palette (force, not value-driven) */
+
+  watch->battery_shown_pct = -2;
+  ai_watch_battery_update(watch);
 
   /* Update the alert banner if it is on screen */
 
@@ -2911,6 +2974,46 @@ static void ai_watch_create_home_page(FAR struct ai_watch_s *watch)
   lv_obj_set_style_text_font(watch->bt_label, &lv_font_montserrat_20, 0);
   lv_obj_align(watch->bt_label, LV_ALIGN_BOTTOM_MID, 0, -64);
 
+  /* Battery gauge: drawn from primitives because this build's Montserrat
+   * faces carry no LV_SYMBOL_BATTERY_* glyphs. Shell + fill + percentage.
+   */
+
+  watch->battery_shell = lv_obj_create(screen);
+  lv_obj_set_size(watch->battery_shell, 26, 13);
+  lv_obj_align(watch->battery_shell, LV_ALIGN_TOP_RIGHT, -66, 31);
+  lv_obj_set_style_bg_opa(watch->battery_shell, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(watch->battery_shell, 2, 0);
+  lv_obj_set_style_border_color(watch->battery_shell,
+                                ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_radius(watch->battery_shell, 3, 0);
+  lv_obj_set_style_pad_all(watch->battery_shell, 0, 0);
+  lv_obj_clear_flag(watch->battery_shell, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(watch->battery_shell, LV_OBJ_FLAG_CLICKABLE);
+
+  watch->battery_fill = lv_obj_create(watch->battery_shell);
+  lv_obj_set_size(watch->battery_fill, 4, 7);
+  lv_obj_align(watch->battery_fill, LV_ALIGN_LEFT_MID, 0, 0);
+  lv_obj_set_style_bg_color(watch->battery_fill,
+                            ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_bg_opa(watch->battery_fill, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(watch->battery_fill, 0, 0);
+  lv_obj_set_style_radius(watch->battery_fill, 1, 0);
+  lv_obj_set_style_pad_all(watch->battery_fill, 0, 0);
+  lv_obj_clear_flag(watch->battery_fill, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(watch->battery_fill, LV_OBJ_FLAG_CLICKABLE);
+
+  watch->battery_label = lv_label_create(screen);
+  lv_label_set_text(watch->battery_label, "--%");
+  lv_obj_set_style_text_color(watch->battery_label,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(watch->battery_label,
+                             &lv_font_montserrat_14, 0);
+  lv_obj_align(watch->battery_label, LV_ALIGN_TOP_RIGHT, -16, 27);
+
+  /* 0% is a legal reading, so the "already shown" sentinel must not be 0. */
+
+  watch->battery_shown_pct = -2;
+
   /* Gesture hint */
 
   watch->home_hint_label = lv_label_create(screen);
@@ -3798,6 +3901,8 @@ int main(int argc, FAR char *argv[])
 {
   lv_nuttx_result_t result;
   lv_nuttx_dsc_t info;
+  struct timespec radio_ready_since = {0, 0};
+  bool sensor_features_started = false;
   struct ai_watch_s watch =
   {
     .button_fd = -1,
@@ -3832,7 +3937,13 @@ int main(int argc, FAR char *argv[])
     },
   };
 
+  /* The version string alone cannot tell two builds apart -- 4.8.35 shipped
+   * several times with different contents, which made "which one is on the
+   * board?" a recurring question. The build stamp answers it directly.
+   */
+
   printf("AI Watch version %s\n", AI_WATCH_VERSION);
+  printf("AI Watch build %s %s\n", __DATE__, __TIME__);
   printf("ai_watch started\n");
 
   {
@@ -3933,13 +4044,6 @@ int main(int argc, FAR char *argv[])
       watch.touch_next_poll.tv_sec += 1;
     }
 
-  /* Ambient light + panel brightness. Runs before the UI is built so the
-   * boot default (auto brightness on) is already in effect when the first
-   * frame lands.
-   */
-
-  ai_watch_light_init();
-
   ai_watch_create_ui(&watch);
   ai_watch_button_initialize(&watch);
 
@@ -4001,14 +4105,50 @@ int main(int argc, FAR char *argv[])
         static enum ai_watch_ble_bsp_state_e last_ble_state =
           AI_WATCH_BLE_BSP_OFF;
 
-        enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
+        enum ai_watch_ble_bsp_state_e state;
 
         ai_watch_ble_process();
+        state = ai_watch_ble_get_state();
 
         if (state != last_ble_state)
           {
             last_ble_state = state;
             ai_watch_update_bt_label(&watch);
+          }
+
+        /* Sensor and panel setup can contend for HCPU peripherals while the
+         * controller is recovering. Wait until BLE has stayed usable for
+         * ten seconds before touching I2C, ADC or LCD power controls.
+         */
+
+        if (state == AI_WATCH_BLE_BSP_ADVERTISING ||
+            state == AI_WATCH_BLE_BSP_CONNECTED)
+          {
+            if (radio_ready_since.tv_sec == 0)
+              {
+                clock_gettime(CLOCK_MONOTONIC, &radio_ready_since);
+              }
+            else if (!sensor_features_started &&
+                     ai_watch_elapsed_ms(&now, &radio_ready_since) >= 10000)
+              {
+                int light_ret;
+
+                light_ret = ai_watch_light_init();
+                if (light_ret >= 0)
+                  {
+                    ai_watch_light_start();
+                  }
+
+                ai_watch_battery_init();
+                sensor_features_started = true;
+                printf("Sensors: deferred startup complete (light=%d)\n",
+                       light_ret);
+              }
+          }
+        else
+          {
+            radio_ready_since.tv_sec = 0;
+            radio_ready_since.tv_nsec = 0;
           }
 
         /* Show an alert banner for every arrival not shown yet */
@@ -4040,6 +4180,8 @@ int main(int argc, FAR char *argv[])
        */
 
       ai_watch_light_poll();
+      ai_watch_battery_poll();
+      ai_watch_battery_update(&watch);
 
       idle = lv_timer_handler();
 

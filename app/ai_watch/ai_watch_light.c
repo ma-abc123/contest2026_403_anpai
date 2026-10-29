@@ -71,8 +71,7 @@
 
 #define LIGHT_PERIOD_MS     1000
 #define LIGHT_STACKSIZE     3072
-#define LIGHT_PRIORITY      90            /* below motion sampling (80) */
-#define LIGHT_SETTLE_MS     600           /* first conversion after enable */
+#define LIGHT_PRIORITY      90            /* below UI (100), above motion (80) */
 
 /* Manual range, in percent of panel maximum. The settings bar exposes the
  * full 1..100 span; light_apply() clamps whatever it is handed.
@@ -378,8 +377,6 @@ static FAR void *light_thread(FAR void *arg)
 
 int ai_watch_light_init(void)
 {
-  pthread_attr_t attr;
-  struct sched_param param;
   uint8_t dump[16];
   uint8_t part;
   uint8_t manu;
@@ -447,22 +444,11 @@ int ai_watch_light_init(void)
       return ret;
     }
 
-  usleep(LIGHT_SETTLE_MS * 1000);
-
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, LIGHT_STACKSIZE);
-  pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-  param.sched_priority = LIGHT_PRIORITY;
-  pthread_attr_setschedparam(&attr, &param);
-
-  if (pthread_create(&g_thread, &attr, light_thread, NULL) == 0)
-    {
-      g_thread_running = true;
-    }
-  else
-    {
-      printf("LIGHT: thread create failed\n");
-    }
+  /* The sampling thread is deliberately NOT created here any more; see
+   * ai_watch_light_start() below. The thread waits one full sample period
+   * before reading, which gives the sensor's first conversion time to settle
+   * without blocking the caller.
+   */
 
   /* Boot default: auto brightness on, with a sane level until the first
    * conversion lands.
@@ -473,6 +459,52 @@ int ai_watch_light_init(void)
 
   printf("LIGHT: ready, auto=%d level=%d%%\n", g_auto ? 1 : 0, g_level);
   return OK;
+}
+
+/****************************************************************************
+ * Name: ai_watch_light_start
+ *
+ * Description:
+ *   Spin up the ambient-light sampling thread. Split out of init on purpose.
+ *
+ *   The LCPU bring-up right after init (lcpu patch -> cal -> release) is
+ *   timing-sensitive down to the microsecond, and the HCI commands that drive
+ *   it are issued from the main thread. Whenever the main thread blocks in
+ *   HAL_Delay_us() it gives the CPU away, and a 1 Hz I2C reader that is
+ *   already running can land inside those gaps. Nothing here is urgent --
+ *   the panel keeps the boot brightness until the first conversion -- so the
+ *   thread waits until the radio is up (or has given up and scheduled a
+ *   retry). Call this from the same thread that finishes BLE bring-up.
+ *
+ ****************************************************************************/
+
+void ai_watch_light_start(void)
+{
+  pthread_attr_t attr;
+  struct sched_param param;
+
+  if (!g_present || g_thread_running)
+    {
+      return;
+    }
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, LIGHT_STACKSIZE);
+  pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+  param.sched_priority = LIGHT_PRIORITY;
+  pthread_attr_setschedparam(&attr, &param);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+  if (pthread_create(&g_thread, &attr, light_thread, NULL) == 0)
+    {
+      g_thread_running = true;
+    }
+  else
+    {
+      printf("LIGHT: thread create failed\n");
+    }
+
+  pthread_attr_destroy(&attr);
 }
 
 bool ai_watch_light_present(void)

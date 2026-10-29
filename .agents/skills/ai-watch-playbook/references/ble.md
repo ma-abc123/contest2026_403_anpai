@@ -185,3 +185,43 @@ lcpu evidence: revid=3 (legacy patch path) assert_over=2
 - **能不能广播 ≠ 能不能连**：判连接必须用 `tools/ble_connect_probe.py`
   （建链 + 订阅 + 校时 + 通知全走完），`boot_check.sh` 只看广播，不够。
 - 启动路径不要塞调试性重活，但不要把锅甩给它，除非有 A/B 证据。
+
+## 最强证据：同一份固件，连测两次结果相反（2026-10-28 晚）
+
+判定「某版本 BLE 更好/更差」时，**必须先看这一组数据**：
+
+```
+A1  4.8.32-safebright  PASS  advertising=3  unresponsive=0
+B1  4.8.34-noadc       PASS  advertising=1  unresponsive=0
+A2  4.8.32-safebright  FAIL  advertising=0  unresponsive=3   ← 同一文件
+B2  4.8.34-noadc       FAIL  advertising=0  unresponsive=3   ← 同一文件
+```
+
+判据脚本 `tools/boot_check.sh`，四次**连续**烧写+复位+30 s，A/B 交替。
+**A1 与 A2 是同一个 .bin 文件**，中间只隔了一次 B1 烧写，结果一个通过一个失败。
+
+由此可确定：**连续烧写/复位会让控制器状态累积恶化**，
+`advertising` 能否起得来主要取决于这个状态，而不是刚烧的是哪份固件。
+sftool 的 `--after soft_reset` 只是芯片复位，清不掉这个状态。
+
+推论（重要，避免重复误判）：
+1. 「换上某个版本后变差/变好」这种观察，**在单次烧写后几乎没有证据力**。
+   要判定版本差异，必须 A/B 交替多轮，且每轮之间插入真断电。
+2. 这个现象曾被两次误归因：先归因于「启动时序」（UI 构建多 400ms），
+   后归因于「ADC/VBAT_MON」。两次都被 A/B 数据推翻——`4.8.34-noadc`
+   完全不碰 ADC，同样 FAIL。
+3. 用户在 22:00 报告「加电池代码后蓝牙不好用」，但隔离版（ADC 全关）
+   同样失败，所以**电池模块不是元凶**。
+
+## 连接期崩溃的固定签名（与上面不是同一件事）
+
+```
+aiwatch-ble: connected
+<err> Hardware error, hardware code: 0
+aiwatch-ble: controller recovery type=hardware-error opcode=0x0000
+aiwatch-ble: disconnected, reason 0x00 duration_ms=6934 state=0
+```
+
+连接建立后 **几百毫秒到几秒**内 LCPU 自己 assert。这是 E1 patch 未根治的
+既有问题，与传感器/ADC/电源采样都无关——对照实验里 `4.8.25` 基线同样出现过
+（12:12 那批 10 次里 2 次）。

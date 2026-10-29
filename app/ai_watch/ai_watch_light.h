@@ -18,9 +18,13 @@
  * Name: ai_watch_light_init
  *
  * Description:
- *   Open the sensor bus, identify the LTR-303 and start the auto-brightness
- *   worker (auto mode enabled by default). Safe to call when no sensor is
- *   fitted: it logs and returns an error without registering anything.
+ *   Open the sensor bus, identify the LTR-303, apply the boot brightness and
+ *   enable auto mode. Safe to call when no sensor is fitted: it logs and
+ *   returns an error without registering anything.
+ *
+ *   This no longer starts the sampling thread -- call ai_watch_light_start()
+ *   once the radio is up. Keeping the worker out of the LCPU bring-up window
+ *   is the point of the split.
  *
  * Returned Value:
  *   OK on success, a negated errno on failure.
@@ -28,6 +32,18 @@
  ****************************************************************************/
 
 int ai_watch_light_init(void);
+
+/****************************************************************************
+ * Name: ai_watch_light_start
+ *
+ * Description:
+ *   Start the ambient-light sampling thread. No-op if the sensor was not
+ *   detected or the thread is already running. Call it after BLE bring-up has
+ *   finished (successfully or not) rather than from init.
+ *
+ ****************************************************************************/
+
+void ai_watch_light_start(void);
 
 /****************************************************************************
  * Name: ai_watch_light_present

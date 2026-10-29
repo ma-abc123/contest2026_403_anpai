@@ -32,7 +32,7 @@ MODULE    = $(CONFIG_EXAMPLES_AI_WATCH)
 
 MAINSRC = ai_watch_main.c
 CSRCS   = ai_watch_icons.c ai_watch_ble.c ai_watch_motion.c \
-          ai_watch_light.c \
+          ai_watch_light.c ai_watch_battery.c \
           fonts/ai_watch_font_cjk_16.c
 
 include $(APPDIR)/Application.mk
