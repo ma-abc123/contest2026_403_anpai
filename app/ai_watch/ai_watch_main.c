@@ -49,6 +49,7 @@
 #include "ai_watch_light.h"
 #include "ai_watch_battery.h"
 #include "ai_watch_skill.h"
+#include "ai_watch_shot.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -4432,6 +4433,12 @@ int main(int argc, FAR char *argv[])
   printf("LVGL initialized, display ready after %d attempt(s)\n",
          init_retry + 1);
 
+  /* Screen dump hook. The display buffer holds a full frame in this
+   * configuration, so a dump is a copy of what LVGL already rendered.
+   */
+
+  ai_watch_shot_init(result.disp);
+
   /* Touch may not be registered yet — try now, poll later if not */
 
   watch.touch_indev = NULL;
@@ -4622,6 +4629,12 @@ int main(int argc, FAR char *argv[])
       ai_watch_battery_update(&watch);
 
       idle = lv_timer_handler();
+
+      /* Consume a console keystroke, if any. Placed after the LVGL pass so
+       * a dump always captures a fully rendered frame.
+       */
+
+      ai_watch_shot_poll();
 
       if (idle == 0 || idle > AI_WATCH_BUTTON_POLL_MS)
         {
