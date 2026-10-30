@@ -99,7 +99,6 @@ static uint32_t g_ptr_release_ms;
 
 static void shot_ptr_read(FAR lv_indev_t *indev, FAR lv_indev_data_t *data)
 {
-  static uint32_t last_report;
   uint32_t now = lv_tick_get();
 
   /* Honour a pending short-press hold before reporting the release. */
@@ -118,16 +117,20 @@ static void shot_ptr_read(FAR lv_indev_t *indev, FAR lv_indev_data_t *data)
   data->state = g_ptr_down ? LV_INDEV_STATE_PRESSED
                            : LV_INDEV_STATE_RELEASED;
 
-  /* Rate-limited trace: proves LVGL is actually polling this device
-   * without flooding the console.
+  /* Trace on state edges only: shows whether LVGL ever observes the
+   * press, without flooding the console once polling is healthy.
    */
 
-  if (g_ptr_down && (uint32_t)(now - last_report) > 500u)
-    {
-      last_report = now;
-      printf("[INDEV] polled pressed at %u,%u\n",
-             (unsigned)g_ptr_x, (unsigned)g_ptr_y);
-    }
+  {
+    static uint8_t prev_state;
+
+    if ((uint8_t)data->state != prev_state)
+      {
+        prev_state = (uint8_t)data->state;
+        printf("[INDEV] state=%d at %u,%u\n", (int)data->state,
+               (unsigned)g_ptr_x, (unsigned)g_ptr_y);
+      }
+  }
 }
 
 static void shot_ptr_apply(FAR const uint8_t *buf)
@@ -377,6 +380,13 @@ int ai_watch_shot_init(FAR lv_display_t *disp)
 
   if (g_ptr_indev != NULL)
     {
+      /* Bind explicitly: lv_indev_read() bails out early when indev->disp
+       * is NULL, and lv_indev_create() only fills it from the *default*
+       * display. A self-created display need not be the default, in which
+       * case the device would be silently parked and never polled.
+       */
+
+      lv_indev_set_display(g_ptr_indev, disp);
       lv_indev_set_type(g_ptr_indev, LV_INDEV_TYPE_POINTER);
       lv_indev_set_read_cb(g_ptr_indev, shot_ptr_read);
     }

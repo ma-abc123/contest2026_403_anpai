@@ -2206,6 +2206,21 @@ static void ai_watch_skill_poll_ui(FAR struct ai_watch_s *watch)
 }
 
 #if AI_WATCH_HEADLESS
+/* LVGL's time base. lv_nuttx_init normally installs this; skipping that
+ * init would leave lv_tick_get() returning a counter that never advances,
+ * which silently stops every timer -- input polling and rendering
+ * included. This is the whole reason headless mode needs its own source.
+ */
+
+static uint32_t ai_watch_headless_tick(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint32_t)((uint32_t)ts.tv_sec * 1000u +
+                    (uint32_t)(ts.tv_nsec / 1000000));
+}
+
 /* Nothing is displayed: mark the frame done at once so LVGL keeps
  * rendering at full speed instead of waiting on absent hardware.
  */
@@ -4504,6 +4519,8 @@ int main(int argc, FAR char *argv[])
    * the LCD, so no putarea() timeout can stall the UI.
    */
 
+  lv_tick_set_cb(ai_watch_headless_tick);
+
   result.disp = lv_display_create(390, 450);
 
   if (result.disp != NULL)
@@ -4572,6 +4589,13 @@ int main(int argc, FAR char *argv[])
   watch.touch_available = false;
   watch.touch_poll_remaining = 30;  /* poll for up to 30s */
 
+#if !AI_WATCH_HEADLESS
+  /* The panel's own touch controller. Skipped entirely in headless mode:
+   * /dev/input0 can still exist there (the driver registers it even when
+   * the hardware is gone), and binding that dead device would shadow the
+   * host pointer below.
+   */
+
   if (access("/dev/input0", F_OK) == 0)
     {
       watch.touch_indev =
@@ -4584,6 +4608,9 @@ int main(int argc, FAR char *argv[])
           printf("Touch input initialized\n");
         }
     }
+#else
+  printf("Headless mode: panel touch skipped\n");
+#endif
 
   if (!watch.touch_available)
     {
