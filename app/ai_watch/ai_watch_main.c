@@ -1938,6 +1938,18 @@ static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch)
 #define AI_WATCH_ALERT_WIDTH        358
 #define AI_WATCH_BRIEF_WIDTH        380
 
+/* Headless mode: render into the LVGL buffer and never touch the panel.
+ *
+ * With the panel physically disconnected, every flush still goes through
+ * the LCD driver's putarea(), which waits for hardware that is not there
+ * and times out -- the UI crawls to one frame every several seconds. The
+ * screen dump only needs the rendered buffer, so skip the panel entirely.
+ *
+ * Set to 0 once a working panel is connected again.
+ */
+
+#define AI_WATCH_HEADLESS           1
+
 struct ai_alert_ui_s
 {
   FAR lv_obj_t *panel;
@@ -2192,6 +2204,21 @@ static void ai_watch_skill_poll_ui(FAR struct ai_watch_s *watch)
       ai_watch_alert_show(watch, &alert);
     }
 }
+
+#if AI_WATCH_HEADLESS
+/* Nothing is displayed: mark the frame done at once so LVGL keeps
+ * rendering at full speed instead of waiting on absent hardware.
+ */
+
+static void ai_watch_headless_flush(FAR lv_display_t *disp,
+                                    FAR const lv_area_t *area,
+                                    FAR uint8_t *px_map)
+{
+  LV_UNUSED(area);
+  LV_UNUSED(px_map);
+  lv_display_flush_ready(disp);
+}
+#endif
 
 /****************************************************************************
  * Private Functions - Touch probe overlay
@@ -4466,6 +4493,40 @@ int main(int argc, FAR char *argv[])
     }
 
   lv_init();
+
+  int init_retry = 0;
+
+  LV_UNUSED(info);
+
+#if AI_WATCH_HEADLESS
+  /* Render-only display: a full-frame RGB565 buffer plus a flush callback
+   * that immediately reports the transfer as done. Nothing is written to
+   * the LCD, so no putarea() timeout can stall the UI.
+   */
+
+  result.disp = lv_display_create(390, 450);
+
+  if (result.disp != NULL)
+    {
+      size_t buf_size = 390 * 450 * 2;
+      FAR void *fbuf = lv_malloc(buf_size);
+
+      if (fbuf != NULL)
+        {
+          lv_display_set_color_format(result.disp, LV_COLOR_FORMAT_RGB565);
+          lv_display_set_buffers(result.disp, fbuf, NULL, buf_size,
+                                 LV_DISPLAY_RENDER_MODE_FULL);
+          lv_display_set_flush_cb(result.disp, ai_watch_headless_flush);
+          printf("Headless display: 390x450 RGB565, no panel writes\n");
+        }
+      else
+        {
+          printf("ERROR: headless frame buffer alloc failed\n");
+          result.disp = NULL;
+        }
+    }
+
+#else
   lv_nuttx_dsc_init(&info);
 
   info.fb_path = "/dev/lcd0";
@@ -4474,8 +4535,6 @@ int main(int argc, FAR char *argv[])
   /* Retry lv_nuttx_init — the driver may still be completing
    * the first DMA transfer when /dev/lcd0 first becomes openable.
    */
-
-  int init_retry;
 
   for (init_retry = 0; ; init_retry++)
     {
@@ -4496,6 +4555,7 @@ int main(int argc, FAR char *argv[])
       info.fb_path = "/dev/lcd0";
       info.input_path = NULL;
     }
+#endif /* AI_WATCH_HEADLESS */
 
   printf("LVGL initialized, display ready after %d attempt(s)\n",
          init_retry + 1);
