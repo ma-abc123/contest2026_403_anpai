@@ -48,6 +48,7 @@
 #include "ai_watch_motion.h"
 #include "ai_watch_light.h"
 #include "ai_watch_battery.h"
+#include "ai_watch_skill.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -72,7 +73,8 @@
 #define AI_WATCH_PAGE_HOME          0
 #define AI_WATCH_PAGE_APP_LIST      1
 #define AI_WATCH_PAGE_SETTINGS      2
-#define AI_WATCH_PAGE_FIXED_COUNT   3
+#define AI_WATCH_PAGE_BRIEF         3
+#define AI_WATCH_PAGE_FIXED_COUNT   4
 
 /* App base page ID (dynamic pages start here) */
 
@@ -123,6 +125,9 @@
 
 #define AI_WATCH_ALERT_TYPE_FALL       0x81
 #define AI_WATCH_ALERT_TYPE_FALL_INFO  0x82
+#define AI_WATCH_ALERT_TYPE_SKILL_SIT  0x83
+#define AI_WATCH_ALERT_TYPE_SKILL_GOAL 0x84
+#define AI_WATCH_ALERT_TYPE_SKILL_BRIEF 0x85
 
 /****************************************************************************
  * Private Types
@@ -1930,6 +1935,7 @@ static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch)
 
 #define AI_WATCH_ALERT_SHOW_MS      6000
 #define AI_WATCH_ALERT_WIDTH        358
+#define AI_WATCH_BRIEF_WIDTH        380
 
 struct ai_alert_ui_s
 {
@@ -2046,6 +2052,18 @@ static void ai_watch_alert_show(FAR struct ai_watch_s *watch,
     {
       type_text = LV_SYMBOL_OK "  Fall info";
     }
+  else if (a->type == AI_WATCH_ALERT_TYPE_SKILL_SIT)
+    {
+      type_text = LV_SYMBOL_BELL "  \xe4\xb9\x85\xe5\x9d\x90\xe6\x8f\x90\xe9\x86\x92";
+    }
+  else if (a->type == AI_WATCH_ALERT_TYPE_SKILL_GOAL)
+    {
+      type_text = LV_SYMBOL_OK "  \xe7\x9b\xae\xe6\xa0\x87\xe8\xbe\xbe\xe6\x88\x90";
+    }
+  else if (a->type == AI_WATCH_ALERT_TYPE_SKILL_BRIEF)
+    {
+      type_text = LV_SYMBOL_EDIT "  \xe6\xaf\x8f\xe6\x97\xa5\xe7\xae\x80\xe6\x8a\xa5";
+    }
   else
     {
       type_text = LV_SYMBOL_BELL "  Reminder";
@@ -2072,6 +2090,106 @@ static void ai_watch_alert_show(FAR struct ai_watch_s *watch,
   g_alert_ui.hide_timer = lv_timer_create(ai_watch_alert_timeout_cb,
                                           AI_WATCH_ALERT_SHOW_MS, NULL);
   lv_timer_set_repeat_count(g_alert_ui.hide_timer, 1);
+}
+
+/****************************************************************************
+ * Name: ai_watch_skill_poll_ui
+ *
+ * Description:
+ *   Drain the device-skill event queue and surface each event as an alert
+ *   banner. Skill text is generated here, on the main thread, so the skill
+ *   worker never has to format CJK strings or know about LVGL.
+ *
+ *   The daily brief posts a structured event upward so the phone can add
+ *   one sentence of commentary; the banner shows the local summary right
+ *   away and is replaced by the phone text through DAILY_BRIEF when it
+ *   arrives. With no phone the local summary stands on its own.
+ *
+ ****************************************************************************/
+
+static void ai_watch_skill_poll_ui(FAR struct ai_watch_s *watch)
+{
+  struct ai_watch_skill_event_s ev;
+
+  while (ai_watch_skill_poll(&ev))
+    {
+      struct ai_watch_ble_alert_s alert;
+
+      memset(&alert, 0, sizeof(alert));
+      alert.timestamp = (uint32_t)time(NULL);
+
+      switch (ev.type)
+        {
+          /* Titles are capped by AI_WATCH_REMINDER_TITLE_MAX (24 bytes),
+           * which is 8 CJK glyphs. Every string below stays within that
+           * budget including its terminator, so snprintf never truncates
+           * mid-glyph and produces a broken frame.
+           */
+
+          case AI_WATCH_SKILL_EVENT_SIT:
+            {
+              unsigned mins = (unsigned)(ev.sit_ms / 60000u);
+
+              alert.type = AI_WATCH_ALERT_TYPE_SKILL_SIT;
+              snprintf(alert.title, sizeof(alert.title),
+                       "\xe5\xb7\xb2\xe4\xb9\x85\xe5\x9d\x90%u"
+                       "\xe5\x88\x86\xe9\x92\x9f\xe4\xba\x86",
+                       mins > 0 ? mins : 1u);
+            }
+            break;
+
+          case AI_WATCH_SKILL_EVENT_GOAL:
+            {
+              unsigned steps = (unsigned)ev.steps;
+
+              alert.type = AI_WATCH_ALERT_TYPE_SKILL_GOAL;
+              if (steps <= 9999u)
+                {
+                  snprintf(alert.title, sizeof(alert.title),
+                           "\xe7\x9b\xae\xe6\xa0\x87\xe8\xbe\xbe\xe6\x88\x90"
+                           "\xef\xbc\x8c%u\xe6\xad\xa5",
+                           steps);
+                }
+              else
+                {
+                  snprintf(alert.title, sizeof(alert.title),
+                           "\xe7\x9b\xae\xe6\xa0\x87\xe8\xbe\xbe\xe6\x88\x90");
+                }
+            }
+            break;
+
+          case AI_WATCH_SKILL_EVENT_BRIEF:
+            {
+              unsigned steps = (unsigned)ev.steps;
+
+              /* "看简报 99999 步": 8 glyphs at most, but the digits are
+               * the variable part. Over ~9999 steps the count alone would
+               * push past 24 bytes, so the wording drops to the action
+               * alone -- a truncated number reads worse than none.
+               */
+
+              alert.type = AI_WATCH_ALERT_TYPE_SKILL_BRIEF;
+              if (steps <= 9999u)
+                {
+                  snprintf(alert.title, sizeof(alert.title),
+                           "\xe7\x9c\x8b\xe7\xae\x80\xe6\x8a\xa5%u\xe6\xad\xa5",
+                           steps);
+                }
+              else
+                {
+                  snprintf(alert.title, sizeof(alert.title),
+                           "\xe7\xae\x80\xe6\x8a\xa5\xe5\xb7\xb2\xe7\x94\x9f\xe6\x88\x90"
+                           "\xe8\xaf\xb7\xe5\xb7\xa6\xe6\xbb\x91");
+                }
+            }
+            break;
+
+          default:
+            continue;
+        }
+
+      ai_watch_alert_show(watch, &alert);
+    }
 }
 
 /****************************************************************************
@@ -2889,6 +3007,289 @@ static void ai_watch_create_settings_page(FAR struct ai_watch_s *watch)
 }
 
 /****************************************************************************
+ * Private Functions - Brief Page ("AI negative screen")
+ *
+ * The page reachable by swiping left from the watchface. Everything on it
+ * is either local (counters from the motion service, pending reminders
+ * from the BLE store) or synced from the phone (weather and one sentence
+ * of commentary). With no phone the local half still renders, so the page
+ * is never empty.
+ ****************************************************************************/
+
+struct ai_watch_brief_ui_s
+{
+  FAR lv_obj_t *screen;
+  FAR lv_obj_t *steps_val;
+  FAR lv_obj_t *active_val;
+  FAR lv_obj_t *falls_val;
+  FAR lv_obj_t *weather_val;
+  FAR lv_obj_t *comment_val;
+  FAR lv_obj_t *reminder_box;
+  FAR lv_obj_t *empty_hint;
+};
+
+static struct ai_watch_brief_ui_s g_brief_ui;
+
+static FAR const char *ai_watch_weather_text(uint8_t code)
+{
+  switch (code)
+    {
+      case AI_WATCH_WEATHER_CLEAR:    return "晴";
+      case AI_WATCH_WEATHER_CLOUDY:   return "多云";
+      case AI_WATCH_WEATHER_OVERCAST: return "阴";
+      case AI_WATCH_WEATHER_RAIN:     return "雨";
+      case AI_WATCH_WEATHER_SNOW:     return "雪";
+      case AI_WATCH_WEATHER_FOG:      return "雾";
+      default:                        return NULL;
+    }
+}
+
+/* Rebuild the reminder lines. Only future-dated ones count as "not yet
+ * fired"; the ones already alerted live in the Reminder app instead.
+ */
+
+#define AI_WATCH_BRIEF_REMINDERS_MAX 3
+
+static void ai_watch_brief_refresh_reminders(FAR struct ai_watch_s *watch,
+                                             int theme)
+{
+  FAR struct ai_watch_reminder_store_s *store = ai_watch_ble_get_reminders();
+  time_t now = time(NULL);
+  int shown = 0;
+  int i;
+
+  if (g_brief_ui.reminder_box == NULL)
+    {
+      return;
+    }
+
+  lv_obj_clean(g_brief_ui.reminder_box);
+
+  for (i = 0; i < AI_WATCH_REMINDER_MAX && shown < AI_WATCH_BRIEF_REMINDERS_MAX;
+       i++)
+    {
+      FAR struct ai_watch_reminder_s *r = &store->items[i];
+      FAR lv_obj_t *row;
+
+      if (r->id == 0 || r->due_alerted)
+        {
+          continue;
+        }
+
+      if (r->timestamp != 0 && (time_t)r->timestamp <= now)
+        {
+          continue;
+        }
+
+      row = lv_label_create(g_brief_ui.reminder_box);
+      lv_label_set_long_mode(row, LV_LABEL_LONG_DOT);
+      lv_obj_set_width(row, AI_WATCH_BRIEF_WIDTH - 48);
+      lv_label_set_text_fmt(row, LV_SYMBOL_BELL " %s", r->title);
+      lv_obj_set_style_text_font(row, &ai_watch_font_cjk_16, 0);
+      lv_obj_set_style_text_color(row, ai_watch_theme_text(theme), 0);
+      shown++;
+    }
+
+  if (shown == 0)
+    {
+      FAR lv_obj_t *row = lv_label_create(g_brief_ui.reminder_box);
+
+      lv_label_set_text(row, "暂无待办提醒");
+      lv_obj_set_style_text_font(row, &ai_watch_font_cjk_16, 0);
+      lv_obj_set_style_text_color(row, ai_watch_theme_secondary(theme), 0);
+    }
+}
+
+static void ai_watch_brief_refresh(FAR struct ai_watch_s *watch)
+{
+  struct ai_watch_motion_snapshot_s snap;
+  FAR struct ai_watch_brief_s *b = ai_watch_ble_get_brief();
+  int theme = watch->current_theme;
+  char buf[64];
+
+  if (g_brief_ui.screen == NULL)
+    {
+      return;
+    }
+
+  ai_watch_motion_get_snapshot(&snap);
+
+  /* Local counters win: they are live, the phone's copy is a snapshot
+   * taken when it built the brief.
+   */
+
+  if (g_brief_ui.steps_val != NULL)
+    {
+      snprintf(buf, sizeof(buf), "%lu", (unsigned long)snap.steps_today);
+      lv_label_set_text(g_brief_ui.steps_val, buf);
+    }
+
+  if (g_brief_ui.active_val != NULL)
+    {
+      snprintf(buf, sizeof(buf), "%lu", (unsigned long)(snap.active_ms_today / 60000u));
+      lv_label_set_text(g_brief_ui.active_val, buf);
+    }
+
+  if (g_brief_ui.falls_val != NULL)
+    {
+      snprintf(buf, sizeof(buf), "%u", (unsigned)snap.fall_today);
+      lv_label_set_text(g_brief_ui.falls_val, buf);
+    }
+
+  if (g_brief_ui.weather_val != NULL)
+    {
+      FAR const char *w = ai_watch_weather_text(b->weather);
+
+      if (b->valid && w != NULL)
+        {
+          snprintf(buf, sizeof(buf), "%s %d°C", w, (int)b->temp_c);
+          lv_label_set_text(g_brief_ui.weather_val, buf);
+          lv_obj_clear_flag(g_brief_ui.weather_val, LV_OBJ_FLAG_HIDDEN);
+        }
+      else
+        {
+          lv_obj_add_flag(g_brief_ui.weather_val, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+  if (g_brief_ui.comment_val != NULL)
+    {
+      if (b->valid && b->text[0] != '\0')
+        {
+          lv_label_set_text(g_brief_ui.comment_val, b->text);
+        }
+      else
+        {
+          lv_label_set_text(g_brief_ui.comment_val,
+                            "连接手机后可生成 AI 点评");
+        }
+    }
+
+  ai_watch_brief_refresh_reminders(watch, theme);
+
+  b->pending = false;
+}
+
+static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
+{
+  FAR lv_obj_t *screen = lv_obj_create(NULL);
+  FAR lv_obj_t *title;
+  FAR lv_obj_t *hint;
+  FAR lv_obj_t *stats;
+  FAR lv_obj_t *col;
+  int theme = watch->current_theme;
+
+  lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+  watch->fixed_pages[AI_WATCH_PAGE_BRIEF] = screen;
+  g_brief_ui.screen = screen;
+
+  title = lv_label_create(screen);
+  lv_label_set_text(title, "每日简报");
+  lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(title, &ai_watch_font_cjk_16, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 12);
+
+  g_brief_ui.weather_val = lv_label_create(screen);
+  lv_label_set_text(g_brief_ui.weather_val, "");
+  lv_obj_set_style_text_color(g_brief_ui.weather_val,
+                              ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(g_brief_ui.weather_val, &ai_watch_font_cjk_16, 0);
+  lv_obj_align(g_brief_ui.weather_val, LV_ALIGN_TOP_RIGHT, -20, 12);
+
+  /* Three counters side by side */
+
+  stats = lv_obj_create(screen);
+  lv_obj_set_size(stats, AI_WATCH_BRIEF_WIDTH, 92);
+  lv_obj_align(stats, LV_ALIGN_TOP_MID, 0, 46);
+  lv_obj_set_style_bg_opa(stats, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(stats, 0, 0);
+  lv_obj_set_style_radius(stats, 0, 0);
+  lv_obj_set_style_pad_all(stats, 0, 0);
+  lv_obj_clear_flag(stats, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(stats, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(stats, LV_FLEX_ALIGN_SPACE_EVENLY,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  {
+    static const char *names[3] = { "步数", "活动", "跌倒" };
+    FAR lv_obj_t **slots[3] =
+      {
+        &g_brief_ui.steps_val,
+        &g_brief_ui.active_val,
+        &g_brief_ui.falls_val
+      };
+    int k;
+
+    for (k = 0; k < 3; k++)
+      {
+        FAR lv_obj_t *unit;
+
+        col = lv_obj_create(stats);
+        lv_obj_set_size(col, (AI_WATCH_BRIEF_WIDTH - 24) / 3, 84);
+        lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(col, 0, 0);
+        lv_obj_set_style_pad_all(col, 0, 0);
+        lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        *slots[k] = lv_label_create(col);
+        lv_label_set_text(*slots[k], "--");
+        lv_obj_set_style_text_color(*slots[k], ai_watch_theme_accent(theme), 0);
+        lv_obj_set_style_text_font(*slots[k], &lv_font_montserrat_24, 0);
+
+        unit = lv_label_create(col);
+        lv_label_set_text(unit, names[k]);
+        lv_obj_set_style_text_color(unit, ai_watch_theme_secondary(theme), 0);
+        lv_obj_set_style_text_font(unit, &ai_watch_font_cjk_16, 0);
+      }
+  }
+
+  /* Pending reminders */
+
+  {
+    FAR lv_obj_t *head = lv_label_create(screen);
+
+    lv_label_set_text(head, "待办");
+    lv_obj_set_style_text_color(head, ai_watch_theme_secondary(theme), 0);
+    lv_obj_set_style_text_font(head, &ai_watch_font_cjk_16, 0);
+    lv_obj_align(head, LV_ALIGN_TOP_LEFT, 20, 146);
+  }
+
+  g_brief_ui.reminder_box = lv_obj_create(screen);
+  lv_obj_set_size(g_brief_ui.reminder_box, AI_WATCH_BRIEF_WIDTH, 96);
+  lv_obj_align(g_brief_ui.reminder_box, LV_ALIGN_TOP_MID, 0, 172);
+  lv_obj_set_style_bg_opa(g_brief_ui.reminder_box, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(g_brief_ui.reminder_box, 0, 0);
+  lv_obj_set_style_radius(g_brief_ui.reminder_box, 0, 0);
+  lv_obj_set_style_pad_all(g_brief_ui.reminder_box, 0, 0);
+  lv_obj_set_style_pad_row(g_brief_ui.reminder_box, 6, 0);
+  lv_obj_set_flex_flow(g_brief_ui.reminder_box, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(g_brief_ui.reminder_box, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+  /* AI commentary */
+
+  g_brief_ui.comment_val = lv_label_create(screen);
+  lv_label_set_long_mode(g_brief_ui.comment_val, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_brief_ui.comment_val, AI_WATCH_BRIEF_WIDTH);
+  lv_label_set_text(g_brief_ui.comment_val, "连接手机后可生成 AI 点评");
+  lv_obj_set_style_text_color(g_brief_ui.comment_val,
+                              ai_watch_theme_text(theme), 0);
+  lv_obj_set_style_text_font(g_brief_ui.comment_val,
+                             &ai_watch_font_cjk_16, 0);
+  lv_obj_align(g_brief_ui.comment_val, LV_ALIGN_TOP_MID, 0, 280);
+
+  hint = lv_label_create(screen);
+  lv_label_set_text(hint, LV_SYMBOL_RIGHT " 返回 (KEY2)");
+  lv_obj_set_style_text_color(hint, ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_text_font(hint, &ai_watch_font_cjk_16, 0);
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+/****************************************************************************
  * Private Functions - Home Page (Digital Watchface)
  ****************************************************************************/
 
@@ -3497,6 +3898,7 @@ static void ai_watch_create_ui(FAR struct ai_watch_s *watch)
   ai_watch_create_home_page(watch);
   ai_watch_create_app_list_page(watch);
   ai_watch_create_settings_page(watch);
+  ai_watch_create_brief_page(watch);
 
   lv_scr_load_anim(watch->fixed_pages[AI_WATCH_PAGE_HOME],
                    LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
@@ -3870,6 +4272,18 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
                   ai_watch_push_page(watch, AI_WATCH_PAGE_APP_LIST);
                 }
             }
+          else if (abs(dx) > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
+            {
+              /* Swipe left opens the brief; refresh first so the page
+               * shows counters as of now rather than as of creation.
+               */
+
+              if (dx < 0)
+                {
+                  ai_watch_brief_refresh(watch);
+                  ai_watch_push_page(watch, AI_WATCH_PAGE_BRIEF);
+                }
+            }
           else if (abs(dx) < AI_WATCH_SWIPE_THRESHOLD &&
                    abs(dy) < AI_WATCH_SWIPE_THRESHOLD)
             {
@@ -4055,6 +4469,13 @@ int main(int argc, FAR char *argv[])
 
   ai_watch_motion_init();
 
+  /* Device-side skills: sit reminder, step-goal cheer and the daily
+   * brief slot. They read the motion snapshot and post events to the
+   * loop below; nothing here talks to BLE by itself.
+   */
+
+  ai_watch_skill_init(0);
+
   ai_watch_ble_init();
   ai_watch_update_bt_label(&watch);
 
@@ -4172,8 +4593,25 @@ int main(int argc, FAR char *argv[])
       ai_watch_motion_process();
       ai_watch_fall_poll(&watch);
 
+      /* Device skills: surface whatever the skill worker posted. These
+       * arrive as ordinary alert banners, so they reuse the existing
+       * show/hide lifecycle instead of adding a second overlay.
+       */
+
+      ai_watch_skill_poll_ui(&watch);
+
       ai_watch_unread_update(&watch);
       ai_watch_settings_poll(&watch);
+
+      /* A brief that lands while the page is open updates in place;
+       * otherwise it is picked up by the refresh on entry.
+       */
+
+      if (watch.current_page == AI_WATCH_PAGE_BRIEF &&
+          ai_watch_ble_get_brief()->pending)
+        {
+          ai_watch_brief_refresh(&watch);
+        }
 
       /* Panel writes happen here, on the same thread that runs the LVGL
        * flush, never from the sensor worker.

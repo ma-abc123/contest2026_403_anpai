@@ -93,6 +93,7 @@ static uint32_t g_last_sync_utc;        /* UTC of last accepted sync */
 
 static struct ai_watch_ai_result_s g_ai_result;
 static struct ai_watch_ai_timer_req_s g_ai_timer_req;
+static struct ai_watch_brief_s g_brief;
 
 /* Arrivals waiting to be surfaced as the UI alert banner */
 
@@ -564,6 +565,66 @@ static bool ai_ble_cmd_ai_timer(FAR const uint8_t *data, size_t len)
   return true;
 }
 
+/* Daily brief pushed by the phone. Payload after [version][cmd]:
+ *   steps(4 LE) active_min(2 LE) falls(1) weather(1) temp_c(1)
+ *   text_len(1) text(text_len)
+ * The comment is optional: an empty frame body is valid and simply
+ * refreshes the counters the phone has.
+ */
+
+static bool ai_ble_cmd_daily_brief(FAR const uint8_t *data, size_t len)
+{
+  struct ai_watch_brief_s *b = &g_brief;
+  size_t text_len;
+
+  if (len < AI_WATCH_BRIEF_HDR_LEN)
+    {
+      printf("BLE: daily_brief too short (%u)\n", (unsigned int)len);
+      return false;
+    }
+
+  text_len = data[AI_WATCH_BRIEF_HDR_LEN - 1];
+  if (len < AI_WATCH_BRIEF_HDR_LEN + text_len)
+    {
+      printf("BLE: daily_brief text truncated\n");
+      text_len = len - AI_WATCH_BRIEF_HDR_LEN;
+    }
+
+  if (text_len >= sizeof(b->text))
+    {
+      text_len = sizeof(b->text) - 1;
+    }
+
+  b->steps      = (uint32_t)data[2] |
+                  ((uint32_t)data[3] << 8) |
+                  ((uint32_t)data[4] << 16) |
+                  ((uint32_t)data[5] << 24);
+  b->active_min = (uint16_t)(data[6] | (data[7] << 8));
+  b->falls      = data[8];
+  b->weather    = data[9];
+  b->temp_c     = (int8_t)data[10];
+
+  memcpy(b->text, &data[AI_WATCH_BRIEF_HDR_LEN], text_len);
+  b->text[text_len] = '\0';
+
+  /* Strip a trailing newline some JSON clients leave behind */
+
+  while (text_len > 0 &&
+         (b->text[text_len - 1] == '\n' || b->text[text_len - 1] == '\r'))
+    {
+      b->text[--text_len] = '\0';
+    }
+
+  b->valid   = true;
+  b->pending = true;
+
+  printf("BLE: daily_brief %lu steps, %u min, %u falls, w=%u %dC \"%s\"\n",
+         (unsigned long)b->steps, (unsigned)b->active_min,
+         (unsigned)b->falls, (unsigned)b->weather, (int)b->temp_c,
+         b->text);
+  return true;
+}
+
 static bool ai_ble_parse_command(FAR const uint8_t *data, size_t len)
 {
   if (len < 2)
@@ -589,6 +650,9 @@ static bool ai_ble_parse_command(FAR const uint8_t *data, size_t len)
 
       case AI_WATCH_BLE_CMD_AI_TIMER:
         return ai_ble_cmd_ai_timer(data, len);
+
+      case AI_WATCH_BLE_CMD_DAILY_BRIEF:
+        return ai_ble_cmd_daily_brief(data, len);
 
       case AI_WATCH_BLE_CMD_CLEAR:
         memset(&g_reminders, 0, sizeof(g_reminders));
@@ -1136,6 +1200,11 @@ int ai_watch_ble_send_ai_trigger(uint8_t source,
 FAR struct ai_watch_ai_result_s *ai_watch_ble_get_ai_result(void)
 {
   return &g_ai_result;
+}
+
+FAR struct ai_watch_brief_s *ai_watch_ble_get_brief(void)
+{
+  return &g_brief;
 }
 
 /****************************************************************************

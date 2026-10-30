@@ -119,6 +119,28 @@
 #define AI_WATCH_BLE_CMD_AI_TEXT        0x04  /* AI result text in title */
 #define AI_WATCH_BLE_CMD_AI_TIMER       0x05  /* countdown; timestamp field
                                                * carries duration seconds */
+#define AI_WATCH_BLE_CMD_DAILY_BRIEF    0x06  /* structured daily summary,
+                                               * see struct ai_watch_brief_s */
+
+/* DAILY_BRIEF payload, after [version][cmd]:
+ *   steps(4, LE) active_min(2, LE) falls(1) weather(1) temp_c(1, int8)
+ *   text_len(1) text(N, UTF-8)
+ * The comment is the phone's one-sentence take; the watch renders local
+ * numbers regardless, so a missing or stale brief still shows data.
+ */
+
+#define AI_WATCH_BRIEF_HDR_LEN          12
+#define AI_WATCH_BRIEF_TEXT_MAX         120
+
+/* Weather codes shared with the phone app */
+
+#define AI_WATCH_WEATHER_UNKNOWN        0
+#define AI_WATCH_WEATHER_CLEAR          1
+#define AI_WATCH_WEATHER_CLOUDY         2
+#define AI_WATCH_WEATHER_OVERCAST       3
+#define AI_WATCH_WEATHER_RAIN           4
+#define AI_WATCH_WEATHER_SNOW           5
+#define AI_WATCH_WEATHER_FOG            6
 
 #define AI_WATCH_BLE_CMD_HDR_LEN        9   /* through title_len */
 
@@ -432,5 +454,31 @@ FAR struct ai_watch_ai_result_s *ai_watch_ble_get_ai_result(void);
 
 bool ai_watch_ble_take_ai_timer(
     FAR struct ai_watch_ai_timer_req_s *req);
+
+/****************************************************************************
+ * Name: ai_watch_ble_get_brief
+ *
+ * Description:
+ *   Latest daily brief pushed by the phone (AI_WATCH_BLE_CMD_DAILY_BRIEF).
+ *   The watch shows its own counters either way; this only adds the
+ *   phone's sentence and the synced weather.
+ *
+ *   Check .pending to know a new brief arrived; the reader clears it.
+ *
+ ****************************************************************************/
+
+struct ai_watch_brief_s
+{
+  uint32_t steps;               /* steps the phone saw for that day */
+  uint16_t active_min;          /* active minutes */
+  uint8_t  falls;               /* suspected falls that day */
+  uint8_t  weather;             /* AI_WATCH_WEATHER_* */
+  int8_t   temp_c;              /* degrees Celsius */
+  char     text[AI_WATCH_BRIEF_TEXT_MAX];  /* phone commentary, 0 = none */
+  bool     valid;               /* a brief has been received */
+  bool     pending;             /* new since last read */
+};
+
+FAR struct ai_watch_brief_s *ai_watch_ble_get_brief(void);
 
 #endif /* __APPS_AI_WATCH_AI_WATCH_BLE_H */

@@ -87,6 +87,8 @@ struct ai_watch_motion_snapshot_s
 {
   uint32_t steps_today;         /* peak-detected step count */
   uint32_t distance_m;          /* steps * stride estimate */
+  uint32_t active_ms_today;     /* ms classified as walking or running */
+  uint16_t fall_today;          /* suspected falls confirmed today */
   uint8_t  activity;            /* AI_WATCH_MOTION_* (debounced) */
   uint8_t  activity_confident;  /* bool: enough samples classified */
   uint16_t activity_std_mg;     /* current 2 s window std dev */

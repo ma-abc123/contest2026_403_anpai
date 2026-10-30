@@ -181,6 +181,19 @@ struct motion_state_s
 
 static struct motion_state_s g_motion;
 
+/* Last sample timestamp counted as "moving"; reset when the classifier
+ * reports rest so only genuine motion accumulates active time.
+ */
+
+static uint32_t g_active_last_ms;
+
+/* Local day-of-year used to clear the daily counters, -1 until the wall
+ * clock has been observed at least once.
+ */
+
+static int      g_day_key = -1;
+static uint32_t g_day_check_ms;
+
 /* BLE upload pacing (main loop only) */
 
 static uint32_t g_steps_sent;
@@ -704,12 +717,75 @@ static FAR void *motion_thread(FAR void *arg)
               snap->fall_pending = 0;
               snap->fall_state = FALL_STATE_NORMAL;
               cooldown_until = now + FALL_COOLDOWN_MS;
+
+              /* Count only real detections. A fall started from the test
+               * button must not inflate the daily tally shown on the
+               * negative screen.
+               */
+
+              if (event == AI_WATCH_FALL_CONFIRMED &&
+                  snap->fall_today < UINT16_MAX)
+                {
+                  snap->fall_today++;
+                }
+
               motion_fall_push_locked(event,
                                       snap->fall_impact_mg,
                                       snap->fall_angle_deg);
               snap->fall_test = false;
             }
           break;
+        }
+
+      /* Active time: charge the interval since the previous sample to the
+       * day's total while the debounced classifier says the wearer is
+       * moving. Using the real delta (not the nominal period) keeps the
+       * figure honest despite the byte-wise read jitter.
+       */
+
+      if (snap->activity == AI_WATCH_MOTION_WALK ||
+          snap->activity == AI_WATCH_MOTION_RUN)
+        {
+          if (g_active_last_ms != 0 && now > g_active_last_ms)
+            {
+              snap->active_ms_today += (now - g_active_last_ms);
+            }
+
+          g_active_last_ms = now;
+        }
+      else
+        {
+          g_active_last_ms = 0;
+        }
+
+      /* Day rollover: steps / distance / active time / fall tally are all
+       * "today" figures, so they are cleared when the local date changes.
+       * Skipped until the clock is set (year >= 2024), otherwise the boot
+       * time jump to 1970 would clear the counters spuriously.
+       */
+
+      if (now - g_day_check_ms >= 60000u)
+        {
+          time_t wall = time(NULL);
+          struct tm tm;
+
+          g_day_check_ms = now;
+
+          localtime_r(&wall, &tm);
+          if (tm.tm_year + 1900 >= 2024)
+            {
+              if (g_day_key >= 0 && tm.tm_yday != g_day_key)
+                {
+                  snap->steps_today = 0;
+                  snap->distance_m = 0;
+                  snap->active_ms_today = 0;
+                  snap->fall_today = 0;
+                  g_active_last_ms = 0;
+                  printf("MOTION: local date changed, daily counters reset\n");
+                }
+
+              g_day_key = tm.tm_yday;
+            }
         }
 
       pthread_mutex_unlock(&g_motion.lock);
