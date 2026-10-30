@@ -61,7 +61,7 @@ def read_exact(ser, n, timeout=5.0):
     return bytes(buf)
 
 
-def find_magic(ser):
+def find_magic(ser, sink=None):
     tail = b""
     while True:
         b = ser.read(1)
@@ -70,6 +70,8 @@ def find_magic(ser):
         tail = (tail + b)[-4:]
         if tail == MAGIC:
             return True
+        if sink is not None:
+            sink.write(b)
 
 
 def rle_decode(data, count):
@@ -104,12 +106,12 @@ def rle_decode(data, count):
     return out if o == count else None
 
 
-def grab_frame(ser):
+def grab_frame(ser, sink=None):
     """Request and decode one frame, or return None."""
     ser.write(b"s")
     ser.flush()
 
-    if not find_magic(ser):
+    if not find_magic(ser, sink):
         return None
 
     body = read_exact(ser, HDR_LEN - 4)
@@ -121,6 +123,11 @@ def grab_frame(ser):
     if w == 0 or h == 0 or stride < w * 2 or length == 0:
         return None
     if length > MAX_PIXELS * 2:
+        return None
+
+    # Sanity bound on the advertised geometry: any console line that
+    # happens to contain the magic must not be mistaken for a frame.
+    if not (64 <= w <= 1024 and 64 <= h <= 1024):
         return None
 
     data = read_exact(ser, length)
@@ -155,8 +162,10 @@ def grab_frame(ser):
 def send_pointer(ser, x, y, down):
     x = max(0, min(PANEL_W - 1, int(x)))
     y = max(0, min(PANEL_H - 1, int(y)))
-    ser.write(b"T" + struct.pack("<HHB", x, y, 1 if down else 0))
+    n = ser.write(b"T" + struct.pack("<HHB", x, y, 1 if down else 0))
     ser.flush()
+    if n != 6:
+        print(f"[TX] short write {n}/6 at {x},{y} down={down}", flush=True)
 
 
 def main():
@@ -200,6 +209,12 @@ def main():
 
     print("窗口已打开：鼠标点击/拖动 = 手表触摸；关窗或 Ctrl-C 退出")
 
+    # Console text interleaved with the frame stream is dropped by the
+    # frame parser; keep it so firmware-side traces are still readable.
+    log_path = "/tmp/aiwatch_console.log"
+    sink = open(log_path, "wb", buffering=0)
+    print(f"固件日志写入 {log_path}")
+
     down = False
     frames = 0
     t0 = time.time()
@@ -213,6 +228,7 @@ def main():
 
                 if e.type == X.ButtonPress:
                     down = True
+                    print(f"[X] press {e.event_x},{e.event_y}", flush=True)
                     send_pointer(ser, e.event_x, e.event_y, True)
 
                 elif e.type == X.MotionNotify:
@@ -221,6 +237,7 @@ def main():
 
                 elif e.type == X.ButtonRelease:
                     down = False
+                    print(f"[X] release {e.event_x},{e.event_y}", flush=True)
                     send_pointer(ser, e.event_x, e.event_y, False)
 
                 elif e.type == X.Expose:
@@ -229,11 +246,21 @@ def main():
                 elif e.type == X.DestroyNotify:
                     raise KeyboardInterrupt
 
-            img = grab_frame(ser)
+            img = grab_frame(ser, sink)
             if img is not None:
                 win.put_pil_image(gc, 0, 0, img)
                 disp.flush()
                 frames += 1
+
+                # Put the frame counter in the title: the watch face has no
+                # moving element while the clock is unsynced, so without
+                # this a healthy stream and a frozen one look identical.
+                if frames % 5 == 0:
+                    try:
+                        win.set_wm_name(f"AI Watch Remote - frame {frames}")
+                        disp.flush()
+                    except Exception:
+                        pass
 
                 if frames % 10 == 0:
                     dt = time.time() - t0

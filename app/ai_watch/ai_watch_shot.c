@@ -280,7 +280,7 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
 
   if (buf == NULL || buf->data == NULL)
     {
-      printf("[SHOT] no active buffer\n");
+      printf("[FRM] no active buffer\n");
       return;
     }
 
@@ -296,7 +296,7 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
 
           if (p == NULL)
             {
-              printf("[SHOT] RLE buffer alloc failed (%u bytes)\n",
+              printf("[FRM] RLE buffer alloc failed (%u bytes)\n",
                      (unsigned)need);
               compress = false;
             }
@@ -343,7 +343,7 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
   shot_write_all(&hdr, sizeof(hdr));
   shot_write_all(payload, payload_len);
 
-  printf("\n[SHOT] %ux%u %s %lu bytes\n",
+  printf("\n[FRM] %ux%u %s %lu bytes\n",
          (unsigned)hdr.w, (unsigned)hdr.h,
          compress ? "rle" : "raw", (unsigned long)payload_len);
 }
@@ -381,7 +381,7 @@ int ai_watch_shot_init(FAR lv_display_t *disp)
       lv_indev_set_read_cb(g_ptr_indev, shot_ptr_read);
     }
 
-  printf("[SHOT] ready: 's' = frame, 'r' = raw, 'T' = remote pointer\n");
+  printf("[FRM] ready: 's' = frame, 'r' = raw, 'T' = remote pointer\n");
   return 0;
 }
 
