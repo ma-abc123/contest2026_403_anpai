@@ -57,12 +57,116 @@ struct shot_hdr_s
  ****************************************************************************/
 
 static FAR lv_display_t *g_shot_disp;
+static FAR lv_indev_t   *g_ptr_indev;
 static FAR uint8_t      *g_rle_buf;
 static size_t            g_rle_cap;
+
+/* Remote pointer. The panel's own touch layer is dead, so input now
+ * arrives from the host over the same UART: 'T' + x(2) + y(2) + state(1),
+ * all little endian. A tiny state machine reassembles it because a
+ * non-blocking read may hand back the frame in pieces.
+ */
+
+#define SHOT_CMD_TOUCH_LEN  6
+
+static uint8_t  g_cmd_buf[SHOT_CMD_TOUCH_LEN];
+static uint8_t  g_cmd_len;
+static uint32_t g_cmd_start_ms;
+static uint16_t g_ptr_x;
+static uint16_t g_ptr_y;
+static uint8_t  g_ptr_down;
+
+/* A partially received pointer frame must not wedge the parser: if the
+ * remaining bytes never arrive, drop what we have and resync on the next
+ * command character.
+ */
+
+#define SHOT_CMD_TIMEOUT_MS 400
+
+/* LVGL samples input every few tens of ms, while a fast click can be down
+ * and up again inside one sample. Hold the press briefly so short taps
+ * are still seen.
+ */
+
+#define SHOT_MIN_PRESS_MS   90
+
+static uint32_t g_ptr_down_ms;
+static uint32_t g_ptr_release_ms;
 
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+static void shot_ptr_read(FAR lv_indev_t *indev, FAR lv_indev_data_t *data)
+{
+  static uint32_t last_report;
+  uint32_t now = lv_tick_get();
+
+  /* Honour a pending short-press hold before reporting the release. */
+
+  if (g_ptr_down && g_ptr_release_ms != 0 &&
+      (int32_t)(now - g_ptr_release_ms) >= 0)
+    {
+      g_ptr_down = 0;
+      g_ptr_release_ms = 0;
+    }
+
+  LV_UNUSED(indev);
+
+  data->point.x = (lv_coord_t)g_ptr_x;
+  data->point.y = (lv_coord_t)g_ptr_y;
+  data->state = g_ptr_down ? LV_INDEV_STATE_PRESSED
+                           : LV_INDEV_STATE_RELEASED;
+
+  /* Rate-limited trace: proves LVGL is actually polling this device
+   * without flooding the console.
+   */
+
+  if (g_ptr_down && (uint32_t)(now - last_report) > 500u)
+    {
+      last_report = now;
+      printf("[INDEV] polled pressed at %u,%u\n",
+             (unsigned)g_ptr_x, (unsigned)g_ptr_y);
+    }
+}
+
+static void shot_ptr_apply(FAR const uint8_t *buf)
+{
+  uint32_t now = lv_tick_get();
+  uint8_t down = buf[5];
+
+  g_ptr_x = (uint16_t)(buf[1] | (buf[2] << 8));
+  g_ptr_y = (uint16_t)(buf[3] | (buf[4] << 8));
+
+  if (down)
+    {
+      g_ptr_down_ms = now;
+      g_ptr_release_ms = 0;
+      g_ptr_down = 1;
+    }
+  else if (g_ptr_down)
+    {
+      uint32_t held = now - g_ptr_down_ms;
+
+      if (held < SHOT_MIN_PRESS_MS)
+        {
+          g_ptr_release_ms = g_ptr_down_ms + SHOT_MIN_PRESS_MS;
+        }
+      else
+        {
+          g_ptr_down = 0;
+          g_ptr_release_ms = 0;
+        }
+    }
+  else
+    {
+      g_ptr_x = (uint16_t)(buf[1] | (buf[2] << 8));
+      g_ptr_y = (uint16_t)(buf[3] | (buf[4] << 8));
+    }
+
+  printf("[PTR] %u,%u %s\n", (unsigned)g_ptr_x, (unsigned)g_ptr_y,
+         down ? "down" : "up");
+}
 
 static void shot_write_all(FAR const void *data, size_t len)
 {
@@ -264,7 +368,20 @@ int ai_watch_shot_init(FAR lv_display_t *disp)
       fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     }
 
-  printf("[SHOT] ready: 's' = frame, 'S' = repeat, 'r' = raw\n");
+  /* Register the remote pointer. With the panel's own touch layer dead
+   * this is the only pointing device LVGL will have, so every click in
+   * the host preview window reaches the UI through here.
+   */
+
+  g_ptr_indev = lv_indev_create();
+
+  if (g_ptr_indev != NULL)
+    {
+      lv_indev_set_type(g_ptr_indev, LV_INDEV_TYPE_POINTER);
+      lv_indev_set_read_cb(g_ptr_indev, shot_ptr_read);
+    }
+
+  printf("[SHOT] ready: 's' = frame, 'r' = raw, 'T' = remote pointer\n");
   return 0;
 }
 
@@ -277,22 +394,54 @@ void ai_watch_shot_poll(void)
       return;
     }
 
-  if (read(STDIN_FILENO, &ch, 1) != 1)
+  /* Drain everything the console has, so a burst of pointer moves is not
+   * spread over several frames.
+   */
+
+  if (g_cmd_len > 0 &&
+      (int32_t)(lv_tick_get() - g_cmd_start_ms) > SHOT_CMD_TIMEOUT_MS)
     {
-      return;
+      g_cmd_len = 0;
     }
 
-  switch (ch)
+  while (read(STDIN_FILENO, &ch, 1) == 1)
     {
-      case 's':
-        shot_dump(g_shot_disp, true);
-        break;
+      if (g_cmd_len > 0)
+        {
+          g_cmd_buf[g_cmd_len++] = (uint8_t)ch;
 
-      case 'r':
-        shot_dump(g_shot_disp, false);
-        break;
+          if (g_cmd_len == SHOT_CMD_TOUCH_LEN)
+            {
+              shot_ptr_apply(g_cmd_buf);
+              g_cmd_len = 0;
+            }
 
-      default:
-        break;
+          continue;
+        }
+
+      switch (ch)
+        {
+          case 's':
+            shot_dump(g_shot_disp, true);
+            break;
+
+          case 'r':
+            shot_dump(g_shot_disp, false);
+            break;
+
+          case 'T':
+            g_cmd_buf[0] = 'T';
+            g_cmd_len = 1;
+            g_cmd_start_ms = lv_tick_get();
+            break;
+
+          default:
+            break;
+        }
     }
+}
+
+FAR lv_indev_t *ai_watch_shot_get_indev(void)
+{
+  return g_ptr_indev;
 }

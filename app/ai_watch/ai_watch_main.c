@@ -4527,9 +4527,25 @@ int main(int argc, FAR char *argv[])
 
   if (!watch.touch_available)
     {
-      printf("Touch not ready, will poll every 1s\n");
-      clock_gettime(CLOCK_MONOTONIC, &watch.touch_next_poll);
-      watch.touch_next_poll.tv_sec += 1;
+      /* No panel touch layer. Fall back to the host pointer registered by
+       * the screen-dump hook: without this, every gesture handler bails
+       * out early and clicks from the preview window do nothing.
+       */
+
+      watch.touch_indev = ai_watch_shot_get_indev();
+
+      if (watch.touch_indev != NULL)
+        {
+          watch.touch_available = true;
+          watch.touch_poll_remaining = 0;
+          printf("Touch unavailable; using remote pointer from host\n");
+        }
+      else
+        {
+          printf("Touch not ready, will poll every 1s\n");
+          clock_gettime(CLOCK_MONOTONIC, &watch.touch_next_poll);
+          watch.touch_next_poll.tv_sec += 1;
+        }
     }
 
   ai_watch_create_ui(&watch);

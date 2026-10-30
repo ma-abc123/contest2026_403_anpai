@@ -57,4 +57,16 @@ int ai_watch_shot_init(FAR lv_display_t *disp);
 
 void ai_watch_shot_poll(void);
 
+/****************************************************************************
+ * Name: ai_watch_shot_get_indev
+ *
+ * Description:
+ *   The remote pointer registered by ai_watch_shot_init, or NULL. The app
+ *   binds this as its touch device when the panel's own touch layer is
+ *   unavailable, so gesture handling keeps working off the host mouse.
+ *
+ ****************************************************************************/
+
+FAR lv_indev_t *ai_watch_shot_get_indev(void);
+
 #endif /* __APPS_EXAMPLES_AI_WATCH_AI_WATCH_SHOT_H */
