@@ -61,6 +61,21 @@ static FAR lv_indev_t   *g_ptr_indev;
 static FAR uint8_t      *g_rle_buf;
 static size_t            g_rle_cap;
 
+/* Downscale factor for the dump.
+ *
+ * Costs bytes quadratically (a 2x shrink leaves a quarter of the pixels)
+ * and *also* improves the RLE ratio, because block averaging pulls
+ * neighbouring pixels closer together. A detailed screen that costs
+ * 40 KB at full size lands around 7 KB at 2x.
+ *
+ * 1 = full resolution, 2 or 3 = decimated. Set from the host with the
+ * '1'..'3' keys.
+ */
+
+static uint8_t           g_downscale = 2;
+static FAR uint16_t     *g_small_buf;
+static size_t            g_small_cap;
+
 /* Remote pointer. The panel's own touch layer is dead, so input now
  * arrives from the host over the same UART: 'T' + x(2) + y(2) + state(1),
  * all little endian. A tiny state machine reassembles it because a
@@ -273,13 +288,69 @@ static uint32_t rle_encode(FAR const uint16_t *src, uint32_t count,
   return o;
 }
 
+/* Box-filter downscale by an integer factor. Averaging rather than point
+ * sampling keeps thin strokes readable at 2x and stops icons from
+ * shimmering as the screen changes.
+ */
+
+static void shot_downscale(FAR const uint16_t *src, uint16_t w, uint16_t h,
+                           uint16_t stride_px, uint8_t scale,
+                           FAR uint16_t *dst, uint16_t *out_w,
+                           uint16_t *out_h)
+{
+  uint16_t sw = w / scale;
+  uint16_t sh = h / scale;
+  uint32_t n = (uint32_t)scale * scale;
+  uint16_t x;
+  uint16_t y;
+
+  for (y = 0; y < sh; y++)
+    {
+      FAR const uint16_t *row = src + (uint32_t)(y * scale) * stride_px;
+
+      for (x = 0; x < sw; x++)
+        {
+          uint32_t r = 0;
+          uint32_t g = 0;
+          uint32_t b = 0;
+          uint16_t dy;
+          uint16_t dx;
+
+          for (dy = 0; dy < scale; dy++)
+            {
+              FAR const uint16_t *py = row + (uint32_t)dy * stride_px;
+
+              for (dx = 0; dx < scale; dx++)
+                {
+                  uint16_t px = py[(uint32_t)x * scale + dx];
+
+                  r += (px >> 11) & 0x1f;
+                  g += (px >> 5) & 0x3f;
+                  b += px & 0x1f;
+                }
+            }
+
+          dst[(uint32_t)y * sw + x] =
+            (uint16_t)(((r / n) << 11) | ((g / n) << 5) | (b / n));
+        }
+    }
+
+  *out_w = sw;
+  *out_h = sh;
+}
+
 static void shot_dump(FAR lv_display_t *disp, bool compress)
 {
   FAR lv_draw_buf_t *buf = lv_display_get_buf_active(disp);
   struct shot_hdr_s hdr;
-  uint32_t pixels;
+  FAR const uint16_t *pixels;
+  uint32_t pixel_count;
   uint32_t payload_len = 0;
   FAR const uint8_t *payload = NULL;
+  uint16_t w;
+  uint16_t h;
+  uint16_t stride_px;
+  uint8_t scale;
 
   if (buf == NULL || buf->data == NULL)
     {
@@ -287,11 +358,56 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
       return;
     }
 
-  pixels = (uint32_t)buf->header.stride * buf->header.h / 2;
+  pixels     = (FAR const uint16_t *)buf->data;
+  w          = (uint16_t)buf->header.w;
+  h          = (uint16_t)buf->header.h;
+  stride_px  = (uint16_t)(buf->header.stride / 2);
+  pixel_count = (uint32_t)stride_px * h;
+
+  /* Apply the requested downscale, refusing to shrink below a legible
+   * size (16 px on the short edge).
+   */
+
+  for (scale = g_downscale; scale > 1; scale--)
+    {
+      if ((w / scale) >= 16 && (h / scale) >= 16)
+        {
+          break;
+        }
+    }
+
+  if (scale > 1)
+    {
+      uint16_t sw = w / scale;
+      uint16_t sh = h / scale;
+      size_t need = (size_t)sw * sh * sizeof(uint16_t);
+
+      if (g_small_buf == NULL || g_small_cap < need)
+        {
+          FAR uint16_t *p = realloc(g_small_buf, need);
+
+          if (p != NULL)
+            {
+              g_small_buf = p;
+              g_small_cap = need;
+            }
+        }
+
+      if (g_small_buf != NULL && g_small_cap >= need)
+        {
+          shot_downscale(pixels, w, h, stride_px, scale, g_small_buf,
+                         &sw, &sh);
+          pixels = g_small_buf;
+          w = sw;
+          h = sh;
+          stride_px = sw;
+          pixel_count = (uint32_t)sw * sh;
+        }
+    }
 
   if (compress)
     {
-      size_t need = (size_t)pixels * SHOT_RLE_BYTES_PER_PX;
+      size_t need = (size_t)pixel_count * SHOT_RLE_BYTES_PER_PX;
 
       if (g_rle_buf == NULL || g_rle_cap < need)
         {
@@ -312,8 +428,7 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
 
       if (compress)
         {
-          payload_len = rle_encode((FAR const uint16_t *)buf->data, pixels,
-                                   g_rle_buf, g_rle_cap);
+          payload_len = rle_encode(pixels, pixel_count, g_rle_buf, g_rle_cap);
 
           /* Length 0 means the encoder ran out of room; fall back rather
            * than emit a header with no payload behind it.
@@ -332,14 +447,14 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
 
   if (!compress)
     {
-      payload = buf->data;
-      payload_len = pixels * 2;
+      payload = (FAR const uint8_t *)pixels;
+      payload_len = pixel_count * 2;
     }
 
   memcpy(hdr.magic, SHOT_MAGIC, 4);
-  hdr.w      = (uint16_t)buf->header.w;
-  hdr.h      = (uint16_t)buf->header.h;
-  hdr.stride = (uint16_t)buf->header.stride;
+  hdr.w      = w;
+  hdr.h      = h;
+  hdr.stride = (uint16_t)(stride_px * 2);
   hdr.fmt    = compress ? SHOT_FMT_RLE565 : SHOT_FMT_RGB565;
   hdr.len    = payload_len;
 
@@ -443,6 +558,13 @@ void ai_watch_shot_poll(void)
             g_cmd_buf[0] = 'T';
             g_cmd_len = 1;
             g_cmd_start_ms = lv_tick_get();
+            break;
+
+          case '1':
+          case '2':
+          case '3':
+            g_downscale = (uint8_t)(ch - '0');
+            printf("[FRM] downscale %ux\n", (unsigned)g_downscale);
             break;
 
           default:

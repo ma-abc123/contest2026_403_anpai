@@ -248,6 +248,12 @@ def main():
 
             img = grab_frame(ser, sink)
             if img is not None:
+                # The watch may send a downscaled frame; stretch it back to
+                # panel size so window coordinates map 1:1 to touch
+                # coordinates.
+                if img.size != (PANEL_W, PANEL_H):
+                    img = img.resize((PANEL_W, PANEL_H), Image.NEAREST)
+
                 win.put_pil_image(gc, 0, 0, img)
                 disp.flush()
                 frames += 1
