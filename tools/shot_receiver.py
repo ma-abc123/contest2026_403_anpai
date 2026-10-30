@@ -58,15 +58,50 @@ def find_magic(ser):
             return True
 
 
+def rle_decode(data, count):
+    """Undo the watch-side RLE: c<0x80 run, c>=0x80 literal block."""
+    import numpy as np
+
+    out = np.empty(count, dtype="<u2")
+    o = 0
+    i = 0
+    n = len(data)
+
+    while i < n and o < count:
+        c = data[i]
+        i += 1
+
+        if c < 0x80:
+            if i + 2 > n:
+                break
+            run = c + 1
+            px = data[i] | (data[i + 1] << 8)
+            i += 2
+            end = min(o + run, count)
+            out[o:end] = px
+            o = end
+        else:
+            lit = (c - 0x7F)
+            end = min(o + lit, count)
+            need = (end - o) * 2
+            if i + need > n:
+                break
+            out[o:end] = np.frombuffer(data[i:i + need], dtype="<u2")
+            i += need
+            o = end
+
+    return out if o == count else None
+
+
 def decode_frame(hdr, data):
     """Turn one frame into a PIL image, or return None if it is garbage."""
     magic, w, h, stride, fmt, length = struct.unpack("<4sHHHBI", hdr)
 
-    if magic != MAGIC or fmt != 1:
+    if magic != MAGIC:
         return None
     if length != len(data) or length > MAX_PIXELS * 2:
         return None
-    if w == 0 or h == 0 or stride < w * 2 or length < stride * h:
+    if w == 0 or h == 0 or stride < w * 2 or length == 0:
         return None
 
     try:
@@ -75,10 +110,24 @@ def decode_frame(hdr, data):
     except ImportError:
         return ("raw", w, h, stride, data)
 
+    pixels = stride * h // 2
+
+    if fmt == 2:                       # RLE565
+        px = rle_decode(data, pixels)
+        if px is None:
+            return None
+        px = px.reshape(h, stride // 2)
+    elif fmt == 1:                     # raw RGB565
+        if length < pixels * 2:
+            return None
+        px = np.frombuffer(data[:pixels * 2], dtype="<u2").reshape(h,
+                                                                  stride // 2)
+    else:
+        return None
+
     # RGB565 LE -> RGB888, vectorised: a Python loop over 175k pixels
     # takes seconds and this runs on every captured frame.
-    raw = np.frombuffer(data[:stride * h], dtype="<u2").reshape(h, stride // 2)
-    px = raw[:, :w]
+    px = px[:, :w]
 
     r = ((px >> 11) & 0x1F).astype(np.uint8)
     g = ((px >> 5) & 0x3F).astype(np.uint8)
@@ -147,7 +196,7 @@ def main():
 
             magic, w, h, stride, fmt, length = struct.unpack("<4sHHHBI",
                                                              MAGIC + hdr)
-            if fmt != 1 or length > MAX_PIXELS * 2 or w == 0 or h == 0:
+            if fmt not in (1, 2) or length > MAX_PIXELS * 2 or w == 0 or h == 0:
                 continue
 
             data = read_exact(ser, length)

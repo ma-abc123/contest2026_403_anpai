@@ -2194,6 +2194,73 @@ static void ai_watch_skill_poll_ui(FAR struct ai_watch_s *watch)
 }
 
 /****************************************************************************
+ * Private Functions - Touch probe overlay
+ *
+ * With the panel dead, touch health has to be judged from the screen dump:
+ * press anywhere on the glass and the next frame carries a marker plus the
+ * coordinates the driver reported. The marker lingers briefly so a single
+ * tap is still visible in a frame captured a moment later.
+ ****************************************************************************/
+
+static void ai_watch_touch_probe_poll(FAR struct ai_watch_s *watch)
+{
+  static FAR lv_obj_t *dot;
+  static FAR lv_obj_t *tag;
+  static uint32_t hold_until;
+  FAR lv_obj_t *top;
+  lv_point_t p;
+  char buf[24];
+  uint32_t now;
+
+  if (watch->touch_indev == NULL)
+    {
+      return;
+    }
+
+  if (dot == NULL)
+    {
+      top = lv_layer_top();
+
+      dot = lv_obj_create(top);
+      lv_obj_set_size(dot, 28, 28);
+      lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+      lv_obj_set_style_bg_color(dot, lv_color_hex(0xff3b30), 0);
+      lv_obj_set_style_bg_opa(dot, LV_OPA_60, 0);
+      lv_obj_set_style_border_width(dot, 2, 0);
+      lv_obj_set_style_border_color(dot, lv_color_hex(0xffffff), 0);
+      lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+
+      tag = lv_label_create(top);
+      lv_obj_set_style_text_color(tag, lv_color_hex(0xffffff), 0);
+      lv_obj_set_style_text_font(tag, &lv_font_montserrat_16, 0);
+      lv_label_set_text(tag, "");
+    }
+
+  now = lv_tick_get();
+
+  if (lv_indev_get_state(watch->touch_indev) == LV_INDEV_STATE_PRESSED)
+    {
+      lv_indev_get_point(watch->touch_indev, &p);
+
+      lv_obj_set_pos(dot, p.x - 14, p.y - 14);
+      lv_obj_clear_flag(dot, LV_OBJ_FLAG_HIDDEN);
+
+      snprintf(buf, sizeof(buf), "%d,%d", (int)p.x, (int)p.y);
+      lv_label_set_text(tag, buf);
+      lv_obj_set_pos(tag, p.x + 18, p.y - 8);
+
+      hold_until = now + 2500;
+    }
+  else if (hold_until != 0 && (int32_t)(now - hold_until) >= 0)
+    {
+      lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(tag, "");
+      hold_until = 0;
+    }
+}
+
+/****************************************************************************
  * Private Functions - Exercise App (motion service UI)
  *
  * Pure consumer of the background motion service (ai_watch_motion.c):
@@ -4627,6 +4694,12 @@ int main(int argc, FAR char *argv[])
       ai_watch_light_poll();
       ai_watch_battery_poll();
       ai_watch_battery_update(&watch);
+
+      /* Draw the touch marker before the render pass so it lands in the
+       * same frame the dump will pick up.
+       */
+
+      ai_watch_touch_probe_poll(&watch);
 
       idle = lv_timer_handler();
 
