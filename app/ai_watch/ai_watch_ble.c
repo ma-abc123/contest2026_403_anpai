@@ -139,6 +139,8 @@ static long s_conn_window_deadline;     /* CLOCK_MONOTONIC sec */
  * Private Functions - DataUpload TX worker
  ****************************************************************************/
 
+static volatile long g_conn_since;      /* CLOCK_MONOTONIC sec, 0 = none */
+
 static FAR void *ai_ble_tx_worker(FAR void *arg)
 {
   (void)arg;
@@ -149,6 +151,24 @@ static FAR void *ai_ble_tx_worker(FAR void *arg)
         {
           usleep(20 * 1000);
           continue;
+        }
+
+      /* Fresh-link settle: the first notification burst on a new
+       * connection correlates with the LCPU Hardware Error deaths
+       * (duration_ms 4487/5347 on 4.8.46). Hold uplink traffic for the
+       * first 2 s so the phone's discovery/subscribe finishes on a
+       * quiet link. */
+
+      if (g_conn_since != 0)
+        {
+          struct timespec now;
+
+          clock_gettime(CLOCK_MONOTONIC, &now);
+          if (now.tv_sec - g_conn_since < 2)
+            {
+              usleep(50 * 1000);
+              continue;
+            }
         }
 
       FAR struct ai_watch_ble_txq_entry_s *e = &g_txq[g_txq_tail];
@@ -184,18 +204,17 @@ static FAR void *ai_ble_tx_worker(FAR void *arg)
  * Private Functions - INIT_FAILED recovery pacing
  ****************************************************************************/
 
-/* Seconds between consecutive INIT_FAILED recovery attempts. The first
- * two keep the historical 30 s cadence; after that the interval doubles
- * up to AI_WATCH_BLE_INITFAIL_LAST_S, so a bring-up that keeps failing
- * costs one controller teardown per 5 min instead of hammering the HCI
- * path (each recover() blocks the main loop for up to a command timeout).
- * NOTE 2026-10-31: a front-loaded ladder (3/8/15 s) was tried and made
- * things WORSE -- 0/8 boots advertised in 45 s vs 3/8 in 12 s with this
- * cadence. recover() is a full controller teardown that resets the
- * LCPU-release race clock; retrying every 3 s restarts the race window
- * forever. Give the bring-up room (measured: the +10 s first retry
- * succeeds, advertising ~10 s after boot on rescued boots).
- */
+/* Seconds between consecutive INIT_FAILED recovery attempts: sighting
+ * +10 s first, then 15/20/30/60/120 s, capped at
+ * AI_WATCH_BLE_INITFAIL_LAST_S. Two constraints from field data:
+ * - the +10 s first retry is measured to succeed (advertising ~16 s
+ *   after boot on rescued boots, 4.8.46 lottery);
+ * - anything tighter is harmful: recover() is a full controller
+ *   teardown with an LCPU warm reset that resets the LCPU-release race
+ *   clock (4.8.44 tried 3/8/15 s -> 0/8 boots advertised; P1-1 §2.9:
+ *   300 ms-class HCI timeouts even panicked in the deinit path). The
+ *   15 s spacing stays clear of both. No attempt cap: a battery device
+ *   cannot be power-cycled on site. */
 
 static uint32_t ai_ble_initfail_backoff(int tries)
 {
@@ -988,14 +1007,26 @@ void ai_watch_ble_process(void)
 
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    if (state == AI_WATCH_BLE_BSP_CONNECTED && g_last_sync_utc == 0)
+    if (state == AI_WATCH_BLE_BSP_CONNECTED)
       {
-        if (!s_conn_window)
+        if (g_conn_since == 0)
           {
-            s_conn_window = true;
-            s_conn_window_deadline = now.tv_sec + 8;
+            g_conn_since = now.tv_sec;
           }
-        else if (now.tv_sec > s_conn_window_deadline)
+
+        if (g_last_sync_utc == 0)
+          {
+            if (!s_conn_window)
+              {
+                s_conn_window = true;
+                s_conn_window_deadline = now.tv_sec + 8;
+              }
+            else if (now.tv_sec > s_conn_window_deadline)
+              {
+                s_conn_window = false;
+              }
+          }
+        else
           {
             s_conn_window = false;
           }
@@ -1003,6 +1034,7 @@ void ai_watch_ble_process(void)
     else
       {
         s_conn_window = false;
+        g_conn_since = 0;
       }
   }
 
@@ -1019,6 +1051,15 @@ void ai_watch_ble_process(void)
 
       clock_gettime(CLOCK_MONOTONIC, &now);
 
+      /* Stale uplink data from the dark period must not blast onto the
+       * next fresh connection (the ~4.5-5.3 s deaths of 2026-10-31 all
+       * followed the first notification burst on a new link). */
+
+      if (g_txq_head != g_txq_tail)
+        {
+          g_txq_tail = g_txq_head;
+        }
+
       if (now.tv_sec >= next_retry.tv_sec)
         {
           ai_watch_ble_bsp_resume_advertising();
@@ -1027,6 +1068,19 @@ void ai_watch_ble_process(void)
         }
     }
 }
+
+/* NOTE 2026-10-31: a "DISCONNECTED >20 s -> recover()" escalation was
+ * tried here and REMOVED. recover() is a full controller teardown
+ * including an LCPU warm reset; per P1-1 §2.4/§2.6 repeated warm resets
+ * accumulate the "dose" state that makes the next bring-up fail
+ * (4.8.44: 3/8/15 s retry ladder -> 0/8 boots advertised). The safe
+ * recovery policy per the 4.5.0/4.8.10/4.8.18 field record is
+ * event-driven single recover() with >=10-15 s between teardowns --
+ * which the INIT_FAILED ladder and the fault path already provide. The
+ * post-disconnect -11 dark window self-heals via the bridge's own
+ * resume backoff plus this loop's 1 s resume pokes; if a dark period
+ * exceeds ~60 s, power-cycle the board (P1-1: true power-off >=5 min
+ * clears the accumulated dose). */
 
 /****************************************************************************
  * Name: ai_watch_ble_set_enabled
