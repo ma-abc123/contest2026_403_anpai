@@ -43,6 +43,8 @@
 
 #include <nuttx/config.h>
 
+#include <stdbool.h>
+
 #include <pthread.h>
 #include <sched.h>
 #include <fcntl.h>
@@ -75,6 +77,16 @@
  */
 
 #define MOTION_PERIOD_MS        25
+#define MOTION_SLOW_PERIOD_MS   66      /* 15 Hz: the verified-safe rate
+                                         * during the BLE connect window */
+
+/* Connect-window throttle: while set the sampler loop sleeps
+ * MOTION_SLOW_PERIOD_MS instead of MOTION_PERIOD_MS. Written by the main
+ * loop (ai_watch_motion_set_slow), read by the sampler thread; a single
+ * flag so no locking is needed.
+ */
+
+static volatile bool g_motion_slow;
 
 /* Recording: BLE MOTION_DATA forwarding decimation. The radio path is
  * a sampled view (one frame in BLE_REC_DEC); the serial CSV log always
@@ -343,7 +355,8 @@ static FAR void *motion_thread(FAR void *arg)
       float mag;
       float dev;
 
-      usleep(MOTION_PERIOD_MS * 1000);
+      usleep((g_motion_slow ? MOTION_SLOW_PERIOD_MS
+                            : MOTION_PERIOD_MS) * 1000);
 
       /* (Re-)open the sensor. The device is registered at boot; if it
        * ever disappears the retry keeps the rest of the watch alive.
@@ -889,6 +902,11 @@ static void motion_drain_recording(void)
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
+
+void ai_watch_motion_set_slow(bool slow)
+{
+  g_motion_slow = slow;
+}
 
 void ai_watch_motion_init(void)
 {

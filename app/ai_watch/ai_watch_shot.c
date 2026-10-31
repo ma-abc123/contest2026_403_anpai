@@ -12,8 +12,11 @@
 
 #include <nuttx/config.h>
 
+#include <stdbool.h>
+
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,11 +33,15 @@
 #define SHOT_FMT_RLE565     2
 
 /* Worst case for the encoder is one literal-control byte per pixel plus
- * two bytes of payload, i.e. 3 bytes per pixel. Allocated lazily from
- * the heap (PSRAM is present), never from .bss.
+ * two bytes of payload, i.e. 3 bytes per pixel. The frame staging buffer
+ * additionally carries the 15-byte header in front of the payload, so a
+ * frame is always one contiguous block and the TX state machine has a
+ * single offset to track. Allocated lazily from the heap (PSRAM is
+ * present), never from .bss.
  */
 
 #define SHOT_RLE_BYTES_PER_PX  3
+#define SHOT_HDR_BYTES         15
 
 /****************************************************************************
  * Private Types
@@ -58,8 +65,51 @@ struct shot_hdr_s
 
 static FAR lv_display_t *g_shot_disp;
 static FAR lv_indev_t   *g_ptr_indev;
-static FAR uint8_t      *g_rle_buf;
-static size_t            g_rle_cap;
+static FAR uint8_t      *g_frame_buf;
+static size_t            g_frame_cap;
+
+/* Trace volume: [PTR]/[INDEV] fire on every pointer packet and state edge
+ * and flood the console (and the frame stream's bandwidth) during drags.
+ * Off by default; toggle with the 'v' key.
+ */
+
+static bool              g_verbose;
+
+/* One frame in flight at a time. The frame is snapshotted into
+ * g_frame_buf up front, then streamed to the UART in nonblocking chunks:
+ * write() tops up the driver TX ring until it returns EAGAIN, and the
+ * next main-loop pass resumes. The LVGL loop therefore keeps servicing
+ * touch and animations for the whole transfer instead of parking for
+ * hundreds of milliseconds per frame -- a full-complexity frame at
+ * 1 Mbaud is over a second, which read as "click freezes the watch".
+ */
+
+static bool              g_tx_active;
+static size_t            g_tx_off;
+static size_t            g_tx_len;
+
+/* Stats for the completion line, kept from the last staged frame. */
+
+static uint16_t          g_tx_w;
+static uint16_t          g_tx_h;
+static uint8_t           g_tx_fmt;
+static uint32_t          g_tx_paylen;
+
+/* Stream gate: while set, new frame requests are dropped and any armed
+ * frame finishes. The main loop sets it during the BLE connect window
+ * (connected but not yet time-synced) so the fragile post-connect period
+ * gets the UART and the CPU without a preview stream competing.
+ */
+
+static volatile bool g_stream_gate;
+
+/* A frame request that arrives while the previous frame is still going
+ * out: remember it (1 deep) so the host's request-response loop cannot
+ * deadlock, but do not queue an unbounded backlog.
+ */
+
+static bool              g_tx_pending;
+static bool              g_tx_pending_compress;
 
 /* Downscale factor for the dump.
  *
@@ -98,6 +148,61 @@ static uint8_t  g_ptr_down;
 
 #define SHOT_CMD_TIMEOUT_MS 400
 
+/* Verbose traces printed while a frame is going out would land in the TX
+ * ring between payload chunks and tear the frame on the wire. Park them
+ * in a small ring and flush after the frame completes; on overflow the
+ * oldest line is dropped (traces are diagnostics, frames are product).
+ */
+
+#define SHOT_TRACE_LINE   48
+#define SHOT_TRACE_QLEN   16
+
+static char    g_trace_q[SHOT_TRACE_QLEN][SHOT_TRACE_LINE];
+static uint8_t g_trace_q_head;
+static uint8_t g_trace_q_tail;
+
+static void shot_trace_flush(void)
+{
+  while (g_trace_q_tail != g_trace_q_head)
+    {
+      printf("%s", g_trace_q[g_trace_q_tail]);
+      g_trace_q_tail = (g_trace_q_tail + 1u) % SHOT_TRACE_QLEN;
+    }
+}
+
+static void shot_trace(FAR const char *fmt, ...)
+{
+  va_list ap;
+  uint8_t next;
+
+  if (!g_verbose)
+    {
+      return;
+    }
+
+  if (g_tx_active)
+    {
+      next = (g_trace_q_head + 1u) % SHOT_TRACE_QLEN;
+
+      va_start(ap, fmt);
+      vsnprintf(g_trace_q[g_trace_q_head], SHOT_TRACE_LINE, fmt, ap);
+      va_end(ap);
+
+      if (next == g_trace_q_tail)
+        {
+          /* full: overwrite the oldest */
+          g_trace_q_tail = (g_trace_q_tail + 1u) % SHOT_TRACE_QLEN;
+        }
+
+      g_trace_q_head = next;
+      return;
+    }
+
+  va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+}
+
 /* LVGL samples input every few tens of ms, while a fast click can be down
  * and up again inside one sample. Hold the press briefly so short taps
  * are still seen.
@@ -132,20 +237,21 @@ static void shot_ptr_read(FAR lv_indev_t *indev, FAR lv_indev_data_t *data)
   data->state = g_ptr_down ? LV_INDEV_STATE_PRESSED
                            : LV_INDEV_STATE_RELEASED;
 
-  /* Trace on state edges only: shows whether LVGL ever observes the
-   * press, without flooding the console once polling is healthy.
+  /* Trace on state edges only, and only when verbose; mid-frame the
+   * line is parked and flushed after the frame completes.
    */
 
-  {
-    static uint8_t prev_state;
+  if (g_verbose)
+    {
+      static uint8_t prev_state;
 
-    if ((uint8_t)data->state != prev_state)
-      {
-        prev_state = (uint8_t)data->state;
-        printf("[INDEV] state=%d at %u,%u\n", (int)data->state,
-               (unsigned)g_ptr_x, (unsigned)g_ptr_y);
-      }
-  }
+      if ((uint8_t)data->state != prev_state)
+        {
+          prev_state = (uint8_t)data->state;
+          shot_trace("[INDEV] state=%d at %u,%u\n", (int)data->state,
+                     (unsigned)g_ptr_x, (unsigned)g_ptr_y);
+        }
+    }
 }
 
 static void shot_ptr_apply(FAR const uint8_t *buf)
@@ -182,30 +288,10 @@ static void shot_ptr_apply(FAR const uint8_t *buf)
       g_ptr_y = (uint16_t)(buf[3] | (buf[4] << 8));
     }
 
-  printf("[PTR] %u,%u %s\n", (unsigned)g_ptr_x, (unsigned)g_ptr_y,
-         down ? "down" : "up");
-}
-
-static void shot_write_all(FAR const void *data, size_t len)
-{
-  FAR const uint8_t *p = data;
-  size_t off = 0;
-
-  while (off < len)
+  if (g_verbose)
     {
-      ssize_t n = write(STDOUT_FILENO, p + off, len - off);
-
-      if (n <= 0)
-        {
-          if (n < 0 && errno == EINTR)
-            {
-              continue;
-            }
-
-          break;
-        }
-
-      off += (size_t)n;
+      shot_trace("[PTR] %u,%u %s\n", (unsigned)g_ptr_x, (unsigned)g_ptr_y,
+                 down ? "down" : "up");
     }
 }
 
@@ -339,18 +425,34 @@ static void shot_downscale(FAR const uint16_t *src, uint16_t w, uint16_t h,
   *out_h = sh;
 }
 
-static void shot_dump(FAR lv_display_t *disp, bool compress)
+/* Snapshot the current LVGL frame into g_frame_buf (header + payload,
+ * contiguous) and arm the TX state machine. Encoding happens here,
+ * synchronously -- at 2x downscale that is a couple of milliseconds --
+ * while the UART transfer itself is deferred to shot_tx_pump() so no
+ * main-loop pass ever waits on the wire.
+ *
+ * The snapshot is deliberate: LVGL keeps rendering into its own buffer
+ * while the frame streams out, and the payload must not change under us.
+ */
+
+static void shot_frame_start(FAR lv_display_t *disp, bool compress)
 {
   FAR lv_draw_buf_t *buf = lv_display_get_buf_active(disp);
   struct shot_hdr_s hdr;
   FAR const uint16_t *pixels;
   uint32_t pixel_count;
   uint32_t payload_len = 0;
-  FAR const uint8_t *payload = NULL;
+  FAR uint8_t *payload;
+  size_t need;
   uint16_t w;
   uint16_t h;
   uint16_t stride_px;
   uint8_t scale;
+
+  if (g_tx_active || g_stream_gate)
+    {
+      return;
+    }
 
   if (buf == NULL || buf->data == NULL)
     {
@@ -380,20 +482,20 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
     {
       uint16_t sw = w / scale;
       uint16_t sh = h / scale;
-      size_t need = (size_t)sw * sh * sizeof(uint16_t);
+      size_t small_need = (size_t)sw * sh * sizeof(uint16_t);
 
-      if (g_small_buf == NULL || g_small_cap < need)
+      if (g_small_buf == NULL || g_small_cap < small_need)
         {
-          FAR uint16_t *p = realloc(g_small_buf, need);
+          FAR uint16_t *p = realloc(g_small_buf, small_need);
 
           if (p != NULL)
             {
               g_small_buf = p;
-              g_small_cap = need;
+              g_small_cap = small_need;
             }
         }
 
-      if (g_small_buf != NULL && g_small_cap >= need)
+      if (g_small_buf != NULL && g_small_cap >= small_need)
         {
           shot_downscale(pixels, w, h, stride_px, scale, g_small_buf,
                          &sw, &sh);
@@ -405,50 +507,44 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
         }
     }
 
-  if (compress)
+  need = SHOT_HDR_BYTES + (size_t)pixel_count * SHOT_RLE_BYTES_PER_PX;
+
+  if (g_frame_buf == NULL || g_frame_cap < need)
     {
-      size_t need = (size_t)pixel_count * SHOT_RLE_BYTES_PER_PX;
+      FAR uint8_t *p = realloc(g_frame_buf, need);
 
-      if (g_rle_buf == NULL || g_rle_cap < need)
+      if (p == NULL)
         {
-          FAR uint8_t *p = realloc(g_rle_buf, need);
-
-          if (p == NULL)
-            {
-              printf("[FRM] RLE buffer alloc failed (%u bytes)\n",
-                     (unsigned)need);
-              compress = false;
-            }
-          else
-            {
-              g_rle_buf = p;
-              g_rle_cap = need;
-            }
+          printf("[FRM] frame buffer alloc failed (%u bytes)\n",
+                 (unsigned)need);
+          return;
         }
 
-      if (compress)
+      g_frame_buf = p;
+      g_frame_cap = need;
+    }
+
+  payload = g_frame_buf + SHOT_HDR_BYTES;
+
+  if (compress)
+    {
+      payload_len = rle_encode(pixels, pixel_count, payload,
+                               (size_t)pixel_count * SHOT_RLE_BYTES_PER_PX);
+
+      /* Length 0 means the encoder ran out of room; fall back rather
+       * than emit a header with no payload behind it.
+       */
+
+      if (payload_len == 0)
         {
-          payload_len = rle_encode(pixels, pixel_count, g_rle_buf, g_rle_cap);
-
-          /* Length 0 means the encoder ran out of room; fall back rather
-           * than emit a header with no payload behind it.
-           */
-
-          if (payload_len > 0)
-            {
-              payload = g_rle_buf;
-            }
-          else
-            {
-              compress = false;
-            }
+          compress = false;
         }
     }
 
   if (!compress)
     {
-      payload = (FAR const uint8_t *)pixels;
       payload_len = pixel_count * 2;
+      memcpy(payload, pixels, payload_len);
     }
 
   memcpy(hdr.magic, SHOT_MAGIC, 4);
@@ -457,13 +553,77 @@ static void shot_dump(FAR lv_display_t *disp, bool compress)
   hdr.stride = (uint16_t)(stride_px * 2);
   hdr.fmt    = compress ? SHOT_FMT_RLE565 : SHOT_FMT_RGB565;
   hdr.len    = payload_len;
+  memcpy(g_frame_buf, &hdr, SHOT_HDR_BYTES);
 
-  shot_write_all(&hdr, sizeof(hdr));
-  shot_write_all(payload, payload_len);
+  g_tx_w      = w;
+  g_tx_h      = h;
+  g_tx_fmt    = hdr.fmt;
+  g_tx_paylen = payload_len;
+  g_tx_off    = 0;
+  g_tx_len    = SHOT_HDR_BYTES + payload_len;
+  g_tx_active = true;
+}
 
-  printf("\n[FRM] %ux%u %s %lu bytes\n",
-         (unsigned)hdr.w, (unsigned)hdr.h,
-         compress ? "rle" : "raw", (unsigned long)payload_len);
+/* Stream one chunk of the armed frame into the UART TX ring. Called once
+ * per main-loop pass; returns as soon as the ring is full (EAGAIN) so the
+ * pass stays ~microseconds even mid-frame.
+ */
+
+static void shot_tx_pump(FAR lv_display_t *disp)
+{
+  if (!g_tx_active)
+    {
+      return;
+    }
+
+  while (g_tx_active)
+    {
+      ssize_t n = write(STDOUT_FILENO, g_frame_buf + g_tx_off,
+                        g_tx_len - g_tx_off);
+
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+              /* Ring full: the driver drains it from interrupt context;
+               * resume on the next pass.
+               */
+
+              return;
+            }
+
+          /* Terminal error (e.g. unplugged): drop the frame. The host
+           * recovers via its request timeout.
+           */
+
+          printf("[FRM] write error %d, frame dropped\n", errno);
+          g_tx_active = false;
+          return;
+        }
+
+      g_tx_off += (size_t)n;
+
+      if (g_tx_off >= g_tx_len)
+        {
+          g_tx_active = false;
+          shot_trace_flush();
+          printf("[FRM] %ux%u %s %lu bytes\n",
+                 (unsigned)g_tx_w, (unsigned)g_tx_h,
+                 g_tx_fmt == SHOT_FMT_RLE565 ? "rle" : "raw",
+                 (unsigned long)g_tx_paylen);
+
+          if (g_tx_pending)
+            {
+              g_tx_pending = false;
+              shot_frame_start(disp, g_tx_pending_compress);
+            }
+        }
+    }
 }
 
 /****************************************************************************
@@ -476,14 +636,22 @@ int ai_watch_shot_init(FAR lv_display_t *disp)
 
   g_shot_disp = disp;
 
-  /* Non-blocking console: the poll below must never park the UI loop
-   * waiting for a key that may never come.
+  /* Non-blocking console, both directions: the poll below must never
+   * park the UI loop waiting for a key that may never come, and frame
+   * writes must top up the TX ring without ever waiting for the wire to
+   * drain.
    */
 
   flags = fcntl(STDIN_FILENO, F_GETFL, 0);
   if (flags >= 0)
     {
       fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    }
+
+  flags = fcntl(STDOUT_FILENO, F_GETFL, 0);
+  if (flags >= 0)
+    {
+      fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK);
     }
 
   /* Register the remote pointer. With the panel's own touch layer dead
@@ -506,7 +674,8 @@ int ai_watch_shot_init(FAR lv_display_t *disp)
       lv_indev_set_read_cb(g_ptr_indev, shot_ptr_read);
     }
 
-  printf("[FRM] ready: 's' = frame, 'r' = raw, 'T' = remote pointer\n");
+  printf("[FRM] ready: 's' = frame, 'r' = raw, 'T' = remote pointer, "
+         "'v' = verbose\n");
   return 0;
 }
 
@@ -518,6 +687,13 @@ void ai_watch_shot_poll(void)
     {
       return;
     }
+
+  /* Push the in-flight frame forward first: whatever the TX ring accepted
+   * since the last pass goes out now, and a finished request chain
+   * (pending 's') re-arms here. Only then read commands.
+   */
+
+  shot_tx_pump(g_shot_disp);
 
   /* Drain everything the console has, so a burst of pointer moves is not
    * spread over several frames.
@@ -547,11 +723,20 @@ void ai_watch_shot_poll(void)
       switch (ch)
         {
           case 's':
-            shot_dump(g_shot_disp, true);
-            break;
-
           case 'r':
-            shot_dump(g_shot_disp, false);
+            if (g_tx_active)
+              {
+                /* One-deep backlog: keeps the host's request loop alive
+                 * without letting it pile up frames we cannot send.
+                 */
+
+                g_tx_pending = true;
+                g_tx_pending_compress = (ch == 's');
+              }
+            else
+              {
+                shot_frame_start(g_shot_disp, ch == 's');
+              }
             break;
 
           case 'T':
@@ -567,6 +752,11 @@ void ai_watch_shot_poll(void)
             printf("[FRM] downscale %ux\n", (unsigned)g_downscale);
             break;
 
+          case 'v':
+            g_verbose = !g_verbose;
+            printf("[FRM] verbose %d\n", (int)g_verbose);
+            break;
+
           default:
             break;
         }
@@ -576,4 +766,17 @@ void ai_watch_shot_poll(void)
 FAR lv_indev_t *ai_watch_shot_get_indev(void)
 {
   return g_ptr_indev;
+}
+
+void ai_watch_shot_set_stream_gate(bool block)
+{
+  if (block)
+    {
+      g_stream_gate = true;
+      g_tx_pending = false;
+    }
+  else
+    {
+      g_stream_gate = false;
+    }
 }

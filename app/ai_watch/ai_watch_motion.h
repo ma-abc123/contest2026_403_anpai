@@ -133,6 +133,10 @@ struct ai_watch_fall_report_s
 
 void ai_watch_motion_init(void);
 
+/* Connect-window throttle: 15 Hz while the BLE link is up but not yet
+ * time-synced (see ai_watch_ble_connect_window_active). */
+void ai_watch_motion_set_slow(bool slow);
+
 /****************************************************************************
  * Name: ai_watch_motion_process
  *

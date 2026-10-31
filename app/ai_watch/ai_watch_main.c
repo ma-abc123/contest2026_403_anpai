@@ -55,7 +55,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.39-blesettle"
+#define AI_WATCH_VERSION            "4.8.46-remote"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -912,20 +912,15 @@ static void ai_menu_event_cb(lv_event_t *e)
 
               if (dx * dx + dy * dy < r * r)
                 {
-                  if (i == ctx->focused_index)
-                    {
-                      /* Tapped the focused icon: launch app */
+                  /* Launch straight away. Previously a tap on a
+                   * non-focused icon only panned it to the centre and a
+                   * second tap was needed to open it; the panned frame
+                   * (icons pushed off the edge, nothing happening) reads
+                   * as a frozen screen, and over the 3-10 fps remote link
+                   * a two-tap flow is unusable.
+                   */
 
-                      ai_watch_open_app(watch,
-                                        ctx->icons[i].app_index);
-                    }
-                  else
-                    {
-                      /* Tapped a non-focused icon: snap to it */
-
-                      ai_menu_start_snap(watch, i);
-                    }
-
+                  ai_watch_open_app(watch, ctx->icons[i].app_index);
                   break;
                 }
             }
@@ -1949,6 +1944,18 @@ static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch)
  */
 
 #define AI_WATCH_HEADLESS           1
+
+/* Length of the screen-change animation. Without a panel the transition is
+ * only ever seen through the 5 fps remote preview, where a fade that takes
+ * longer than a couple of frames is indistinguishable from a freeze -- and
+ * worse, clicks during it land on offset screens. Switch instantly instead.
+ */
+
+#if AI_WATCH_HEADLESS
+#  define AI_WATCH_PAGE_ANIM_MS     0
+#else
+#  define AI_WATCH_PAGE_ANIM_MS     200
+#endif
 
 struct ai_alert_ui_s
 {
@@ -4774,6 +4781,17 @@ int main(int argc, FAR char *argv[])
        * arrive as ordinary alert banners, so they reuse the existing
        * show/hide lifecycle instead of adding a second overlay.
        */
+
+      /* BLE connect window: keep the fragile post-connect period free
+       * of preview and high-rate sampling until the phone syncs (or the
+       * 8 s cap expires). */
+
+      {
+        bool conn_window = ai_watch_ble_connect_window_active();
+
+        ai_watch_shot_set_stream_gate(conn_window);
+        ai_watch_motion_set_slow(conn_window);
+      }
 
       ai_watch_skill_poll_ui(&watch);
 

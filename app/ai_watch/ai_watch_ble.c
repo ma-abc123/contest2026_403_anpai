@@ -126,6 +126,15 @@ static volatile bool g_tx_thread_ok;
 static int s_initfail_tries;            /* consecutive auto-recover attempts */
 static struct timespec s_initfail_next; /* earliest next attempt, monotonic */
 
+/* Connect-window gate (see ai_watch_ble_connect_window_active): set while
+ * a connection exists but the phone has not performed TimeSync yet. The
+ * main loop pauses frame streaming and slows the IMU sampler for this
+ * window -- the ~300 ms post-connect period where the controller is at
+ * its most fragile (P1-1 §2.2: connect-time races surface as LCPU
+ * Hardware Error). */
+static volatile bool s_conn_window;
+static long s_conn_window_deadline;     /* CLOCK_MONOTONIC sec */
+
 /****************************************************************************
  * Private Functions - DataUpload TX worker
  ****************************************************************************/
@@ -180,21 +189,45 @@ static FAR void *ai_ble_tx_worker(FAR void *arg)
  * up to AI_WATCH_BLE_INITFAIL_LAST_S, so a bring-up that keeps failing
  * costs one controller teardown per 5 min instead of hammering the HCI
  * path (each recover() blocks the main loop for up to a command timeout).
+ * NOTE 2026-10-31: a front-loaded ladder (3/8/15 s) was tried and made
+ * things WORSE -- 0/8 boots advertised in 45 s vs 3/8 in 12 s with this
+ * cadence. recover() is a full controller teardown that resets the
+ * LCPU-release race clock; retrying every 3 s restarts the race window
+ * forever. Give the bring-up room (measured: the +10 s first retry
+ * succeeds, advertising ~10 s after boot on rescued boots).
  */
 
 static uint32_t ai_ble_initfail_backoff(int tries)
 {
-  if (tries <= 2)
+  /* Moderately front-loaded vs the historical 30 s ladder: a failed first
+   * bring-up recovers at sighting+10 s; pulling the next retries to 15/20 s
+   * brings advertising up ~25-45 s after boot instead of ~40-100 s (the
+   * phone gives up long before 40 s). NOT the 3/8 s hammering tried
+   * earlier the same day -- recover() is a full controller teardown that
+   * resets the LCPU-release race clock, and 0/8 boots advertised under
+   * it; 15 s spacing stays clear of that failure mode. */
+
+  if (tries == 1)
     {
-      return 30;
+      return 15;
+    }
+
+  if (tries == 2)
+    {
+      return 20;
     }
 
   if (tries == 3)
     {
-      return 60;
+      return 30;
     }
 
   if (tries == 4)
+    {
+      return 60;
+    }
+
+  if (tries == 5)
     {
       return 120;
     }
@@ -811,6 +844,15 @@ FAR const char *ai_watch_ble_get_status_text(
 }
 
 /****************************************************************************
+ * Name: ai_watch_ble_connect_window_active
+ ****************************************************************************/
+
+bool ai_watch_ble_connect_window_active(void)
+{
+  return s_conn_window;
+}
+
+/****************************************************************************
  * Name: ai_watch_ble_process
  ****************************************************************************/
 
@@ -933,6 +975,34 @@ void ai_watch_ble_process(void)
             ai_watch_ble_bsp_recover();
             return;
           }
+      }
+  }
+
+  /* Connect-window update: active while CONNECTED and not yet time-
+   * synced, hard-capped at 8 s so a phone that never syncs cannot keep
+   * the preview frozen forever. */
+
+  {
+    enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (state == AI_WATCH_BLE_BSP_CONNECTED && g_last_sync_utc == 0)
+      {
+        if (!s_conn_window)
+          {
+            s_conn_window = true;
+            s_conn_window_deadline = now.tv_sec + 8;
+          }
+        else if (now.tv_sec > s_conn_window_deadline)
+          {
+            s_conn_window = false;
+          }
+      }
+    else
+      {
+        s_conn_window = false;
       }
   }
 

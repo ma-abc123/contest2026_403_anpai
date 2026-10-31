@@ -10,12 +10,18 @@ touch events over the same UART the frames come back on.
 Coordinates are clamped to the panel, so a drag that runs off the window
 edge slides along the border instead of producing nonsense.
 
+The firmware streams a frame in small chunks and keeps servicing touch
+while it does, so this end must NOT block on a full frame between mouse
+events: the loop selects on both the serial port and the X connection and
+feeds an incremental frame parser as bytes arrive.
+
 Usage:
     python3 tools/shot_remote.py -p /dev/ttyUSB0
 """
 
 import argparse
 import os
+import select
 import struct
 import sys
 import time
@@ -38,152 +44,37 @@ except ImportError:
     sys.exit("需要 python-xlib: pip install --user python-xlib")
 
 
-MAGIC = b"SHOT"
-HDR_LEN = 15
-FMT_RGB565 = 1
-FMT_RLE565 = 2
-MAX_PIXELS = 1024 * 1024
+from shot_protocol import FrameParser, wait_for_ready
 
 PANEL_W = 390
 PANEL_H = 450
 
-
-def read_exact(ser, n, timeout=5.0):
-    buf = bytearray()
-    deadline = time.time() + timeout
-    while len(buf) < n:
-        chunk = ser.read(n - len(buf))
-        if chunk:
-            buf.extend(chunk)
-            deadline = time.time() + timeout
-        elif time.time() > deadline:
-            return None
-    return bytes(buf)
-
-
-def find_magic(ser, sink=None):
-    tail = b""
-    while True:
-        b = ser.read(1)
-        if not b:
-            return False
-        tail = (tail + b)[-4:]
-        if tail == MAGIC:
-            return True
-        if sink is not None:
-            sink.write(b)
-
-
-def rle_decode(data, count):
-    out = np.empty(count, dtype="<u2")
-    o = 0
-    i = 0
-    n = len(data)
-
-    while i < n and o < count:
-        c = data[i]
-        i += 1
-
-        if c < 0x80:
-            if i + 2 > n:
-                break
-            run = c + 1
-            px = data[i] | (data[i + 1] << 8)
-            i += 2
-            end = min(o + run, count)
-            out[o:end] = px
-            o = end
-        else:
-            lit = (c - 0x7F)
-            end = min(o + lit, count)
-            need = (end - o) * 2
-            if i + need > n:
-                break
-            out[o:end] = np.frombuffer(data[i:i + need], dtype="<u2")
-            i += need
-            o = end
-
-    return out if o == count else None
-
-
-def grab_frame(ser, sink=None):
-    """Request and decode one frame, or return None."""
-    ser.write(b"s")
-    ser.flush()
-
-    if not find_magic(ser, sink):
-        return None
-
-    body = read_exact(ser, HDR_LEN - 4)
-    if body is None:
-        return None
-
-    magic, w, h, stride, fmt, length = struct.unpack("<4sHHHBI", MAGIC + body)
-
-    if w == 0 or h == 0 or stride < w * 2 or length == 0:
-        return None
-    if length > MAX_PIXELS * 2:
-        return None
-
-    # Sanity bound on the advertised geometry: any console line that
-    # happens to contain the magic must not be mistaken for a frame.
-    if not (64 <= w <= 1024 and 64 <= h <= 1024):
-        return None
-
-    data = read_exact(ser, length)
-    if data is None or len(data) != length:
-        return None
-
-    pixels = stride * h // 2
-
-    if fmt == FMT_RLE565:
-        px = rle_decode(data, pixels)
-        if px is None:
-            return None
-        px = px.reshape(h, stride // 2)
-    elif fmt == FMT_RGB565:
-        px = np.frombuffer(data[:pixels * 2],
-                           dtype="<u2").reshape(h, stride // 2)
-    else:
-        return None
-
-    px = px[:, :w]
-    r = ((px >> 11) & 0x1F).astype(np.uint8)
-    g = ((px >> 5) & 0x3F).astype(np.uint8)
-    b = (px & 0x1F).astype(np.uint8)
-
-    rgb = np.dstack([(r << 3) | (r >> 2),
-                     (g << 2) | (g >> 4),
-                     (b << 3) | (b >> 2)])
-
-    return Image.fromarray(rgb, "RGB")
-
-
-def send_pointer(ser, x, y, down):
-    x = max(0, min(PANEL_W - 1, int(x)))
-    y = max(0, min(PANEL_H - 1, int(y)))
-    n = ser.write(b"T" + struct.pack("<HHB", x, y, 1 if down else 0))
-    ser.flush()
-    if n != 6:
-        print(f"[TX] short write {n}/6 at {x},{y} down={down}", flush=True)
+# A frame request that goes unanswered for this long (torn frame, lost
+# request, screen stuck) is re-issued.
+REQUEST_TIMEOUT = 1.5
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--port", default="/dev/ttyUSB0")
     ap.add_argument("-b", "--baud", type=int, default=1000000)
-    ap.add_argument("--boot-wait", type=float, default=12.0)
-    ap.add_argument("--fps-interval", type=float, default=0.0)
+    ap.add_argument("--boot-wait", type=float, default=0.0)
     args = ap.parse_args()
 
-    ser = serial.Serial(args.port, args.baud, timeout=0.2)
+    ser = serial.Serial(args.port, args.baud, timeout=0)
     ser.rts = False
     ser.dtr = False
     time.sleep(0.3)
     ser.reset_input_buffer()
 
-    print(f"等待 {args.boot_wait:.0f}s 让板子启动")
-    time.sleep(args.boot_wait)
+    # Opening the port resets the board; wait for the app banner so the
+    # first frame request (and any queued touch) is not swallowed by
+    # boot. --boot-wait only adds extra grace on top.
+    if args.boot_wait > 0:
+        print(f"额外等待 {args.boot_wait:.0f}s ...")
+        time.sleep(args.boot_wait)
+    ready, _banner = wait_for_ready(ser.read, timeout=15.0)
+    print("板子就绪" if ready else "未见启动横幅：板子应已在运行")
     ser.reset_input_buffer()
 
     disp = Xlib.display.Display()
@@ -206,6 +97,12 @@ def main():
     disp.sync()
 
     gc = win.create_gc()
+    # python-xlib: the X socket lives under display().socket; select() on
+    # it alongside the serial port so clicks are sent while a frame is
+    # still streaming in.
+    x_fd = disp.display.socket.fileno()
+    ser_fd = ser.fileno()
+    os.set_blocking(ser_fd, False)
 
     print("窗口已打开：鼠标点击/拖动 = 手表触摸；关窗或 Ctrl-C 退出")
 
@@ -215,66 +112,123 @@ def main():
     sink = open(log_path, "wb", buffering=0)
     print(f"固件日志写入 {log_path}")
 
-    down = False
+    parser = FrameParser(sink)
+
+    def send_pointer(x, y, down):
+        x = max(0, min(PANEL_W - 1, int(x)))
+        y = max(0, min(PANEL_H - 1, int(y)))
+        n = ser.write(b"T" + struct.pack("<HHB", x, y, 1 if down else 0))
+        if n != 6:
+            print(f"[TX] short write {n}/6 at {x},{y} down={down}",
+                  flush=True)
+
+    def pump_x():
+        """Handle every X event currently queued; return False to exit."""
+
+        while disp.pending_events():
+            e = disp.next_event()
+
+            if e.type == X.ButtonPress:
+                down[0] = True
+                print(f"[X] press {e.event_x},{e.event_y}", flush=True)
+                send_pointer(e.event_x, e.event_y, True)
+
+            elif e.type == X.MotionNotify:
+                if down[0]:
+                    send_pointer(e.event_x, e.event_y, True)
+
+            elif e.type == X.ButtonRelease:
+                down[0] = False
+                print(f"[X] release {e.event_x},{e.event_y}", flush=True)
+                send_pointer(e.event_x, e.event_y, False)
+
+            elif e.type == X.DestroyNotify:
+                return False
+
+        return True
+
+    def request_frame():
+        ser.write(b"s")
+        ser.flush()
+        return time.time()
+
+    down = [False]
+    outstanding_since = None
     frames = 0
+    drops = 0
     t0 = time.time()
 
     try:
+        outstanding_since = request_frame()
+
         while True:
-            # Pump X events first so input feels immediate even while a
-            # frame is still being transferred.
-            while disp.pending_events():
-                e = disp.next_event()
+            # X events first: input must never wait behind a frame.
+            if not pump_x():
+                break
 
-                if e.type == X.ButtonPress:
-                    down = True
-                    print(f"[X] press {e.event_x},{e.event_y}", flush=True)
-                    send_pointer(ser, e.event_x, e.event_y, True)
+            r, _, _ = select.select([ser_fd, x_fd], [], [], 0.05)
 
-                elif e.type == X.MotionNotify:
-                    if down:
-                        send_pointer(ser, e.event_x, e.event_y, True)
+            if x_fd in r:
+                if not pump_x():
+                    break
 
-                elif e.type == X.ButtonRelease:
-                    down = False
-                    print(f"[X] release {e.event_x},{e.event_y}", flush=True)
-                    send_pointer(ser, e.event_x, e.event_y, False)
+            if ser_fd in r:
+                try:
+                    data = ser.read(4096)
+                except (serial.SerialException, OSError) as err:
+                    print(f"\n串口错误: {err}")
+                    break
 
-                elif e.type == X.Expose:
-                    pass
+                if data:
+                    img = parser.feed(data)
+                    if img is not None:
+                        outstanding_since = None
+                        frames += 1
 
-                elif e.type == X.DestroyNotify:
-                    raise KeyboardInterrupt
+                        # The watch may send a downscaled frame; stretch it
+                        # back to panel size so window coordinates map 1:1
+                        # to touch coordinates.
+                        if img.size != (PANEL_W, PANEL_H):
+                            img = img.resize((PANEL_W, PANEL_H),
+                                             Image.NEAREST)
 
-            img = grab_frame(ser, sink)
-            if img is not None:
-                # The watch may send a downscaled frame; stretch it back to
-                # panel size so window coordinates map 1:1 to touch
-                # coordinates.
-                if img.size != (PANEL_W, PANEL_H):
-                    img = img.resize((PANEL_W, PANEL_H), Image.NEAREST)
-
-                win.put_pil_image(gc, 0, 0, img)
-                disp.flush()
-                frames += 1
-
-                # Put the frame counter in the title: the watch face has no
-                # moving element while the clock is unsynced, so without
-                # this a healthy stream and a frozen one look identical.
-                if frames % 5 == 0:
-                    try:
-                        win.set_wm_name(f"AI Watch Remote - frame {frames}")
+                        win.put_pil_image(gc, 0, 0, img)
                         disp.flush()
-                    except Exception:
-                        pass
 
-                if frames % 10 == 0:
-                    dt = time.time() - t0
-                    print(f"{frames} 帧, {frames / dt:.1f} fps   ",
-                          end="\r", flush=True)
+                        # Put the frame counter in the title: the watch
+                        # face has no moving element while the clock is
+                        # unsynced, so without this a healthy stream and a
+                        # frozen one look identical.
+                        if frames % 5 == 0:
+                            try:
+                                win.set_wm_name(
+                                    f"AI Watch Remote - frame {frames}"
+                                    f" (drop {drops})")
+                                disp.flush()
+                            except Exception:
+                                pass
 
-            if args.fps_interval:
-                time.sleep(args.fps_interval)
+                        if frames % 10 == 0:
+                            dt = time.time() - t0
+                            print(f"{frames} 帧, {frames / dt:.1f} fps,"
+                                  f" 丢 {drops}   ", end="\r", flush=True)
+
+                        outstanding_since = request_frame()
+
+                    elif parser.failed:
+                        # A body arrived but would not decode (console log
+                        # torn through the payload). The parser has already
+                        # resynchronised; ask for the next frame at once.
+                        drops += 1
+                        outstanding_since = request_frame()
+
+            # A request that never produced a frame gets re-issued so one
+            # lost frame cannot stall the preview.
+            if (outstanding_since is not None and
+                    time.time() - outstanding_since > REQUEST_TIMEOUT):
+                drops += 1
+                outstanding_since = request_frame()
+
     except KeyboardInterrupt:
         print("\n退出")
     finally:

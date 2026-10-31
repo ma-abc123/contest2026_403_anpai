@@ -255,6 +255,22 @@ struct ai_watch_ai_timer_req_s
 int ai_watch_ble_init(void);
 
 /****************************************************************************
+ * Name: ai_watch_ble_connect_window_active
+ *
+ * Description:
+ *   True while a BLE connection exists but the phone has not performed
+ *   TimeSync yet (capped at 8 s). The main loop pauses frame streaming
+ *   and slows IMU sampling during this window to keep the fragile
+ *   post-connect period free of competing load.
+ *
+ * Returned Value:
+ *   true = connect window active, reduce load.
+ *
+ ****************************************************************************/
+
+bool ai_watch_ble_connect_window_active(void);
+
+/****************************************************************************
  * Name: ai_watch_ble_get_state / ai_watch_ble_get_status_text
  ****************************************************************************/
 
