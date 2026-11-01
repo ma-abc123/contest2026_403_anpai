@@ -55,7 +55,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.48-ble2"
+#define AI_WATCH_VERSION            "4.8.55-ble9"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -88,7 +88,11 @@
 /* Swipe gesture thresholds */
 
 #define AI_WATCH_SWIPE_THRESHOLD    50
-#define AI_WATCH_SWIPE_TIMEOUT_MS   300
+/* 600 ms: the remote virtual pointer (host mouse over UART) adds enough
+ * latency that human swipes routinely exceed 300 ms; with the old 300 ms
+ * window a remote swipe fell out of the fast path and degraded into a
+ * widget click. Panel swipes were never this slow. */
+#define AI_WATCH_SWIPE_TIMEOUT_MS   600
 /* Back-home gesture: fires mid-drag as soon as the horizontal intent is
  * unambiguous; the release-based fallback allows slow, deliberate swipes.
  */
@@ -2253,6 +2257,17 @@ static void ai_watch_headless_flush(FAR lv_display_t *disp,
 
 static void ai_watch_touch_probe_poll(FAR struct ai_watch_s *watch)
 {
+  /* DISABLED 2026-11-01: the probe was a bring-up diagnostic for the dead
+   * panel. With RENDER_MODE_FULL every marker show/move invalidates and
+   * redraws the whole 351 KB framebuffer (~1.2 s measured), which stalls
+   * the main loop for the entire gesture - the first touch after a quiet
+   * period swallowed swipes whole and they degraded into taps ("右滑被
+   * 识别为点击"). The virtual input path is covered by
+   * tools/shot_selftest.py instead; re-enable only for touch debugging,
+   * one render cost at a time. */
+
+  return;
+
   static FAR lv_obj_t *dot;
   static FAR lv_obj_t *tag;
   static uint32_t hold_until;
@@ -2897,16 +2912,6 @@ static void ai_watch_settings_poll(FAR struct ai_watch_s *watch)
     }
 }
 
-static void ai_watch_home_click_cb(lv_event_t *e)
-{
-  FAR struct ai_watch_s *watch = lv_event_get_user_data(e);
-
-  if (watch->current_page == AI_WATCH_PAGE_HOME)
-    {
-      ai_watch_push_page(watch, AI_WATCH_PAGE_APP_LIST);
-    }
-}
-
 /* Settings page geometry. The list scrolls, so rows are placed with explicit
  * offsets in the list's content coordinates; with 24 px side padding the
  * usable width is 342 px on the 390 px panel.
@@ -3294,6 +3299,8 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
   FAR lv_obj_t *hint;
   FAR lv_obj_t *stats;
   FAR lv_obj_t *col;
+  FAR lv_obj_t *bar;
+  FAR lv_obj_t *card;
   int theme = watch->current_theme;
 
   lv_obj_set_style_bg_color(screen, ai_watch_theme_bg(theme), 0);
@@ -3301,28 +3308,40 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
   watch->fixed_pages[AI_WATCH_PAGE_BRIEF] = screen;
   g_brief_ui.screen = screen;
 
+  /* ---- Header: title + accent underline + weather ---- */
+
   title = lv_label_create(screen);
   lv_label_set_text(title, "每日简报");
   lv_obj_set_style_text_color(title, ai_watch_theme_text(theme), 0);
   lv_obj_set_style_text_font(title, &ai_watch_font_cjk_16, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 12);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 14);
+
+  bar = lv_obj_create(screen);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, 40, 3);
+  lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 20, 44);
+  lv_obj_set_style_bg_color(bar, ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
 
   g_brief_ui.weather_val = lv_label_create(screen);
   lv_label_set_text(g_brief_ui.weather_val, "");
   lv_obj_set_style_text_color(g_brief_ui.weather_val,
                               ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_text_font(g_brief_ui.weather_val, &ai_watch_font_cjk_16, 0);
-  lv_obj_align(g_brief_ui.weather_val, LV_ALIGN_TOP_RIGHT, -20, 12);
+  lv_obj_align(g_brief_ui.weather_val, LV_ALIGN_TOP_RIGHT, -20, 14);
 
-  /* Three counters side by side */
+  /* ---- Stats card: three counters on a subtle panel ---- */
 
   stats = lv_obj_create(screen);
-  lv_obj_set_size(stats, AI_WATCH_BRIEF_WIDTH, 92);
-  lv_obj_align(stats, LV_ALIGN_TOP_MID, 0, 46);
-  lv_obj_set_style_bg_opa(stats, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(stats, 0, 0);
-  lv_obj_set_style_radius(stats, 0, 0);
-  lv_obj_set_style_pad_all(stats, 0, 0);
+  lv_obj_set_size(stats, AI_WATCH_BRIEF_WIDTH - 32, 100);
+  lv_obj_align(stats, LV_ALIGN_TOP_MID, 0, 58);
+  lv_obj_set_style_bg_color(stats, ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_bg_opa(stats, LV_OPA_30, 0);
+  lv_obj_set_style_border_width(stats, 1, 0);
+  lv_obj_set_style_border_color(stats, ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_border_opa(stats, LV_OPA_50, 0);
+  lv_obj_set_style_radius(stats, 14, 0);
+  lv_obj_set_style_pad_all(stats, 4, 0);
   lv_obj_clear_flag(stats, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(stats, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(stats, LV_FLEX_ALIGN_SPACE_EVENLY,
@@ -3343,7 +3362,7 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
         FAR lv_obj_t *unit;
 
         col = lv_obj_create(stats);
-        lv_obj_set_size(col, (AI_WATCH_BRIEF_WIDTH - 24) / 3, 84);
+        lv_obj_set_size(col, (AI_WATCH_BRIEF_WIDTH - 40) / 3, 88);
         lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(col, 0, 0);
         lv_obj_set_style_pad_all(col, 0, 0);
@@ -3355,7 +3374,7 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
         *slots[k] = lv_label_create(col);
         lv_label_set_text(*slots[k], "--");
         lv_obj_set_style_text_color(*slots[k], ai_watch_theme_accent(theme), 0);
-        lv_obj_set_style_text_font(*slots[k], &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_font(*slots[k], &lv_font_montserrat_28, 0);
 
         unit = lv_label_create(col);
         lv_label_set_text(unit, names[k]);
@@ -3364,7 +3383,7 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
       }
   }
 
-  /* Pending reminders */
+  /* ---- Pending reminders ---- */
 
   {
     FAR lv_obj_t *head = lv_label_create(screen);
@@ -3372,38 +3391,62 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
     lv_label_set_text(head, "待办");
     lv_obj_set_style_text_color(head, ai_watch_theme_secondary(theme), 0);
     lv_obj_set_style_text_font(head, &ai_watch_font_cjk_16, 0);
-    lv_obj_align(head, LV_ALIGN_TOP_LEFT, 20, 146);
+    lv_obj_align(head, LV_ALIGN_TOP_LEFT, 20, 174);
   }
 
   g_brief_ui.reminder_box = lv_obj_create(screen);
-  lv_obj_set_size(g_brief_ui.reminder_box, AI_WATCH_BRIEF_WIDTH, 96);
-  lv_obj_align(g_brief_ui.reminder_box, LV_ALIGN_TOP_MID, 0, 172);
-  lv_obj_set_style_bg_opa(g_brief_ui.reminder_box, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(g_brief_ui.reminder_box, 0, 0);
-  lv_obj_set_style_radius(g_brief_ui.reminder_box, 0, 0);
-  lv_obj_set_style_pad_all(g_brief_ui.reminder_box, 0, 0);
+  lv_obj_set_size(g_brief_ui.reminder_box, AI_WATCH_BRIEF_WIDTH - 32, 92);
+  lv_obj_align(g_brief_ui.reminder_box, LV_ALIGN_TOP_MID, 0, 198);
+  lv_obj_set_style_bg_color(g_brief_ui.reminder_box,
+                            ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_bg_opa(g_brief_ui.reminder_box, LV_OPA_30, 0);
+  lv_obj_set_style_border_width(g_brief_ui.reminder_box, 1, 0);
+  lv_obj_set_style_border_color(g_brief_ui.reminder_box,
+                                ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_border_opa(g_brief_ui.reminder_box, LV_OPA_50, 0);
+  lv_obj_set_style_radius(g_brief_ui.reminder_box, 12, 0);
+  lv_obj_set_style_pad_all(g_brief_ui.reminder_box, 8, 0);
   lv_obj_set_style_pad_row(g_brief_ui.reminder_box, 6, 0);
   lv_obj_set_flex_flow(g_brief_ui.reminder_box, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(g_brief_ui.reminder_box, LV_FLEX_ALIGN_START,
                         LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-  /* AI commentary */
+  /* ---- AI commentary card: accent bar + wrapped text ---- */
 
-  g_brief_ui.comment_val = lv_label_create(screen);
+  card = lv_obj_create(screen);
+  lv_obj_set_size(card, AI_WATCH_BRIEF_WIDTH - 32, 92);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 306);
+  lv_obj_set_style_bg_color(card, ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_30, 0);
+  lv_obj_set_style_border_width(card, 1, 0);
+  lv_obj_set_style_border_color(card, ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_border_opa(card, LV_OPA_50, 0);
+  lv_obj_set_style_radius(card, 12, 0);
+  lv_obj_set_style_pad_all(card, 0, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  bar = lv_obj_create(card);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, 3, 68);
+  lv_obj_align(bar, LV_ALIGN_LEFT_MID, 4, 0);
+  lv_obj_set_style_bg_color(bar, ai_watch_theme_accent(theme), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+  g_brief_ui.comment_val = lv_label_create(card);
   lv_label_set_long_mode(g_brief_ui.comment_val, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(g_brief_ui.comment_val, AI_WATCH_BRIEF_WIDTH);
+  lv_obj_set_width(g_brief_ui.comment_val, AI_WATCH_BRIEF_WIDTH - 72);
   lv_label_set_text(g_brief_ui.comment_val, "连接手机后可生成 AI 点评");
   lv_obj_set_style_text_color(g_brief_ui.comment_val,
                               ai_watch_theme_text(theme), 0);
   lv_obj_set_style_text_font(g_brief_ui.comment_val,
                              &ai_watch_font_cjk_16, 0);
-  lv_obj_align(g_brief_ui.comment_val, LV_ALIGN_TOP_MID, 0, 280);
+  lv_obj_align(g_brief_ui.comment_val, LV_ALIGN_LEFT_MID, 16, 0);
 
   hint = lv_label_create(screen);
-  lv_label_set_text(hint, LV_SYMBOL_RIGHT " 返回 (KEY2)");
+  lv_label_set_text(hint, "返回 (KEY2)");
   lv_obj_set_style_text_color(hint, ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_text_font(hint, &ai_watch_font_cjk_16, 0);
-  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
 }
 
 /****************************************************************************
@@ -3535,15 +3578,17 @@ static void ai_watch_create_home_page(FAR struct ai_watch_s *watch)
   /* Gesture hint */
 
   watch->home_hint_label = lv_label_create(screen);
-  lv_label_set_text(watch->home_hint_label, "Tap or swipe up for apps");
+  lv_label_set_text(watch->home_hint_label, "Swipe up for apps");
   lv_obj_set_style_text_color(watch->home_hint_label,
                               ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_text_font(watch->home_hint_label,
                              &lv_font_montserrat_14, 0);
   lv_obj_align(watch->home_hint_label, LV_ALIGN_BOTTOM_MID, 0, -24);
 
-  lv_obj_add_event_cb(screen, ai_watch_home_click_cb,
-                      LV_EVENT_CLICKED, watch);
+  /* The CLICKED-to-open-the-app-list callback was removed 2026-11-01:
+   * over the remote preview a swipe that ends on the screen object fires
+   * CLICKED (no scrolling on a fixed screen), so every swipe degraded
+   * into "tap opens the app list". The list is swipe-up only now. */
 }
 
 /****************************************************************************
@@ -4375,12 +4420,14 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
 
       if (watch->current_page == AI_WATCH_PAGE_HOME)
         {
-          /* Home page: tap or swipe up opens the app list */
-
-          if (elapsed_ms > AI_WATCH_SWIPE_TIMEOUT_MS)
-            {
-              return;
-            }
+          /* Home page: swipe up opens the app list, horizontal swipes
+           * open the brief. NO time gate here: the classification is
+           * purely geometric (|dx|/|dy| vs the threshold), and the
+           * remote pointer's drag duration is unbounded - the old 300/
+           * 600 ms windows silently swallowed human-paced remote swipes
+           * (measured 800 ms). A long stationary press ends in the
+           * small-delta case, which does nothing since taps no longer
+           * open the list. */
 
           if (abs(dy) > AI_WATCH_SWIPE_THRESHOLD && abs(dy) > abs(dx))
             {
@@ -4391,21 +4438,24 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
             }
           else if (abs(dx) > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
             {
-              /* Swipe left opens the brief; refresh first so the page
-               * shows counters as of now rather than as of creation.
+              /* Either horizontal direction opens the brief. Left swipe
+               * is the documented gesture; right swipe was added for the
+               * remote-preview era - users naturally swipe right for a
+               * -1 screen, and with only the left branch a right swipe
+               * fell through to the widget underneath and read as a
+               * click. Refresh first so the page shows counters as of
+               * now rather than as of creation.
                */
 
-              if (dx < 0)
-                {
-                  ai_watch_brief_refresh(watch);
-                  ai_watch_push_page(watch, AI_WATCH_PAGE_BRIEF);
-                }
+              ai_watch_brief_refresh(watch);
+              ai_watch_push_page(watch, AI_WATCH_PAGE_BRIEF);
             }
-          else if (abs(dx) < AI_WATCH_SWIPE_THRESHOLD &&
-                   abs(dy) < AI_WATCH_SWIPE_THRESHOLD)
-            {
-              ai_watch_push_page(watch, AI_WATCH_PAGE_APP_LIST);
-            }
+          /* Taps no longer open the app list (removed 2026-11-01): over
+           * the remote preview a swipe that misclassifies as a tap kept
+           * opening the wrong page - the list is swipe-up only now. */
+
+          (void)dx;
+          (void)dy;
         }
       else if (watch->current_page != AI_WATCH_PAGE_APP_LIST)
         {
@@ -4538,8 +4588,13 @@ int main(int argc, FAR char *argv[])
       if (fbuf != NULL)
         {
           lv_display_set_color_format(result.disp, LV_COLOR_FORMAT_RGB565);
+          /* DIRECT (not FULL): the buffer is still full-frame so the
+           * serial dump reads a complete picture, but LVGL only redraws
+           * the damaged areas. RENDER_MODE_FULL redrew all 351 KB on
+           * every invalidation (~100-180 ms each) - a press alone made
+           * the main loop 10x slower and swallowed gestures whole. */
           lv_display_set_buffers(result.disp, fbuf, NULL, buf_size,
-                                 LV_DISPLAY_RENDER_MODE_FULL);
+                                 LV_DISPLAY_RENDER_MODE_DIRECT);
           lv_display_set_flush_cb(result.disp, ai_watch_headless_flush);
           printf("Headless display: 390x450 RGB565, no panel writes\n");
         }
@@ -4783,14 +4838,19 @@ int main(int argc, FAR char *argv[])
        */
 
       /* BLE connect window: keep the fragile post-connect period free
-       * of preview and high-rate sampling until the phone syncs (or the
-       * 8 s cap expires). */
+       * of preview until the phone syncs (8 s cap). The IMU stays at the
+       * p02-verified 15 Hz for the WHOLE connection: the phone subscribes
+       * in indication mode (CCCD 0x0002 -> bt_gatt_indicate, ~100-150 ms
+       * blocking each), and the MOTION_DATA indication rate is
+       * sample_rate/4 - at 25 ms poll that is ~10/s, 2.7x the p02-era
+       * rate, and connects died right as that stream started. */
 
       {
         bool conn_window = ai_watch_ble_connect_window_active();
 
         ai_watch_shot_set_stream_gate(conn_window);
-        ai_watch_motion_set_slow(conn_window);
+        ai_watch_motion_set_slow(ai_watch_ble_get_state() ==
+                                 AI_WATCH_BLE_BSP_CONNECTED);
       }
 
       ai_watch_skill_poll_ui(&watch);

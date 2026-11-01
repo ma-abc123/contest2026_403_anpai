@@ -121,19 +121,33 @@ class Bluetoothctl:
         self.p = subprocess.Popen(
             ["bluetoothctl"], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=0)
+            bufsize=0)
+        self.stdout_buf = b""
+
+    def read_lines(self, timeout):
+        """Read complete output lines without blocking on a partial line."""
+
+        r, _, _ = select.select([self.p.stdout], [], [], timeout)
+        if not r:
+            return []
+
+        chunk = os.read(self.p.stdout.fileno(), 4096)
+        if not chunk:
+            return []
+
+        self.stdout_buf += chunk
+        lines = self.stdout_buf.split(b"\n")
+        self.stdout_buf = lines.pop()
+        return [line.decode("utf-8", "replace").rstrip()
+                for line in lines]
 
     def send(self, cmd, wait=0.8):
-        self.p.stdin.write(cmd + "\n")
+        self.p.stdin.write((cmd + "\n").encode())
         self.p.stdin.flush()
         t_end = time.time() + wait
         out = []
         while time.time() < t_end:
-            r, _, _ = select.select([self.p.stdout], [], [], 0.1)
-            if r:
-                line = self.p.stdout.readline()
-                if line:
-                    out.append(line.rstrip())
+            out.extend(self.read_lines(min(0.1, max(0.0, t_end - time.time()))))
         return out
 
     def wait_for(self, marks, timeout, collect=None):
@@ -142,12 +156,7 @@ class Bluetoothctl:
         t_end = time.time() + timeout
         all_lines = []
         while time.time() < t_end:
-            r, _, _ = select.select([self.p.stdout], [], [], 0.1)
-            if r:
-                line = self.p.stdout.readline()
-                if not line:
-                    continue
-                line = line.rstrip()
+            for line in self.read_lines(min(0.1, max(0.0, t_end - time.time()))):
                 if collect is not None:
                     all_lines.append(line)
                 for m in marks:
@@ -157,7 +166,7 @@ class Bluetoothctl:
 
     def close(self):
         try:
-            self.p.stdin.write("quit\n")
+            self.p.stdin.write(b"quit\n")
             self.p.stdin.flush()
         except Exception:
             pass
@@ -168,7 +177,25 @@ class Bluetoothctl:
 def timesync_value():
     utc = int(time.time())
     tz_min = 480                      # UTC+8, matches the phone app
-    return struct.pack("<BiH", 1, utc, tz_min & 0xFFFF).hex()
+    return struct.pack("<BiH", 1, utc, tz_min & 0xFFFF)
+
+
+def write_timesync(mac):
+    """Write TimeSync through BlueZ D-Bus (bluetoothctl parses byte lists
+    differently and rejects the packed phone payload).
+    """
+
+    device = mac.replace(":", "_")
+    attr = f"/org/bluez/hci0/dev_{device}/service000e/char0012"
+    data = ", ".join(f"byte 0x{value:02x}" for value in timesync_value())
+    result = subprocess.run(
+        ["gdbus", "call", "--system", "--dest", "org.bluez",
+         "--object-path", attr,
+         "--method", "org.bluez.GattCharacteristic1.WriteValue",
+         f"[{data}]", "{}"],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"TimeSync D-Bus write failed: {result.stderr.strip()}")
 
 
 class LoadThread(threading.Thread):
@@ -190,7 +217,7 @@ class LoadThread(threading.Thread):
                 break
 
 
-def one_trial(bt, console, mac, load, trial, gap_s):
+def one_trial(bt, console, mac, load, trial, gap_s, hold_s=45.0):
     print(f"--- trial {trial}: load={load} ---")
     console.clear()
     t0 = time.time()
@@ -228,16 +255,18 @@ def one_trial(bt, console, mac, load, trial, gap_s):
         bt.send(f"select-attribute {uuid}", 0.4)
         bt.send("notify on", 0.4)
     bt.send(f"select-attribute {UUID_TIMESYNC}", 0.4)
-    bt.send(f"write {timesync_value()}", 0.8)
+    write_timesync(mac)
 
     # wait for the authoritative board verdict
     verdict = "TIMEOUT"
     t_end = time.time() + 10.0
     events = []
+    synced = False
     while time.time() < t_end:
         evs = console.since(t0)
         events = [l for (_, l) in evs]
         if any("time synced" in l for l in events):
+            synced = True
             verdict = "SUCCESS"
             break
         if any("hardware-error" in l or "Force teardown" in l
@@ -248,6 +277,28 @@ def one_trial(bt, console, mac, load, trial, gap_s):
             verdict = "FAIL_DROP"
             break
         time.sleep(0.05)
+
+    # Survival hold: the phone stays connected after sync with NO further
+    # traffic of its own - all ongoing traffic is the watch's indication
+    # stream (status + MOTION_DATA). Hold the link and see whether the
+    # controller survives it; the "初始化抛 lost" symptom dies here.
+    if verdict == "SUCCESS" and hold_s > 0:
+        t_hold = time.time()
+        t_end = time.time() + hold_s
+        while time.time() < t_end:
+            evs = console.since(t0)
+            events = [l for (_, l) in evs]
+            if any("hardware-error" in l or "Force teardown" in l
+                   for l in events):
+                verdict = "DIED_HOLD"
+                break
+            if any("disconnected, reason" in l for l in events):
+                verdict = "DIED_HOLD"
+                break
+            time.sleep(0.05)
+        else:
+            verdict = "SURVIVED"
+        print(f"   存活观察 {time.time() - t_hold:.0f}s -> {verdict}")
 
     if load_thr:
         load_thr.stop_flag = True
@@ -286,6 +337,8 @@ def main():
     ap.add_argument("--load", choices=["none", "frames"], default="none")
     ap.add_argument("--mac", default=None)
     ap.add_argument("--gap", type=float, default=4.0)
+    ap.add_argument("--hold", type=float, default=45.0,
+                    help="授时成功后保持连接的秒数（0=不保持）")
     args = ap.parse_args()
 
     import serial
@@ -315,17 +368,11 @@ def main():
             t_end = time.time() + 12.0
             seen = []
             while time.time() < t_end:
-                r, _, _ = select.select([bt.p.stdout], [], [], 0.1)
-                if not r:
-                    continue
-                line = bt.p.stdout.readline()
-                if not line:
-                    continue
-                line = line.rstrip()
-                if "Device" in line:
-                    seen.append(line)
-                if WATCH_NAME in line and mac is None:
-                    mac = mac_from_line(line)
+                for line in bt.read_lines(min(0.1, max(0.0, t_end - time.time()))):
+                    if "Device" in line:
+                        seen.append(line)
+                    if WATCH_NAME in line and mac is None:
+                        mac = mac_from_line(line)
             bt.send("scan off", 0.3)
             if mac:
                 break
@@ -341,7 +388,7 @@ def main():
         dark_boots = 0
         while i < args.trials:
             v, t_conn, events = one_trial(bt, console, mac, args.load, i + 1,
-                                          args.gap)
+                                          args.gap, hold_s=args.hold)
             if v == "NO_ADV" and dark_boots < 2:
                 # this boot never advertised; a fresh reset re-rolls the
                 # bring-up dice (measured 2026-10-31: 1/3 of boots come up
@@ -369,7 +416,7 @@ def main():
     finally:
         bt.close()
 
-    ok = verdicts.count("SUCCESS")
+    ok = verdicts.count("SURVIVED")
     print("\n== 汇总 ==")
     from collections import Counter
     for k, c in Counter(verdicts).items():

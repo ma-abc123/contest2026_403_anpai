@@ -108,15 +108,17 @@ static uint8_t g_alert_count;           /* entries waiting */
  * loop - otherwise touch sampling dies at recording rates (seen on
  * 4.8.0: every 4th REC sample showed a ~120 ms main-loop stall).
  *
- * Single producer (the LVGL main loop; ble_process/motion/UI all run
- * there), single consumer (tx_worker). Plain volatile indices are
- * sufficient on this single-core target.
+ * The LVGL loop is the producer and tx_worker is the consumer. A mutex
+ * protects queue metadata because the main loop also discards pending
+ * entries on disconnect; the worker copies an entry before the blocking
+ * GATT call.
  */
 
 static struct ai_watch_ble_txq_entry_s
     g_txq[AI_WATCH_BLE_TXQ_LEN];
 static volatile uint8_t g_txq_head;
 static volatile uint8_t g_txq_tail;
+static pthread_mutex_t g_txq_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_txq_dropped;
 static pthread_t g_tx_thread;
 static volatile bool g_tx_thread_ok;
@@ -134,6 +136,7 @@ static struct timespec s_initfail_next; /* earliest next attempt, monotonic */
  * Hardware Error). */
 static volatile bool s_conn_window;
 static long s_conn_window_deadline;     /* CLOCK_MONOTONIC sec */
+static bool s_conn_synced;
 
 /****************************************************************************
  * Private Functions - DataUpload TX worker
@@ -147,7 +150,27 @@ static FAR void *ai_ble_tx_worker(FAR void *arg)
 
   for (;;)
     {
+      struct ai_watch_ble_txq_entry_s entry;
+      uint8_t tail;
+      uint8_t next;
+      int ret;
+
+      pthread_mutex_lock(&g_txq_lock);
       if (g_txq_tail == g_txq_head)
+        {
+          pthread_mutex_unlock(&g_txq_lock);
+          usleep(20 * 1000);
+          continue;
+        }
+
+      pthread_mutex_unlock(&g_txq_lock);
+
+      /* The main loop timestamps every new link. Do not let a queued
+       * sample escape before it has installed the fresh-link quiet period.
+       */
+
+      if (ai_watch_ble_get_state() != AI_WATCH_BLE_BSP_CONNECTED ||
+          g_conn_since == 0)
         {
           usleep(20 * 1000);
           continue;
@@ -171,21 +194,33 @@ static FAR void *ai_ble_tx_worker(FAR void *arg)
             }
         }
 
-      FAR struct ai_watch_ble_txq_entry_s *e = &g_txq[g_txq_tail];
-      uint8_t next = (g_txq_tail + 1u) % AI_WATCH_BLE_TXQ_LEN;
-      int ret;
+      pthread_mutex_lock(&g_txq_lock);
+      if (g_txq_tail == g_txq_head)
+        {
+          pthread_mutex_unlock(&g_txq_lock);
+          continue;
+        }
 
-      ret = ai_watch_ble_send_sensor_data(e->sensor_type,
-                                          e->data, e->len);
+      tail = g_txq_tail;
+      entry = g_txq[tail];
+      next = (tail + 1u) % AI_WATCH_BLE_TXQ_LEN;
 
-      /* Consume the entry either way: drops beat re-sending stale
-       * samples. A failure (peer not yet subscribed, transient radio
-       * state) just costs a backoff sleep - without it the "Device is
-       * not subscribed" path would retry at loop rate and flood the
-       * console (119 warnings on the 4.8.0 log).
+      /* Consume before the potentially blocking GATT call. The main loop
+       * may clear the remaining queue on disconnect while indicate waits;
+       * advancing the old tail after it returns would resurrect stale data.
        */
 
       g_txq_tail = next;
+      pthread_mutex_unlock(&g_txq_lock);
+
+      ret = ai_watch_ble_send_sensor_data(entry.sensor_type,
+                                          entry.data, entry.len);
+
+      /* A failure (peer not yet subscribed, transient radio state) just
+       * costs a backoff sleep - without it the "Device is not subscribed"
+       * path would retry at loop rate and flood the console (119 warnings
+       * on the 4.8.0 log).
+       */
 
       if (ret != 0)
         {
@@ -294,6 +329,11 @@ static void ai_ble_apply_timesync(
 
   g_tz_offset_min = sync->tz_offset_min;
   g_last_sync_utc = sync->utc_seconds;
+  if (g_conn_since != 0)
+    {
+      s_conn_synced = true;
+      s_conn_window = false;
+    }
 
   printf("BLE: time synced, utc=%lu tz=%+d min\n",
          (unsigned long)sync->utc_seconds, (int)sync->tz_offset_min);
@@ -877,9 +917,37 @@ bool ai_watch_ble_connect_window_active(void)
 
 void ai_watch_ble_process(void)
 {
+  static bool disconnected_seen;
+  static struct timespec next_retry;
   struct ai_watch_ble_bsp_timesync_s sync;
   uint8_t cmd[AI_WATCH_BLE_CMD_MAX];
   size_t len;
+  enum ai_watch_ble_bsp_state_e state;
+  struct timespec now;
+
+  /* Start a fresh quiet window for every connection, including reconnects
+   * after the watch has already been time-synced. g_last_sync_utc is a
+   * persistent clock-status value and cannot identify the current link.
+   */
+
+  state = ai_watch_ble_get_state();
+  if (state == AI_WATCH_BLE_BSP_CONNECTED)
+    {
+      if (g_conn_since == 0)
+        {
+          clock_gettime(CLOCK_MONOTONIC, &now);
+          g_conn_since = now.tv_sec == 0 ? 1 : now.tv_sec;
+          s_conn_synced = false;
+          s_conn_window = true;
+          s_conn_window_deadline = now.tv_sec + 8;
+        }
+    }
+  else
+    {
+      g_conn_since = 0;
+      s_conn_synced = false;
+      s_conn_window = false;
+    }
 
   /* Deliver a pending validated TimeSync: RTC gets UTC, the timezone
    * offset is remembered for display only.
@@ -1002,31 +1070,13 @@ void ai_watch_ble_process(void)
    * the preview frozen forever. */
 
   {
-    enum ai_watch_ble_bsp_state_e state = ai_watch_ble_get_state();
-    struct timespec now;
-
+    state = ai_watch_ble_get_state();
     clock_gettime(CLOCK_MONOTONIC, &now);
 
     if (state == AI_WATCH_BLE_BSP_CONNECTED)
       {
-        if (g_conn_since == 0)
-          {
-            g_conn_since = now.tv_sec;
-          }
-
-        if (g_last_sync_utc == 0)
-          {
-            if (!s_conn_window)
-              {
-                s_conn_window = true;
-                s_conn_window_deadline = now.tv_sec + 8;
-              }
-            else if (now.tv_sec > s_conn_window_deadline)
-              {
-                s_conn_window = false;
-              }
-          }
-        else
+        if (s_conn_window && !s_conn_synced &&
+            now.tv_sec >= s_conn_window_deadline)
           {
             s_conn_window = false;
           }
@@ -1038,15 +1088,15 @@ void ai_watch_ble_process(void)
       }
   }
 
-  /* Auto-reconnect: after a link loss, retry re-advertising once per
-   * second from this (application) thread until it succeeds - the
-   * bridge cannot run the HCI command sequence reliably from its RX
-   * context, and the host does not auto-resume ONE_TIME advertising.
+  /* Auto-reconnect: let the disconnect callback and controller finish
+   * their teardown before sending a new advertising command. Immediate
+   * bt_le_adv_start after a 0x13 disconnect timed out on 0x200a and drove
+   * recovery; after the recovery advertising became usable once the
+   * controller had settled. Retry once per second after this initial gap.
    */
 
   if (ai_watch_ble_get_state() == AI_WATCH_BLE_BSP_DISCONNECTED)
     {
-      static struct timespec next_retry;
       struct timespec now;
 
       clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1055,17 +1105,31 @@ void ai_watch_ble_process(void)
        * next fresh connection (the ~4.5-5.3 s deaths of 2026-10-31 all
        * followed the first notification burst on a new link). */
 
+      pthread_mutex_lock(&g_txq_lock);
       if (g_txq_head != g_txq_tail)
         {
           g_txq_tail = g_txq_head;
         }
+      pthread_mutex_unlock(&g_txq_lock);
 
-      if (now.tv_sec >= next_retry.tv_sec)
+      if (!disconnected_seen)
+        {
+          disconnected_seen = true;
+          next_retry = now;
+          next_retry.tv_sec += 3;
+        }
+      else if (now.tv_sec >= next_retry.tv_sec)
         {
           ai_watch_ble_bsp_resume_advertising();
           next_retry = now;
           next_retry.tv_sec += 1;
         }
+    }
+  else
+    {
+      disconnected_seen = false;
+      next_retry.tv_sec = 0;
+      next_retry.tv_nsec = 0;
     }
 }
 
@@ -1257,10 +1321,12 @@ int ai_watch_ble_post(uint8_t sensor_type,
       return -ENOTCONN;
     }
 
+  pthread_mutex_lock(&g_txq_lock);
   next = (g_txq_head + 1u) % AI_WATCH_BLE_TXQ_LEN;
   if (next == g_txq_tail)
     {
       g_txq_dropped++;
+      pthread_mutex_unlock(&g_txq_lock);
       if ((g_txq_dropped % 100u) == 1u)
         {
           printf("BLE: tx queue full, dropped=%lu\n",
@@ -1274,6 +1340,7 @@ int ai_watch_ble_post(uint8_t sensor_type,
   g_txq[g_txq_head].len = data_len;
   memcpy(g_txq[g_txq_head].data, data, data_len);
   g_txq_head = next;
+  pthread_mutex_unlock(&g_txq_lock);
 
   return 0;
 }
