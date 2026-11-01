@@ -56,8 +56,6 @@ data class AiSessionRecord(
     val id: Long,
     val timeMs: Long,
     val source: Int = BleProto.AI_SRC_MANUAL,
-    val hr: Int = 0,
-    val spo2: Int = 0,
     val userText: String? = null,
     val reply: String? = null,
     val actions: List<AiActionRecord> = emptyList(),
@@ -76,7 +74,7 @@ private data class ParsedAction(
 )
 
 /** 后台触发的待启动请求（通知点击后由 UI 消费） */
-data class TriggerInfo(val source: Int, val hr: Int, val spo2: Int)
+data class TriggerInfo(val source: Int)
 
 /**
  * AI 会话状态机：
@@ -95,8 +93,6 @@ class AiSessionManager(
         const val CHANNEL_AI_TRIGGER = "ai_trigger"
         const val NOTIF_AI_TRIGGER = 2001
         const val EXTRA_AI_SOURCE = "ai_source"
-        const val EXTRA_AI_HR = "ai_hr"
-        const val EXTRA_AI_SPO2 = "ai_spo2"
 
         /** §2.2 system prompt（可直接使用），占位符运行期替换 */
         val SYSTEM_PROMPT = """
@@ -175,7 +171,7 @@ class AiSessionManager(
     // =====================================================================
 
     /** 手表 AI 触发 / 手动触发统一入口 */
-    fun onTrigger(source: Int, hr: Int, spo2: Int) {
+    fun onTrigger(source: Int) {
         if (ble.state.value.phase != Phase.CONNECTED) {
             log.error("AI 触发到达时手表未连接，忽略")
             return
@@ -193,15 +189,15 @@ class AiSessionManager(
                 return@launch
             }
             if (appInForeground) {
-                startSession(source, hr, spo2)
+                startSession(source)
             } else {
-                postTriggerNotification(source, hr, spo2)
+                postTriggerNotification(source)
             }
         }
     }
 
     /** §2.4：后台触发 → 高优先级通知，点开即录 */
-    private fun postTriggerNotification(source: Int, hr: Int, spo2: Int) {
+    private fun postTriggerNotification(source: Int) {
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -219,8 +215,6 @@ class AiSessionManager(
         val intent = Intent(context, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             putExtra(EXTRA_AI_SOURCE, source)
-            putExtra(EXTRA_AI_HR, hr)
-            putExtra(EXTRA_AI_SPO2, spo2)
         }
         val pi = PendingIntent.getActivity(
             context, 2001, intent,
@@ -244,7 +238,7 @@ class AiSessionManager(
     // =====================================================================
 
     /** 启动一次完整会话（录音 → ASR → LLM → 下发） */
-    fun startSession(source: Int, hr: Int, spo2: Int) {
+    fun startSession(source: Int) {
         if (_active.value?.busy == true) {
             ble.notifyUser("已有 AI 会话进行中")
             return
@@ -255,7 +249,7 @@ class AiSessionManager(
             return
         }
         sessionJob = scope.launch {
-            runSession(source, hr, spo2, reuseText = null)
+            runSession(source, reuseText = null)
         }
     }
 
@@ -268,10 +262,10 @@ class AiSessionManager(
                 return
             }
             sessionJob = scope.launch {
-                runSession(rec.source, rec.hr, rec.spo2, reuseText = rec.userText)
+                runSession(rec.source, reuseText = rec.userText)
             }
         } else {
-            startSession(rec.source, rec.hr, rec.spo2)
+            startSession(rec.source)
         }
     }
 
@@ -297,13 +291,11 @@ class AiSessionManager(
         log.event("已清空全部会话记录")
     }
 
-    private suspend fun runSession(source: Int, hr: Int, spo2: Int, reuseText: String?) {
+    private suspend fun runSession(source: Int, reuseText: String?) {
         _active.value = AiSessionRecord(
             id = ++sessionSeq,
             timeMs = System.currentTimeMillis(),
             source = source,
-            hr = hr,
-            spo2 = spo2,
             stage = AiStage.LISTENING.name,
         )
         recorder = null
@@ -341,7 +333,7 @@ class AiSessionManager(
             }
 
             // ---------- THINKING ----------
-            val (reply, actions) = callLlm(cfg, userText, source, hr, spo2)
+            val (reply, actions) = callLlm(cfg, userText)
             // 空回复保护：不下发空 AI_TEXT 到手表，直接判失败可重试
             if (reply.isBlank()) throw IllegalStateException("AI 返回了空回复（服务端偶发），请重试")
             updateSession { it.copy(reply = reply, stage = AiStage.DELIVERING.name) }
@@ -392,9 +384,6 @@ class AiSessionManager(
     private suspend fun callLlm(
         cfg: com.aiwatch.companion.ai.AiConfig,
         userText: String,
-        source: Int,
-        hr: Int,
-        spo2: Int,
     ): Pair<String, List<ParsedAction>> {
         val utcSec = System.currentTimeMillis() / 1000
         val localCn = java.time.LocalDateTime.ofInstant(Instant.ofEpochSecond(utcSec), java.time.ZoneId.systemDefault())
@@ -402,14 +391,7 @@ class AiSessionManager(
         val sys = SYSTEM_PROMPT
             .replace("{utc_sec}", utcSec.toString())
             .replace("{local_cn}", localCn)
-        val user = if (source == BleProto.AI_SRC_HR_PAGE) {
-            val hrText = if (hr > 0) "$hr 次/分" else "未知"
-            val spo2Text = if (spo2 > 0) "$spo2%" else "未知"
-            "$userText\n（用户当前心率：$hrText；血氧：$spo2Text。若用户想分析这些数据，请基于它们回答）"
-        } else {
-            userText
-        }
-        val raw = AiHttp.chat(cfg.llm, sys, user)
+        val raw = AiHttp.chat(cfg.llm, sys, userText)
         log.event("LLM 原始返回：${raw.take(200)}")
         return parseLlmJson(raw, userText)
     }

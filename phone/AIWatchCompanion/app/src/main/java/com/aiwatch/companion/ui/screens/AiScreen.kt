@@ -90,7 +90,7 @@ fun AiScreen(padding: PaddingValues, onGoToSettings: () -> Unit) {
                 )
             }
             if (active == null) {
-                Button(onClick = { app.ai.startSession(BleProto.AI_SRC_MANUAL, 0, 0) }, enabled = connected) {
+                Button(onClick = { app.ai.startSession(BleProto.AI_SRC_MANUAL) }, enabled = connected) {
                     Icon(Icons.Outlined.Mic, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("开始对话")
@@ -382,9 +382,6 @@ private fun stageLabel(stage: String): String = when (stage) {
 
 private fun sourceLabel(s: AiSessionRecord): String = when (s.source) {
     BleProto.AI_SRC_ASSISTANT_PAGE -> "手表 AI 页"
-    BleProto.AI_SRC_HR_PAGE -> buildString {
-        append("心率页 Ask AI")
-        append(" · 心率 ${if (s.hr > 0) "${s.hr}" else "--"} · 血氧 ${if (s.spo2 > 0) "${s.spo2}%" else "--"}")
-    }
-    else -> "手动"
+    BleProto.AI_SRC_MANUAL -> "手动"
+    else -> "手表（旧记录）"
 }

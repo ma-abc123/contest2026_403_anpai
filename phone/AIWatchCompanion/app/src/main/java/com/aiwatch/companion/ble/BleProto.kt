@@ -56,10 +56,7 @@ object BleProto {
     const val FLAG_ACTIVE = 0x02
 
     // DataUpload sensor_type
-    const val SENSOR_TEMPERATURE = 0x01
-    const val SENSOR_HUMIDITY = 0x02
-    const val SENSOR_HEART_RATE = 0x03
-    const val SENSOR_SPO2 = 0x04
+    // 0x01 温度 / 0x02 湿度 / 0x03 心率 / 0x04 血氧 已按 v3.1 需求移除，收到一律按未知类型忽略。
     const val SENSOR_STEPS = 0x05        // v3 今日步数
     const val SENSOR_ACTIVITY = 0x06     // v3 活动状态
     const val SENSOR_AI_TRIGGER = 0x10
@@ -78,7 +75,6 @@ object BleProto {
 
     // AI 触发来源（sensor_type=0x10 的 source 字段）
     const val AI_SRC_ASSISTANT_PAGE = 0x01
-    const val AI_SRC_HR_PAGE = 0x02
 
     // AI 手动触发（手机端本地语义，不进协议）
     const val AI_SRC_MANUAL = 0x00
@@ -93,21 +89,15 @@ object BleProto {
     )
 
     /** DataUpload(f3) 解析结果 */
-    data class SensorSample(val sensorType: Int, val value: Float) {
-        val known: Boolean get() = sensorType in SENSOR_TEMPERATURE..SENSOR_SPO2
-    }
-
     /**
      * AI 触发（v2，sensor_type=0x10）：[version(1)][0x10(1)][source(1)][context(N)]
-     * source=0x01 AI 助手页（context 空）；0x02 心率/血氧页（context=hr(2)+spo2(2)，0=未知）。
-     * 未知 source / 任意 context 长度都容忍（不崩溃）。
+     *
+     * 本版本只支持 source=0x01（AI 助手页，context 为空）。
+     * 旧固件的 source=0x02（心率/血氧页，context=hr+spo2）随该功能一并移除，
+     * 收到按"未知来源"忽略；context 任意长度都容忍（不解析、不崩溃）。
      */
-    data class AiTrigger(
-        val source: Int,
-        val hr: Int = 0,
-        val spo2: Int = 0,
-    ) {
-        val knownSource: Boolean get() = source == AI_SRC_ASSISTANT_PAGE || source == AI_SRC_HR_PAGE
+    data class AiTrigger(val source: Int) {
+        val knownSource: Boolean get() = source == AI_SRC_ASSISTANT_PAGE
     }
 
     /** AI 触发帧解析：帧非法（版本/长度）返回 null；source 未知也返回（由调用方决定忽略） */
@@ -115,15 +105,8 @@ object BleProto {
         if (bytes.size < 3) return null
         if (bytes[0].toInt() and 0xFF != PROTOCOL_VERSION) return null
         if (bytes[1].toInt() and 0xFF != SENSOR_AI_TRIGGER) return null
-        val source = bytes[2].toInt() and 0xFF
-        val ctxLen = bytes.size - 3
-        var hr = 0
-        var spo2 = 0
-        if (source == AI_SRC_HR_PAGE && ctxLen >= 4) {
-            hr = readUInt16LE(bytes, 3)
-            spo2 = readUInt16LE(bytes, 5)
-        }
-        return AiTrigger(source, hr, spo2)
+        // 只取 source，context 一律不消费（旧版携带的生理数据已不在本版本功能范围）
+        return AiTrigger(bytes[2].toInt() and 0xFF)
     }
 
     // ---------- v3 运动数据模型 ----------
@@ -289,28 +272,6 @@ object BleProto {
         return WatchStatus(version, connected, lastSync)
     }
 
-    /**
-     * DataUpload(f3) 解析：[version(1)][sensor_type(1)][payload(N)]
-     * 未知 sensor_type 返回 known=false 的样本（调用方记录后忽略，不崩溃）；
-     * 帧非法（版本/长度）返回 null。
-     */
-    fun parseDataUpload(bytes: ByteArray): SensorSample? {
-        if (bytes.size < 2) return null
-        if (bytes[0].toInt() and 0xFF != PROTOCOL_VERSION) return null
-        val sensorType = bytes[1].toInt() and 0xFF
-        return when (sensorType) {
-            SENSOR_TEMPERATURE, SENSOR_HUMIDITY -> {
-                if (bytes.size < 6) null
-                else SensorSample(sensorType, Float.fromBits(readUInt32LE(bytes, 2).toInt()))
-            }
-            SENSOR_HEART_RATE, SENSOR_SPO2 -> {
-                if (bytes.size < 4) null
-                else SensorSample(sensorType, readUInt16LE(bytes, 2).toFloat())
-            }
-            else -> SensorSample(sensorType, Float.NaN)
-        }
-    }
-
     // ---------- 错误码 ----------
 
     /** GATT/ATT 错误码 → 可读文案 */
@@ -354,10 +315,6 @@ object BleProto {
         bytes.joinToString(" ") { "%02X".format(it) }
 
     fun sensorName(type: Int): String = when (type) {
-        SENSOR_TEMPERATURE -> "温度"
-        SENSOR_HUMIDITY -> "湿度"
-        SENSOR_HEART_RATE -> "心率"
-        SENSOR_SPO2 -> "血氧"
         SENSOR_STEPS -> "步数"
         SENSOR_ACTIVITY -> "活动状态"
         SENSOR_FALL -> "疑似跌倒"

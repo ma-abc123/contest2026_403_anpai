@@ -98,7 +98,7 @@ private fun MainApp(app: WatchApp) {
             if (t != null) {
                 app.ai.pendingAutoStart.value = null
                 tab = 2 // 切到 AI 页
-                app.ai.startSession(t.source, t.hr, t.spo2)
+                app.ai.startSession(t.source)
             }
         }
     }

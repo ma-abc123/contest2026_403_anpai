@@ -45,15 +45,13 @@ class MainActivity : ComponentActivity() {
         (application as WatchApp).ble.onAppForeground()
     }
 
-    /** 后台 AI 触发通知点击进入：携带触发参数，UI 层消费后直接开始聆听 */
+    /** 后台 AI 触发通知点击进入：携带触发来源，UI 层消费后直接开始聆听 */
     private fun handleAiIntent(intent: Intent?) {
         val i = intent ?: return
         val source = i.getIntExtra(AiSessionManager.EXTRA_AI_SOURCE, -1)
         if (source >= 0) {
             (application as WatchApp).ai.pendingAutoStart.value = com.aiwatch.companion.ai.TriggerInfo(
                 source = source,
-                hr = i.getIntExtra(AiSessionManager.EXTRA_AI_HR, 0),
-                spo2 = i.getIntExtra(AiSessionManager.EXTRA_AI_SPO2, 0),
             )
         }
     }

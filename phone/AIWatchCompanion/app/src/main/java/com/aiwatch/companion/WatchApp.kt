@@ -63,8 +63,8 @@ class WatchApp : Application() {
         falls = FallRepository(this)
         motion = MotionRecorder(this)
         // v2：手表 AI 触发（f3 sensor_type=0x10）→ 会话管理器
-        ble.aiTriggerListener = { source, hr, spo2 ->
-            ai.onTrigger(source, hr, spo2)
+        ble.aiTriggerListener = { source ->
+            ai.onTrigger(source)
         }
         // v3：疑似跌倒（0x11）→ 入库 + 通知 + 前台置顶弹窗（不允许丢）
         ble.fallListener = { f ->

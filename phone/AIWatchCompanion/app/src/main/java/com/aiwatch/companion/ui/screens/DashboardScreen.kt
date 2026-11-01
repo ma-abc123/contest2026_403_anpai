@@ -16,20 +16,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Air
 import androidx.compose.material.icons.outlined.Bluetooth
 import androidx.compose.material.icons.outlined.BluetoothDisabled
 import androidx.compose.material.icons.outlined.BluetoothSearching
-import androidx.compose.material.icons.outlined.DeviceThermostat
 import androidx.compose.material.icons.outlined.DirectionsRun
 import androidx.compose.material.icons.outlined.DirectionsWalk
 import androidx.compose.material.icons.outlined.Emergency
 import androidx.compose.material.icons.outlined.HealthAndSafety
-import androidx.compose.material.icons.outlined.Link
-import androidx.compose.material.icons.outlined.LinkOff
-import androidx.compose.material.icons.outlined.MonitorHeart
 import androidx.compose.material.icons.outlined.Sync
-import androidx.compose.material.icons.outlined.WaterDrop
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -57,7 +51,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aiwatch.companion.WatchApp
 import com.aiwatch.companion.ble.BleProto
 import com.aiwatch.companion.ble.Phase
-import com.aiwatch.companion.ble.SensorValue
 import com.aiwatch.companion.ble.WatchState
 import com.aiwatch.companion.ui.StatusDot
 import com.aiwatch.companion.ui.formatHms
@@ -176,51 +169,6 @@ fun DashboardScreen(padding: PaddingValues, onGoToSport: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(16.dp),
-            )
-        }
-
-        Spacer(Modifier.height(16.dp))
-        Text(
-            "传感器数据",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            SensorCard(
-                modifier = Modifier.weight(1f),
-                label = "温度",
-                unit = "℃",
-                icon = Icons.Outlined.DeviceThermostat,
-                value = state.sensors.temperature,
-                format = { "%.1f".format(it) },
-            )
-            SensorCard(
-                modifier = Modifier.weight(1f),
-                label = "心率",
-                unit = "次/分",
-                icon = Icons.Outlined.MonitorHeart,
-                value = state.sensors.heartRate,
-                format = { "%.0f".format(it) },
-            )
-        }
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            SensorCard(
-                modifier = Modifier.weight(1f),
-                label = "湿度",
-                unit = "%RH",
-                icon = Icons.Outlined.WaterDrop,
-                value = state.sensors.humidity,
-                format = { "%.1f".format(it) },
-            )
-            SensorCard(
-                modifier = Modifier.weight(1f),
-                label = "血氧",
-                unit = "%",
-                icon = Icons.Outlined.Air,
-                value = state.sensors.spo2,
-                format = { "%.0f".format(it) },
             )
         }
 
@@ -363,44 +311,6 @@ private fun ScanHitsCard(hits: List<com.aiwatch.companion.ble.ScanHit>, onConnec
 }
 
 @Composable
-private fun SensorCard(
-    modifier: Modifier = Modifier,
-    label: String,
-    unit: String,
-    icon: ImageVector,
-    value: SensorValue?,
-    format: (Float) -> String,
-) {
-    Card(modifier = modifier) {
-        Column(Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(label, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Spacer(Modifier.height(10.dp))
-            Text(
-                value?.let { format(it.value) } ?: "--",
-                style = MaterialTheme.typography.displaySmall,
-                fontWeight = FontWeight.Bold,
-                color = if (value != null) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outline,
-            )
-            Text(
-                unit,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                value?.let { "更新于 ${formatHms(it.atMs)}" } ?: "等待手表推送…",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-        }
-    }
-}
-
-@Composable
 private fun MotionCard(
     modifier: Modifier = Modifier,
     label: String,
@@ -448,7 +358,7 @@ private fun DisclaimerCard() {
             )
             Spacer(Modifier.width(10.dp))
             Text(
-                "数据仅供参考，非医疗用途。心率/血氧仅在手表对应页面且数据质量达标时推送；未收到的数据以 -- 显示。",
+                "疑似跌倒为腕表运动特征的阈值判断，仅供参考，非医疗级结论。手表端可到 Exercise 页点 Test 联调演练。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onTertiaryContainer,
             )

@@ -50,17 +50,6 @@ import java.util.concurrent.atomic.AtomicInteger
 /** 连接阶段 */
 enum class Phase { IDLE, SCANNING, CONNECTING, INITIALIZING, CONNECTED, RECONNECTING, BLUETOOTH_OFF }
 
-/** 单个传感器读数（值 + 收到时刻） */
-data class SensorValue(val value: Float, val atMs: Long)
-
-/** 仪表盘快照：缺数据为 null（UI 显示 --） */
-data class SensorSnapshot(
-    val temperature: SensorValue? = null,
-    val humidity: SensorValue? = null,
-    val heartRate: SensorValue? = null,
-    val spo2: SensorValue? = null,
-)
-
 /** 扫描命中的设备 */
 data class ScanHit(val name: String?, val address: String, val rssi: Int)
 
@@ -73,7 +62,6 @@ data class WatchState(
     val lastSyncUtc: Long = 0L,
     val retryAttempt: Int = 0,
     val nextRetryAtMs: Long = 0L,
-    val sensors: SensorSnapshot = SensorSnapshot(),
     val scanHits: List<ScanHit> = emptyList(),
     val queueSize: Int = 0,
     // v3 运动数据
@@ -107,7 +95,6 @@ class WatchBleManager(
     companion object {
         const val CONNECT_TIMEOUT_MS = 30_000L      // v3.0.1：对齐 Android connectGatt 自身超时（原 15s 早退会留下半开连接）
         const val STEP_TIMEOUT_MS = 12_000L         // 初始化单步超时
-        const val BASE_RETRY_MS = 2_000L            // §2 指数退避 2s 起
         const val MAX_RETRY_MS = 30_000L            // 封顶 30s
         const val GATT_CLOSE_GRACE_MS = 400L        // v3.0.1：disconnect 后等 close 完成，再发起下一次连接
         const val USER_CLOSE_GRACE_MS = 3_000L      // v3.0.1：用户主动断开时等 DISCONNECTED 回调，3s 兜底 close
@@ -120,8 +107,11 @@ class WatchBleManager(
         const val REQUEST_MTU = 247                 // §2 要求 ≥247
         const val MOTION_LOG_EVERY = 25             // v3：0x12 高频帧日志节流（8Hz 下约 3s 一条）
 
-        /** v3.0.1：重连退避阶梯 2s→4s→8s→15s→30s（与《手机端BLE重连退避需求-2026-10-24》一致） */
-        private val RETRY_LADDER_MS = longArrayOf(2_000L, 4_000L, 8_000L, 15_000L, 30_000L)
+        /**
+         * v3.1：重连退避阶梯 1s→2s→4s→8s→15s→30s（封顶），严格对齐
+         * 《手机端BLE重连退避需求-2026-10-24》第 1 条（首档必须是 1s，不能从 2s 起）。
+         */
+        private val RETRY_LADDER_MS = longArrayOf(1_000L, 2_000L, 4_000L, 8_000L, 15_000L, MAX_RETRY_MS)
     }
 
     // v3：motion 帧日志节流计数
@@ -144,11 +134,11 @@ class WatchBleManager(
     }
 
     /**
-     * AI 触发回调（v2：收到 f3 sensor_type=0x10）。
+     * AI 触发回调（v2：收到 f3 sensor_type=0x10，source=0x01）。
      * 由 AiSessionManager 注册；回调发生在主线程。
      */
     @Volatile
-    var aiTriggerListener: ((source: Int, hr: Int, spo2: Int) -> Unit)? = null
+    var aiTriggerListener: ((source: Int) -> Unit)? = null
 
     /** v3：跌倒事件回调（0x11，WatchApp 注册：入库 + 通知；主线程，不允许丢） */
     @Volatile
@@ -968,7 +958,9 @@ class WatchBleManager(
                 log.error("特征 ${char.uuid} 无 CCCD 描述符")
                 return false
             }
-            val payload = byteArrayOf(0x02, 0x00) // ENABLE_NOTIFICATION
+            // v3.1：统一写 0x0001（Notify）。手表 f1/f3 同时支持 Notify/Indicate，
+            // 写 0x0002 会被降级为 Indication，高频 0x12 运动流下 ACK 开销大、丢帧率升高。
+            val payload = byteArrayOf(0x01, 0x00) // ENABLE_NOTIFICATION
             val d = CompletableDeferred<Int>()
             descriptorResults[char.uuid] = d
             val initiated = if (Build.VERSION.SDK_INT >= 33) {
@@ -1167,14 +1159,14 @@ class WatchBleManager(
                         }
                         val srcText = when (trigger.source) {
                             BleProto.AI_SRC_ASSISTANT_PAGE -> "AI 助手页"
-                            BleProto.AI_SRC_HR_PAGE -> "心率/血氧页(心率=${trigger.hr} 血氧=${trigger.spo2})"
-                            else -> "未知来源 0x%02X".format(trigger.source)
+                            else -> "未知/已废弃来源 0x%02X".format(trigger.source)
                         }
                         log.rx("DataUpload(f3)", value, "通知：AI 触发 source=$srcText")
                         if (trigger.knownSource) {
-                            aiTriggerListener?.invoke(trigger.source, trigger.hr, trigger.spo2)
+                            aiTriggerListener?.invoke(trigger.source)
                         } else {
-                            log.error("未知 AI 触发来源，忽略（不崩溃）")
+                            // 0x02（心率/血氧页）随该功能移除，本版本不再消费其 context
+                            log.error("AI 触发来源不在本版本支持范围，忽略（不崩溃）")
                         }
                     }
 
@@ -1226,45 +1218,17 @@ class WatchBleManager(
                         motionListener?.invoke(m)
                     }
 
-                    // ---- v1：温度/湿度/心率/血氧 ----
+                    // ---- 温度/湿度/心率/血氧已按 v3.1 需求移除；未知类型一律忽略 ----
                     else -> {
-                        val sample = BleProto.parseDataUpload(value)
-                        if (sample == null) {
-                            log.rx("DataUpload(f3)", value, "通知：帧非法（版本/长度），已忽略")
-                            return
-                        }
-                        if (!sample.known) {
-                            // §3.3：未知 sensor_type 必须忽略，不崩溃（向后兼容）
-                            log.rx("DataUpload(f3)", value, "通知：未知传感器类型 0x%02X，已忽略".format(sample.sensorType))
-                            return
-                        }
-                        val now = System.currentTimeMillis()
-                        _state.update { s ->
-                            val v = SensorValue(sample.value, now)
-                            s.copy(
-                                sensors = when (sample.sensorType) {
-                                    BleProto.SENSOR_TEMPERATURE -> s.sensors.copy(temperature = v)
-                                    BleProto.SENSOR_HUMIDITY -> s.sensors.copy(humidity = v)
-                                    BleProto.SENSOR_HEART_RATE -> s.sensors.copy(heartRate = v)
-                                    BleProto.SENSOR_SPO2 -> s.sensors.copy(spo2 = v)
-                                    else -> s.sensors
-                                },
-                            )
-                        }
-                        log.rx("DataUpload(f3)", value, "通知：${describeSample(sample)}")
+                        log.rx(
+                            "DataUpload(f3)", value,
+                            "通知：未知传感器类型 0x%02X，已忽略".format(value[1].toInt() and 0xFF),
+                        )
                     }
                 }
             }
             else -> log.rx("Notify", value, "未知特征通知 ${uuid}，已忽略")
         }
-    }
-
-    private fun describeSample(sample: BleProto.SensorSample): String = when (sample.sensorType) {
-        BleProto.SENSOR_TEMPERATURE -> "温度 %.1f℃".format(sample.value)
-        BleProto.SENSOR_HUMIDITY -> "湿度 %.1f%%RH".format(sample.value)
-        BleProto.SENSOR_HEART_RATE -> "心率 %.0f 次/分".format(sample.value)
-        BleProto.SENSOR_SPO2 -> "血氧 %.0f%%".format(sample.value)
-        else -> "未知样本"
     }
 
     // =====================================================================
