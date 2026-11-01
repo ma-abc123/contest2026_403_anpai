@@ -435,9 +435,24 @@ static void shot_downscale(FAR const uint16_t *src, uint16_t w, uint16_t h,
  * while the frame streams out, and the payload must not change under us.
  */
 
+/* Bound full-frame shadow source (partial-render mode): the flush path
+ * mirrors every rendered strip into a full-frame buffer and binds it
+ * here, because the LVGL display buffer itself only holds one strip. */
+
+static FAR const uint8_t *g_frame_src;
+static int g_frame_w;
+static int g_frame_h;
+
+void ai_watch_shot_bind_frame(FAR const uint8_t *pixels, int w, int h)
+{
+  g_frame_src = pixels;
+  g_frame_w   = w;
+  g_frame_h   = h;
+}
+
 static void shot_frame_start(FAR lv_display_t *disp, bool compress)
 {
-  FAR lv_draw_buf_t *buf = lv_display_get_buf_active(disp);
+  FAR lv_draw_buf_t *buf;
   struct shot_hdr_s hdr;
   FAR const uint16_t *pixels;
   uint32_t pixel_count;
@@ -454,17 +469,30 @@ static void shot_frame_start(FAR lv_display_t *disp, bool compress)
       return;
     }
 
-  if (buf == NULL || buf->data == NULL)
+  if (g_frame_src != NULL)
     {
-      printf("[FRM] no active buffer\n");
-      return;
+      pixels     = (FAR const uint16_t *)g_frame_src;
+      w          = (uint16_t)g_frame_w;
+      h          = (uint16_t)g_frame_h;
+      stride_px  = (uint16_t)g_frame_w;
+      pixel_count = (uint32_t)stride_px * h;
     }
+  else
+    {
+      buf = lv_display_get_buf_active(disp);
 
-  pixels     = (FAR const uint16_t *)buf->data;
-  w          = (uint16_t)buf->header.w;
-  h          = (uint16_t)buf->header.h;
-  stride_px  = (uint16_t)(buf->header.stride / 2);
-  pixel_count = (uint32_t)stride_px * h;
+      if (buf == NULL || buf->data == NULL)
+        {
+          printf("[FRM] no active buffer\n");
+          return;
+        }
+
+      pixels     = (FAR const uint16_t *)buf->data;
+      w          = (uint16_t)buf->header.w;
+      h          = (uint16_t)buf->header.h;
+      stride_px  = (uint16_t)(buf->header.stride / 2);
+      pixel_count = (uint32_t)stride_px * h;
+    }
 
   /* Apply the requested downscale, refusing to shrink below a legible
    * size (16 px on the short edge).

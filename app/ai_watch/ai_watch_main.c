@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <malloc.h>
 #include <math.h>
+#include <nuttx/lcd/lcd_dev.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -56,7 +57,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.56-ui5"
+#define AI_WATCH_VERSION            "4.8.57-perf4"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -68,6 +69,9 @@
 /* Display dimensions */
 
 #define AI_WATCH_SCREEN_WIDTH       390
+/* Partial-render strip height (rows): the SRAM render target for the
+ * screen-fluidity work. 100 rows = 78 KB, comfortably inside SRAM. */
+#define AI_WATCH_LCD_STRIP_ROWS     100
 #define AI_WATCH_SCREEN_HEIGHT      450
 
 /* Fixed page IDs */
@@ -4100,6 +4104,50 @@ static void ai_watch_init_about(FAR struct ai_watch_s *watch)
     }
 }
 
+/* UI performance counters (2026-11-01 screen-fluidity work): refresh
+ * cycles and invalidated pixel volume per second. The stock sysmon FPS
+ * metric reads 0 on this port; these counters are the usable signal.
+ * Expected magnitudes: idle watchface should be a couple of refreshes/s
+ * with a few thousand dirty pixels; a value pinned at 15 refreshes of a
+ * full 390x450 frame means something invalidates the whole screen. */
+
+static uint32_t g_ui_refr_cnt;
+static uint32_t g_ui_dirty_px;
+
+static void ui_perf_event_cb(lv_event_t *e)
+{
+  lv_event_code_t code = lv_event_get_code(e);
+
+  if (code == LV_EVENT_REFR_START)
+    {
+      g_ui_refr_cnt++;
+    }
+  else if (code == LV_EVENT_INVALIDATE_AREA)
+    {
+      FAR lv_area_t *area = lv_event_get_param(e);
+
+      if (area != NULL)
+        {
+          g_ui_dirty_px += (uint32_t)lv_area_get_width(area) *
+                           lv_area_get_height(area);
+        }
+      else
+        {
+          g_ui_dirty_px +=
+            (uint32_t)AI_WATCH_SCREEN_WIDTH * AI_WATCH_SCREEN_HEIGHT;
+        }
+    }
+}
+
+static void ui_perf_report_cb(lv_timer_t *timer)
+{
+  LV_UNUSED(timer);
+  printf("UIPERF refr=%lu dirty=%lu\n",
+         (unsigned long)g_ui_refr_cnt, (unsigned long)g_ui_dirty_px);
+  g_ui_refr_cnt = 0;
+  g_ui_dirty_px = 0;
+}
+
 static void ai_watch_create_ui(FAR struct ai_watch_s *watch)
 {
   ai_watch_page_manager_init(watch);
@@ -4108,6 +4156,35 @@ static void ai_watch_create_ui(FAR struct ai_watch_s *watch)
   ai_watch_create_app_list_page(watch);
   ai_watch_create_settings_page(watch);
   ai_watch_create_brief_page(watch);
+
+  /* Input scan at 15 ms (default 30 ms reads as touch lag); report UI
+   * load once a second. The refresh timer stays at the defconfig's
+   * 16 ms. */
+
+  {
+    FAR lv_display_t *disp = lv_display_get_next(NULL);
+    FAR lv_indev_t *indev = lv_indev_get_next(NULL);
+    FAR lv_timer_t *timer;
+
+    if (disp != NULL)
+      {
+        lv_display_add_event_cb(disp, ui_perf_event_cb, LV_EVENT_ALL, NULL);
+      }
+
+    while (indev != NULL)
+      {
+        timer = lv_indev_get_read_timer(indev);
+
+        if (timer != NULL)
+          {
+            lv_timer_set_period(timer, 15);
+          }
+
+        indev = lv_indev_get_next(indev);
+      }
+
+    lv_timer_create(ui_perf_report_cb, 1000, NULL);
+  }
 
 
   lv_scr_load_anim(watch->fixed_pages[AI_WATCH_PAGE_HOME],
@@ -4565,6 +4642,54 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
  * Public Functions
  ****************************************************************************/
 
+/* LCD partial-render plumbing (2026-11-01 screen-fluidity work): LVGL
+ * renders invalidated strips into a small SRAM buffer; this flush sends
+ * each strip to the panel and mirrors it into a full-frame shadow so the
+ * shot link can still snapshot complete pictures (in PARTIAL mode the
+ * LVGL buffer only ever holds one strip). */
+
+static int g_lcd_fd = -1;
+static FAR uint16_t *g_lcd_shadow;
+
+/* Render strip in .bss: guaranteed SRAM (the heap's 351 KB full-frame
+ * buffer lands in PSRAM and LVGL renders through the QSPI bus at
+ * ~4 MB/s -- the dominant screen-fluidity bottleneck on this board). */
+
+static FAR uint16_t g_lcd_strip[AI_WATCH_SCREEN_WIDTH * AI_WATCH_LCD_STRIP_ROWS]
+  __attribute__((aligned(64)));
+
+static void ai_watch_lcd_flush_cb(lv_display_t *disp, const lv_area_t *area,
+                                  uint8_t *color_p)
+{
+  struct lcddev_area_s desc;
+  int y;
+  int row_bytes;
+
+  desc.row_start = area->y1;
+  desc.row_end   = area->y2;
+  desc.col_start = area->x1;
+  desc.col_end   = area->x2;
+  desc.data      = color_p;
+  row_bytes      = (area->x2 - area->x1 + 1) * 2;   /* RGB565 */
+  desc.stride    = row_bytes;
+
+  if (g_lcd_fd >= 0)
+    {
+      ioctl(g_lcd_fd, LCDDEVIO_PUTAREA, (unsigned long)&desc);
+    }
+
+  if (g_lcd_shadow != NULL)
+    {
+      for (y = area->y1; y <= area->y2; y++)
+        {
+          memcpy(g_lcd_shadow + y * AI_WATCH_SCREEN_WIDTH + area->x1,
+                 color_p + (y - area->y1) * row_bytes, row_bytes);
+        }
+    }
+
+  lv_display_flush_ready(disp);
+}
+
 int main(int argc, FAR char *argv[])
 {
   lv_nuttx_result_t result;
@@ -4669,25 +4794,30 @@ int main(int argc, FAR char *argv[])
 
   if (result.disp != NULL)
     {
-      size_t buf_size = 390 * 450 * 2;
-      FAR void *fbuf = lv_malloc(buf_size);
+      /* PARTIAL strip in SRAM + full-frame shadow (PSRAM): DIRECT with a
+       * full-frame buffer redrew 351 KB through PSRAM at ~4 MB/s
+       * (scroll render 88 ms); the SRAM strip renders an order faster
+       * and the flush mirrors each strip into the shadow that the shot
+       * link snapshots. PARTIAL renders only the damaged areas. */
 
-      if (fbuf != NULL)
+      g_lcd_shadow = lv_malloc((size_t)AI_WATCH_SCREEN_WIDTH *
+                               AI_WATCH_SCREEN_HEIGHT * 2);
+
+      if (g_lcd_shadow != NULL)
         {
           lv_display_set_color_format(result.disp, LV_COLOR_FORMAT_RGB565);
-          /* DIRECT (not FULL): the buffer is still full-frame so the
-           * serial dump reads a complete picture, but LVGL only redraws
-           * the damaged areas. RENDER_MODE_FULL redrew all 351 KB on
-           * every invalidation (~100-180 ms each) - a press alone made
-           * the main loop 10x slower and swallowed gestures whole. */
-          lv_display_set_buffers(result.disp, fbuf, NULL, buf_size,
-                                 LV_DISPLAY_RENDER_MODE_DIRECT);
-          lv_display_set_flush_cb(result.disp, ai_watch_headless_flush);
-          printf("Headless display: 390x450 RGB565, no panel writes\n");
+          lv_display_set_buffers(result.disp, g_lcd_strip, NULL,
+                                 sizeof(g_lcd_strip),
+                                 LV_DISPLAY_RENDER_MODE_PARTIAL);
+          lv_display_set_flush_cb(result.disp, ai_watch_lcd_flush_cb);
+          ai_watch_shot_bind_frame((FAR const uint8_t *)g_lcd_shadow,
+                                   AI_WATCH_SCREEN_WIDTH,
+                                   AI_WATCH_SCREEN_HEIGHT);
+          printf("Headless display: SRAM strip + shadow frame\n");
         }
       else
         {
-          printf("ERROR: headless frame buffer alloc failed\n");
+          printf("ERROR: headless shadow frame alloc failed\n");
           result.disp = NULL;
         }
     }
@@ -4725,6 +4855,54 @@ int main(int argc, FAR char *argv[])
 
   printf("LVGL initialized, display ready after %d attempt(s)\n",
          init_retry + 1);
+
+#if !AI_WATCH_HEADLESS
+  /* Screen fluidity (2026-11-01): lv_nuttx_lcd hands LVGL a full-screen
+   * buffer in RENDER_MODE_FULL -- every invalidation re-rendered every
+   * widget AND re-streamed the whole 351 KB frame over QSPI (measured
+   * 100-180 ms per invalidation; scroll render averaged 88 ms even in
+   * DIRECT, because the full-frame buffer lands in PSRAM and LVGL
+   * renders at ~4 MB/s through the QSPI bus). Switch to a 100-row strip
+   * in SRAM (LV_DISPLAY_RENDER_MODE_PARTIAL): only the invalidated
+   * areas are rendered and streamed. The strip cannot feed the shot
+   * mirror, so the flush mirrors every strip into a full-frame shadow
+   * (PSRAM) that the snapshot path reads instead of the LVGL buffer.
+   * The port's original full-screen buffer stays allocated (no free
+   * API); one-off 351 KB in an 8 MB PSRAM. */
+
+  if (result.disp != NULL)
+    {
+      FAR lv_color_t *strip =
+        lv_malloc((size_t)AI_WATCH_SCREEN_WIDTH *
+                  AI_WATCH_LCD_STRIP_ROWS * 2);
+
+      g_lcd_shadow = lv_malloc((size_t)AI_WATCH_SCREEN_WIDTH *
+                               AI_WATCH_SCREEN_HEIGHT * 2);
+      g_lcd_fd = open("/dev/lcd0", O_RDWR);
+
+      if (strip != NULL && g_lcd_shadow != NULL && g_lcd_fd >= 0)
+        {
+          lv_display_set_buffers(result.disp, strip, NULL,
+                                 (size_t)AI_WATCH_SCREEN_WIDTH *
+                                 AI_WATCH_LCD_STRIP_ROWS * 2,
+                                 LV_DISPLAY_RENDER_MODE_PARTIAL);
+          lv_display_set_flush_cb(result.disp, ai_watch_lcd_flush_cb);
+          ai_watch_shot_bind_frame((FAR const uint8_t *)g_lcd_shadow,
+                                   AI_WATCH_SCREEN_WIDTH,
+                                   AI_WATCH_SCREEN_HEIGHT);
+          printf("LCD partial render: %d-row strip + shadow frame\n",
+                 AI_WATCH_LCD_STRIP_ROWS);
+        }
+      else
+        {
+          /* Keep the port's full-screen buffer (DIRECT); slower, but the
+           * UI and the mirror keep working. */
+          lv_display_set_render_mode(result.disp,
+                                     LV_DISPLAY_RENDER_MODE_DIRECT);
+          printf("LCD partial setup failed; DIRECT full-frame fallback\n");
+        }
+    }
+#endif /* !AI_WATCH_HEADLESS */
 
   /* Screen dump hook. The display buffer holds a full frame in this
    * configuration, so a dump is a copy of what LVGL already rendered.

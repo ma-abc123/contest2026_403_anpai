@@ -57,6 +57,20 @@
 int ai_watch_shot_init(FAR lv_display_t *disp);
 
 /****************************************************************************
+ * Name: ai_watch_shot_bind_frame
+ *
+ * Description:
+ *   Point the snapshot source at a full-frame shadow buffer. Needed when
+ *   LVGL renders in PARTIAL mode: the display's own buffer only holds one
+ *   strip, so the flush path mirrors every strip into a shadow frame and
+ *   binds it here. When no shadow is bound, snapshots read the display's
+ *   active buffer (full-frame render modes).
+ *
+ ****************************************************************************/
+
+void ai_watch_shot_bind_frame(FAR const uint8_t *pixels, int w, int h);
+
+/****************************************************************************
  * Name: ai_watch_shot_poll
  *
  * Description:
