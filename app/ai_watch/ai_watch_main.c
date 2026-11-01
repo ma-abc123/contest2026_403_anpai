@@ -26,12 +26,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -44,6 +44,7 @@
 
 #include "ai_watch_icons.h"
 #include "fonts/ai_watch_font_cjk_16.h"
+#include "fonts/ai_watch_font_weather_28.h"
 #include "ai_watch_ble.h"
 #include "ai_watch_motion.h"
 #include "ai_watch_light.h"
@@ -55,7 +56,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.55-ble9"
+#define AI_WATCH_VERSION            "4.8.56-ui5"
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -287,6 +288,7 @@ struct ai_watch_s
   bool touch_available;
   int touch_start_x;
   int touch_start_y;
+  int touch_last_y;             /* previous poll sample, brief scroll */
   struct timespec touch_start_time;
 
   /* Touch polling */
@@ -1936,6 +1938,12 @@ static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch)
 #define AI_WATCH_ALERT_SHOW_MS      6000
 #define AI_WATCH_ALERT_WIDTH        358
 #define AI_WATCH_BRIEF_WIDTH        380
+/* Scrollable extent of the brief page: content ends at the hint label
+ * (y=486 + ~19 px) on the 450 px panel. The page is laid out with
+ * absolute coordinates, so this is a build-time constant -- keep it in
+ * sync when the layout changes. lv_obj_get_scroll_bottom() was observed
+ * to return unreliable values here (scroll overshot into black). */
+#define AI_WATCH_BRIEF_SCROLL_MAX   60
 
 /* Headless mode: render into the LVGL buffer and never touch the panel.
  *
@@ -3264,13 +3272,25 @@ static void ai_watch_brief_refresh(FAR struct ai_watch_s *watch)
 
       if (b->valid && w != NULL)
         {
-          snprintf(buf, sizeof(buf), "%s %d°C", w, (int)b->temp_c);
+          /* ℃ is one glyph (U+2103, from DejaVu in the weather font);
+           * "%d°C" rendered an invisible ring because Droid Sans
+           * Fallback has no U+00B0. */
+
+          snprintf(buf, sizeof(buf), "%s %d℃", w, (int)b->temp_c);
           lv_label_set_text(g_brief_ui.weather_val, buf);
-          lv_obj_clear_flag(g_brief_ui.weather_val, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_set_style_text_font(g_brief_ui.weather_val,
+                                     &ai_watch_font_weather_28, 0);
+          lv_obj_set_style_text_color(g_brief_ui.weather_val,
+                                      ai_watch_theme_text(theme), 0);
         }
       else
         {
-          lv_obj_add_flag(g_brief_ui.weather_val, LV_OBJ_FLAG_HIDDEN);
+          lv_label_set_text(g_brief_ui.weather_val,
+                            "连接手机后显示天气");
+          lv_obj_set_style_text_font(g_brief_ui.weather_val,
+                                     &ai_watch_font_cjk_16, 0);
+          lv_obj_set_style_text_color(g_brief_ui.weather_val,
+                                      ai_watch_theme_secondary(theme), 0);
         }
     }
 
@@ -3308,7 +3328,7 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
   watch->fixed_pages[AI_WATCH_PAGE_BRIEF] = screen;
   g_brief_ui.screen = screen;
 
-  /* ---- Header: title + accent underline + weather ---- */
+  /* ---- Header: title + accent underline ---- */
 
   title = lv_label_create(screen);
   lv_label_set_text(title, "每日简报");
@@ -3323,18 +3343,42 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
   lv_obj_set_style_bg_color(bar, ai_watch_theme_accent(theme), 0);
   lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
 
+  /* Content now reaches ~505 px on the 450 px panel: vertical scroll
+   * reveals the lower cards. Page navigation on this screen is
+   * horizontal-only, so a vertical drag scrolls instead of switching. */
+
+  lv_obj_add_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(screen, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
+
+  /* ---- Weather card: ONE label styled as the card. The container
+   * variant (lv_obj + 2 labels) was observed to wedge BLE bring-up on
+   * every boot (bt_enable -110) and is documented in the dev log --
+   * object count on this page stays identical to the 4.8.55 layout. */
+
   g_brief_ui.weather_val = lv_label_create(screen);
-  lv_label_set_text(g_brief_ui.weather_val, "");
+  lv_label_set_text(g_brief_ui.weather_val, "连接手机后显示天气");
+  lv_obj_set_size(g_brief_ui.weather_val, AI_WATCH_BRIEF_WIDTH - 32, 64);
+  lv_obj_align(g_brief_ui.weather_val, LV_ALIGN_TOP_MID, 0, 58);
+  lv_obj_set_style_bg_color(g_brief_ui.weather_val,
+                            ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_bg_opa(g_brief_ui.weather_val, LV_OPA_30, 0);
+  lv_obj_set_style_border_width(g_brief_ui.weather_val, 1, 0);
+  lv_obj_set_style_border_color(g_brief_ui.weather_val,
+                                ai_watch_theme_secondary(theme), 0);
+  lv_obj_set_style_border_opa(g_brief_ui.weather_val, LV_OPA_50, 0);
+  lv_obj_set_style_radius(g_brief_ui.weather_val, 14, 0);
+  lv_obj_set_style_pad_left(g_brief_ui.weather_val, 12, 0);
   lv_obj_set_style_text_color(g_brief_ui.weather_val,
                               ai_watch_theme_secondary(theme), 0);
-  lv_obj_set_style_text_font(g_brief_ui.weather_val, &ai_watch_font_cjk_16, 0);
-  lv_obj_align(g_brief_ui.weather_val, LV_ALIGN_TOP_RIGHT, -20, 14);
+  lv_obj_set_style_text_font(g_brief_ui.weather_val,
+                             &ai_watch_font_cjk_16, 0);
 
   /* ---- Stats card: three counters on a subtle panel ---- */
 
   stats = lv_obj_create(screen);
   lv_obj_set_size(stats, AI_WATCH_BRIEF_WIDTH - 32, 100);
-  lv_obj_align(stats, LV_ALIGN_TOP_MID, 0, 58);
+  lv_obj_align(stats, LV_ALIGN_TOP_MID, 0, 134);
   lv_obj_set_style_bg_color(stats, ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_bg_opa(stats, LV_OPA_30, 0);
   lv_obj_set_style_border_width(stats, 1, 0);
@@ -3391,12 +3435,12 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
     lv_label_set_text(head, "待办");
     lv_obj_set_style_text_color(head, ai_watch_theme_secondary(theme), 0);
     lv_obj_set_style_text_font(head, &ai_watch_font_cjk_16, 0);
-    lv_obj_align(head, LV_ALIGN_TOP_LEFT, 20, 174);
+    lv_obj_align(head, LV_ALIGN_TOP_LEFT, 20, 250);
   }
 
   g_brief_ui.reminder_box = lv_obj_create(screen);
   lv_obj_set_size(g_brief_ui.reminder_box, AI_WATCH_BRIEF_WIDTH - 32, 92);
-  lv_obj_align(g_brief_ui.reminder_box, LV_ALIGN_TOP_MID, 0, 198);
+  lv_obj_align(g_brief_ui.reminder_box, LV_ALIGN_TOP_MID, 0, 274);
   lv_obj_set_style_bg_color(g_brief_ui.reminder_box,
                             ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_bg_opa(g_brief_ui.reminder_box, LV_OPA_30, 0);
@@ -3410,12 +3454,13 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
   lv_obj_set_flex_flow(g_brief_ui.reminder_box, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(g_brief_ui.reminder_box, LV_FLEX_ALIGN_START,
                         LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_clear_flag(g_brief_ui.reminder_box, LV_OBJ_FLAG_SCROLLABLE);
 
   /* ---- AI commentary card: accent bar + wrapped text ---- */
 
   card = lv_obj_create(screen);
   lv_obj_set_size(card, AI_WATCH_BRIEF_WIDTH - 32, 92);
-  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 306);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 382);
   lv_obj_set_style_bg_color(card, ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_bg_opa(card, LV_OPA_30, 0);
   lv_obj_set_style_border_width(card, 1, 0);
@@ -3446,7 +3491,9 @@ static void ai_watch_create_brief_page(FAR struct ai_watch_s *watch)
   lv_label_set_text(hint, "返回 (KEY2)");
   lv_obj_set_style_text_color(hint, ai_watch_theme_secondary(theme), 0);
   lv_obj_set_style_text_font(hint, &ai_watch_font_cjk_16, 0);
-  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+  /* Below the comment card (ends at y=474): BOTTOM_MID would clamp to
+   * the 450 px panel and land inside the card once content overflows. */
+  lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 486);
 }
 
 /****************************************************************************
@@ -4062,6 +4109,7 @@ static void ai_watch_create_ui(FAR struct ai_watch_s *watch)
   ai_watch_create_settings_page(watch);
   ai_watch_create_brief_page(watch);
 
+
   lv_scr_load_anim(watch->fixed_pages[AI_WATCH_PAGE_HOME],
                    LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 
@@ -4372,6 +4420,7 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
           watch->gesture_lock = false;
           watch->touch_start_x = point.x;
           watch->touch_start_y = point.y;
+          watch->touch_last_y = point.y;
           watch->touch_start_time = now;
         }
       else if (!watch->gesture_handled &&
@@ -4386,15 +4435,53 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
            * the brightness bar from being read as a back swipe.
            */
 
-          int dx = point.x - watch->touch_start_x;
-          int dy = point.y - watch->touch_start_y;
+            int dx = point.x - watch->touch_start_x;
+            int dy = point.y - watch->touch_start_y;
 
-          if (dx > AI_WATCH_SWIPE_BACK_TRIGGER &&
-              abs(dx) > abs(dy) * 2)
-            {
-              watch->gesture_handled = true;
-              ai_watch_go_home(watch);
-            }
+            if (dx > AI_WATCH_SWIPE_BACK_TRIGGER &&
+                abs(dx) > abs(dy) * 2)
+              {
+                watch->gesture_handled = true;
+                ai_watch_go_home(watch);
+              }
+            else if (watch->current_page == AI_WATCH_PAGE_BRIEF &&
+                     g_brief_ui.screen != NULL && abs(dy) > abs(dx))
+              {
+                /* The brief page scrolls with the finger. LVGL's own
+                 * drag scroll never engages through the remote pointer
+                 * indev -- press/move samples all arrive (verbose [PTR]
+                 * trace 2026-11-01) yet the screen never moves -- so
+                 * the poller drives the scroll itself. Finger up
+                 * reveals lower cards; clamped to the content. */
+
+                /* lv_obj_get_scroll_y() reads NEGATIVE of the
+                 * scrolled-down amount on this LVGL (scroll 19 px down
+                 * -> -19; feeding it back raw doubled the offset every
+                 * poll and fled the content). Negate it. */
+
+                int step = watch->touch_last_y - point.y;
+                int cur = -(int)lv_obj_get_scroll_y(g_brief_ui.screen);
+                int target = cur + step;
+
+                watch->touch_last_y = point.y;
+
+                if (target < 0)
+                  {
+                    target = 0;
+                  }
+
+                if (target > AI_WATCH_BRIEF_SCROLL_MAX)
+                  {
+                    target = AI_WATCH_BRIEF_SCROLL_MAX;
+                  }
+
+                if (target != cur)
+                  {
+                    lv_obj_scroll_by(g_brief_ui.screen, 0,
+                                     (lv_coord_t)(target - cur),
+                                     LV_ANIM_OFF);
+                  }
+              }
         }
     }
   else if (watch->touch_active)
