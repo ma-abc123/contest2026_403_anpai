@@ -57,10 +57,30 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
+/* Headless mode: render into the LVGL buffer and never touch the panel.
+ *
+ * With the panel physically disconnected, every flush still goes through
+ * the LCD driver's putarea(), which waits for hardware that is not there
+ * and times out -- the UI crawls to one frame every several seconds. The
+ * screen dump only needs the rendered buffer, so skip the panel entirely.
+ *
+ * Set to 0 once a working panel is connected again.  It has to be defined
+ * here, above the version string, so the build can label itself.
+ */
+
+#define AI_WATCH_HEADLESS           1
+
+/* The version string must say which build is actually on the board: three
+ * images differ only by preprocessor switches, and after a day of swapping
+ * "which one did I just flash" is the question that costs the most time.
+ */
+
 #if AI_WATCH_CAPTURE_STREAM
-#  define AI_WATCH_VERSION          "4.8.63-capture"
+#  define AI_WATCH_VERSION          "4.8.81-capture"
+#elif AI_WATCH_HEADLESS
+#  define AI_WATCH_VERSION          "4.8.81-vendor-test"
 #else
-#  define AI_WATCH_VERSION          "4.8.62-nostore"
+#  define AI_WATCH_VERSION          "4.8.81-vendor-panel"
 #endif
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
@@ -1953,17 +1973,9 @@ static void ai_watch_destroy_reminder_app(FAR struct ai_watch_s *watch)
  * to return unreliable values here (scroll overshot into black). */
 #define AI_WATCH_BRIEF_SCROLL_MAX   60
 
-/* Headless mode: render into the LVGL buffer and never touch the panel.
- *
- * With the panel physically disconnected, every flush still goes through
- * the LCD driver's putarea(), which waits for hardware that is not there
- * and times out -- the UI crawls to one frame every several seconds. The
- * screen dump only needs the rendered buffer, so skip the panel entirely.
- *
- * Set to 0 once a working panel is connected again.
+/* AI_WATCH_HEADLESS lives near the top of this file: the version string is
+ * chosen from it, and that block is compiled before this point.
  */
-
-#define AI_WATCH_HEADLESS           1
 
 /* Length of the screen-change animation. Without a panel the transition is
  * only ever seen through the 5 fps remote preview, where a fade that takes

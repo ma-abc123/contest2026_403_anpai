@@ -1,428 +1,422 @@
 #!/usr/bin/env python3
-"""Automated BLE connection regression test for the AI Watch.
+"""AI Watch BLE 连接/重连回归：实时扫描 -> CCC -> 校时 -> 存活观察。
 
-Replicates the phone app's connect sequence from this host's BLE adapter
-(hci0) and classifies each trial by the BOARD console (the authoritative
-side):
+用 /usr/bin/python3（需 bleak、pyserial）；先停 ai-watch-viewer。
+每轮都重新收取广播获取当前随机地址，按 UUID 解析 GATT；不使用
+bluetoothctl 输出或缓存中的设备名判断是否在广播。只保留一个串口读者。
 
-    scan -> connect -> subscribe Status/DataUp CCCD -> write TimeSync
+  /usr/bin/python3 tools/ble_connect_test.py -n 5 --hold 45 --load none
+  /usr/bin/python3 tools/ble_connect_test.py -n 5 --hold 45 --load frames
 
-  SUCCESS   board printed "BLE: time synced"
-  FAIL_HW   controller hardware-error / forced teardown before sync
-  FAIL_DROP connection dropped before sync (no HW error)
-  TIMEOUT   nothing conclusive within the window
+本工具不主动复位、不重开串口；NO_ADV 是实际扫描窗口的结果，不自动
+丢弃失败轮次。打开串口前预置 DTR/RTS=False，仍应通过启动日志判断
+USB 驱动是否产生了复位毛刺。重测开机请外部复位后运行，或启动工具后
+按板上复位键。--startup-wait 只等待、不发送任何板端命令。
 
-Conditions (--load frames|none) toggle a continuous frame-request load
-during each trial, mimicking the auto-preview viewer. This is the A/B
-that separates "BLE is broken" from "BLE breaks under the preview load".
-
-Usage:
-    systemctl --user stop ai-watch-viewer     # free the serial port!
-    python3 tools/ble_connect_test.py -n 5 --load none
-    python3 tools/ble_connect_test.py -n 5 --load frames
+保存 <log-prefix>.log（板端完整文本、主机阶段、每轮结果），.raw（逐字节
+原始串口，含帧）和 .chunks.jsonl（原始块的 UTC/单调时间及 offset/length）。
+投屏帧中被插入的日志无法可靠分离，保留 raw 用于复核；链路存活同时检查
+BlueZ 断连事件与板端断连/控制器故障，sync 模式还必须看到板端校时确认。
 """
 
 import argparse
+import asyncio
+from collections import Counter
+from datetime import datetime, timezone
+import json
 import os
-import select
-import struct
-import subprocess
-import sys
+from pathlib import Path
 import re
+import struct
 import threading
 import time
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from shot_protocol import wait_for_ready  # noqa: E402
 
 SVC = "12345678-9abc-def0-1234-56789abcdef0"
 UUID_STATUS = "12345678-9abc-def0-1234-56789abcdef1"
 UUID_DATAUP = "12345678-9abc-def0-1234-56789abcdef3"
 UUID_TIMESYNC = "12345678-9abc-def0-1234-56789abcdef2"
-
 WATCH_NAME = "AI-Watch-403"
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+class RunLog:
+    def __init__(self, prefix):
+        prefix = Path(prefix).expanduser()
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        self.prefix = str(prefix)
+        self.text = open(self.prefix + ".log", "w", encoding="utf-8", buffering=1)
+        self.lock = threading.Lock()
+
+    def write(self, source, text, echo=False):
+        stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        line = f"[{stamp}] {source}: {text}"
+        with self.lock:
+            self.text.write(line + "\n")
+            if echo:
+                print(line, flush=True)
+
+    def close(self):
+        self.text.close()
+
+
+class FrameFilter:
+    """Strip SHOT bodies without decoding, keeping split headers/magic."""
+
+    def __init__(self, sink):
+        self.sink = sink
+        self.pending = bytearray()
+        self.remaining = 0
+        self.frames = 0
+
+    def feed(self, data):
+        self.pending.extend(data)
+        while self.pending:
+            if self.remaining:
+                n = min(self.remaining, len(self.pending))
+                del self.pending[:n]
+                self.remaining -= n
+                if self.remaining == 0:
+                    self.frames += 1
+                continue
+            idx = self.pending.find(b"SHOT")
+            if idx < 0:
+                keep = next((n for n in (3, 2, 1)
+                             if self.pending.endswith(b"SHOT"[:n])), 0)
+                end = len(self.pending) - keep
+                self.sink(bytes(self.pending[:end]))
+                del self.pending[:end]
+                break
+            if idx:
+                self.sink(bytes(self.pending[:idx]))
+                del self.pending[:idx]
+            if len(self.pending) < 15:
+                break
+            _, width, height, stride, fmt, length = struct.unpack(
+                "<4sHHHBI", self.pending[:15])
+            if (64 <= width <= 1024 and 64 <= height <= 1024 and
+                    stride >= width * 2 and fmt in (1, 2) and
+                    0 < length <= 2 * 1024 * 1024):
+                del self.pending[:15]
+                self.remaining = length
+            else:
+                self.sink(bytes(self.pending[:4]))
+                del self.pending[:4]
 
 
 class ConsoleMonitor(threading.Thread):
-    """Tail the board serial console, keep timestamped BLE-relevant lines.
+    """The only serial reader for the entire run; never reopen underneath it."""
 
-    Frame bytes are consumed and discarded through the shared parser so
-    the SHOT stream never blocks console parsing; console text between
-    frames is line-split here.
-    """
-
-    EVENT_MARKS = ("BLE:", "aiwatch-ble:", "hardware-error", "Push page",
-                   "Opened app", "controller recovery", "Force teardown")
-
-    def __init__(self, ser):
+    def __init__(self, ser, log):
         super().__init__(daemon=True)
         self.ser = ser
-        self.lines = []            # (t, text)
+        self.log = log
+        self.stop_flag = threading.Event()
         self.lock = threading.Lock()
-        self.frame_tail = b""
-        self.stop_flag = False
+        self.lines = []
+        self.line_tail = b""
+        self.error = None
+        self.filter = FrameFilter(self._text)
+        self.raw = open(log.prefix + ".raw", "wb")
+        self.chunks = open(log.prefix + ".chunks.jsonl", "w", buffering=1)
+        self.offset = 0
+
+    def _text(self, data):
+        lines = (self.line_tail + data).split(b"\n")
+        self.line_tail = lines.pop()
+        # Bound corrupt/binary text after a torn frame without dropping raw.
+        if len(self.line_tail) > 65536:
+            lines.append(self.line_tail)
+            self.line_tail = b""
+        for part in lines:
+            text = ANSI.sub("", part.decode("latin-1", "replace")).strip("\r\0 ")
+            if text:
+                now = time.monotonic()
+                with self.lock:
+                    self.lines.append((now, text))
+                self.log.write("BOARD", text)
 
     def run(self):
-        tail = b""
-        while not self.stop_flag:
-            try:
-                data = self.ser.read(4096)
-            except Exception:
-                break
-            if not data:
-                time.sleep(0.01)
-                continue
-            data = self.frame_tail + data
-            self.frame_tail = b""
-            # drop SHOT frame payloads cheaply: find magic, skip 15+4len
-            out = bytearray()
-            i = 0
-            while i < len(data):
-                idx = data.find(b"SHOT", i)
-                if idx < 0:
-                    out.extend(data[i:])
-                    break
-                out.extend(data[i:idx])
-                if len(data) - idx < 15:
-                    self.frame_tail = bytes(data[idx:])
-                    break
-                import struct as _s
-                _, _w, _h, _stride, _fmt, ln = _s.unpack(
-                    "<4sHHHBI", data[idx:idx + 15])
-                if 64 <= _w <= 1024 and 64 <= _h <= 1024 and \
-                        0 < ln <= 2 * 1024 * 1024:
-                    if len(data) - idx < 15 + ln:
-                        self.frame_tail = bytes(data[idx:])
-                        break
-                    i = idx + 15 + ln
-                else:
-                    out.extend(data[idx:idx + 4])
-                    i = idx + 4
-            for line in bytes(out).split(b"\n"):
-                line = line.decode("latin-1", "replace").strip()
-                if line and any(m in line for m in self.EVENT_MARKS):
-                    with self.lock:
-                        self.lines.append((time.time(), line))
-
-    def since(self, t):
-        with self.lock:
-            return [(ts, l) for (ts, l) in self.lines if ts >= t]
-
-    def clear(self):
-        with self.lock:
-            self.lines.clear()
-
-
-class Bluetoothctl:
-    """Thin pipe driver for `bluetoothctl` interactive mode."""
-
-    def __init__(self):
-        self.p = subprocess.Popen(
-            ["bluetoothctl"], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=0)
-        self.stdout_buf = b""
-
-    def read_lines(self, timeout):
-        """Read complete output lines without blocking on a partial line."""
-
-        r, _, _ = select.select([self.p.stdout], [], [], timeout)
-        if not r:
-            return []
-
-        chunk = os.read(self.p.stdout.fileno(), 4096)
-        if not chunk:
-            return []
-
-        self.stdout_buf += chunk
-        lines = self.stdout_buf.split(b"\n")
-        self.stdout_buf = lines.pop()
-        return [line.decode("utf-8", "replace").rstrip()
-                for line in lines]
-
-    def send(self, cmd, wait=0.8):
-        self.p.stdin.write((cmd + "\n").encode())
-        self.p.stdin.flush()
-        t_end = time.time() + wait
-        out = []
-        while time.time() < t_end:
-            out.extend(self.read_lines(min(0.1, max(0.0, t_end - time.time()))))
-        return out
-
-    def wait_for(self, marks, timeout, collect=None):
-        """Read until any mark appears; return (matched, all_lines)."""
-
-        t_end = time.time() + timeout
-        all_lines = []
-        while time.time() < t_end:
-            for line in self.read_lines(min(0.1, max(0.0, t_end - time.time()))):
-                if collect is not None:
-                    all_lines.append(line)
-                for m in marks:
-                    if m in line:
-                        return m, all_lines
-        return None, all_lines
-
-    def close(self):
         try:
-            self.p.stdin.write(b"quit\n")
-            self.p.stdin.flush()
-        except Exception:
+            while not self.stop_flag.is_set():
+                data = self.ser.read(8192)
+                if not data:
+                    continue
+                self.raw.write(data)
+                self.chunks.write(json.dumps({
+                    "utc": datetime.now(timezone.utc).isoformat(),
+                    "monotonic": time.monotonic(),
+                    "offset": self.offset, "length": len(data),
+                }) + "\n")
+                self.offset += len(data)
+                self.filter.feed(data)
+        except Exception as exc:
+            self.error = repr(exc)
+            self.log.write("SERIAL_ERROR", self.error, echo=True)
+        finally:
+            if self.line_tail:
+                self.log.write("BOARD_PARTIAL", self.line_tail.decode(
+                    "latin-1", "replace"))
+            self.raw.close()
+            self.chunks.close()
+
+    def since(self, stamp):
+        with self.lock:
+            return [line for ts, line in self.lines if ts >= stamp]
+
+
+def fault_from_lines(lines):
+    for line in lines:
+        lower = line.lower()
+        if any(mark in lower for mark in (
+                "hardware error", "hardware-error", "controller recovery",
+                "force teardown", "force host teardown", "controller unresponsive")):
+            return "FAIL_HW", line
+    for line in lines:
+        if "disconnected, reason" in line:
+            return "FAIL_DROP", line
+    return None, ""
+
+
+def link_fault(console, stamp, disconnected, client):
+    if console.error:
+        return "SERIAL_ERROR", console.error
+    fault, detail = fault_from_lines(console.since(stamp))
+    if fault:
+        return fault, detail
+    if disconnected.is_set() or not client.is_connected:
+        return "FAIL_DROP", "BlueZ disconnected"
+    return None, ""
+
+
+async def find_watch(args, log):
+    from bleak import BleakScanner
+
+    event = asyncio.Event()
+    found = None
+    seen = set()
+
+    def advertisement(device, adv):
+        nonlocal found
+        seen.add(device.address)
+        name = adv.local_name or device.name or ""
+        matches = (device.address.lower() == args.mac.lower() if args.mac else
+                   name == WATCH_NAME or SVC in [s.lower() for s in adv.service_uuids])
+        if matches:
+            found = device
+            log.write("ADV", f"{device.address} name={name!r} rssi={adv.rssi}")
+            event.set()
+
+    async with BleakScanner(advertisement, adapter=args.adapter):
+        try:
+            await asyncio.wait_for(event.wait(), args.scan_s)
+        except asyncio.TimeoutError:
             pass
-        time.sleep(0.2)
-        self.p.kill()
+    log.write("SCAN", f"seen={len(seen)} target={getattr(found, 'address', None)}",
+              echo=True)
+    return found
 
 
-def timesync_value():
-    utc = int(time.time())
-    tz_min = 480                      # UTC+8, matches the phone app
-    return struct.pack("<BiH", 1, utc, tz_min & 0xFFFF)
-
-
-def write_timesync(mac):
-    """Write TimeSync through BlueZ D-Bus (bluetoothctl parses byte lists
-    differently and rejects the packed phone payload).
-    """
-
-    device = mac.replace(":", "_")
-    attr = f"/org/bluez/hci0/dev_{device}/service000e/char0012"
-    data = ", ".join(f"byte 0x{value:02x}" for value in timesync_value())
-    result = subprocess.run(
-        ["gdbus", "call", "--system", "--dest", "org.bluez",
-         "--object-path", attr,
-         "--method", "org.bluez.GattCharacteristic1.WriteValue",
-         f"[{data}]", "{}"],
-        capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"TimeSync D-Bus write failed: {result.stderr.strip()}")
-
-
-class LoadThread(threading.Thread):
-    """Continuously request frames, one outstanding, like the viewer."""
-
-    def __init__(self, ser):
-        super().__init__(daemon=True)
-        self.ser = ser
-        self.stop_flag = False
-
-    def run(self):
-        while not self.stop_flag:
-            try:
-                self.ser.write(b"s")
-                self.ser.flush()
-                time.sleep(0.05)
-                self.ser.read(4096)     # drain; content irrelevant here
-            except Exception:
-                break
-
-
-def one_trial(bt, console, mac, load, trial, gap_s, hold_s=45.0):
-    print(f"--- trial {trial}: load={load} ---")
-    console.clear()
-    t0 = time.time()
-
-    bt.send("scan on", 0.3)
-    m, _ = bt.wait_for([WATCH_NAME], 8.0)
-    bt.send("scan off", 0.3)
-    if m is None:
-        evs = console.since(t0 - 1)
-        print(f"   未扫到板子（未在广播？）匹配行: {m!r:.120}")
-        print("   板端近况:")
-        for (_, l) in evs[-6:]:
-            print(f"     | {l[:150]}")
-        return "NO_ADV", 0.0, []
-
-    t0 = time.time()
-    load_thr = None
-    if load == "frames":
-        load_thr = LoadThread(console.ser)
-        load_thr.start()
-
-    bt.send(f"connect {mac}", 0.3)
-    m, _ = bt.wait_for(["Connection successful", "Failed to connect",
-                        "Failed"], 15.0)
-    t_conn = time.time() - t0 if m == "Connection successful" else None
-    if m != "Connection successful":
-        if load_thr:
-            load_thr.stop_flag = True
-        print(f"   连接失败: {m}")
-        return "FAIL_CONN", 0.0, []
-
-    # subscribe Status + DataUp, then write TimeSync -- the phone's order
-    bt.send("menu gatt", 0.5)
-    for uuid in (UUID_STATUS, UUID_DATAUP):
-        bt.send(f"select-attribute {uuid}", 0.4)
-        bt.send("notify on", 0.4)
-    bt.send(f"select-attribute {UUID_TIMESYNC}", 0.4)
-    write_timesync(mac)
-
-    # wait for the authoritative board verdict
-    verdict = "TIMEOUT"
-    t_end = time.time() + 10.0
-    events = []
-    synced = False
-    while time.time() < t_end:
-        evs = console.since(t0)
-        events = [l for (_, l) in evs]
-        if any("time synced" in l for l in events):
-            synced = True
-            verdict = "SUCCESS"
-            break
-        if any("hardware-error" in l or "Force teardown" in l
-               for l in events):
-            verdict = "FAIL_HW"
-            break
-        if any("disconnected, reason" in l for l in events):
-            verdict = "FAIL_DROP"
-            break
-        time.sleep(0.05)
-
-    # Survival hold: the phone stays connected after sync with NO further
-    # traffic of its own - all ongoing traffic is the watch's indication
-    # stream (status + MOTION_DATA). Hold the link and see whether the
-    # controller survives it; the "初始化抛 lost" symptom dies here.
-    if verdict == "SUCCESS" and hold_s > 0:
-        t_hold = time.time()
-        t_end = time.time() + hold_s
-        while time.time() < t_end:
-            evs = console.since(t0)
-            events = [l for (_, l) in evs]
-            if any("hardware-error" in l or "Force teardown" in l
-                   for l in events):
-                verdict = "DIED_HOLD"
-                break
-            if any("disconnected, reason" in l for l in events):
-                verdict = "DIED_HOLD"
-                break
-            time.sleep(0.05)
-        else:
-            verdict = "SURVIVED"
-        print(f"   存活观察 {time.time() - t_hold:.0f}s -> {verdict}")
-
-    if load_thr:
-        load_thr.stop_flag = True
-        load_thr.join(timeout=1)
-
-    bt.send("disconnect", 1.0)
-    bt.send("back", 0.3)
-    time.sleep(gap_s)
-    return verdict, t_conn, events
-
-
-def mac_from_line(line):
-    m = re.search(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){6})", line)
-    return m.group(1) if m else None
-
-
-
-# The auto-preview daemon holds the same serial port; concurrent readers
-# split the byte stream, so refuse to run rather than fail mysteriously.
-pidfile = "/tmp/aiwatch_viewer.pid"
-if os.path.exists(pidfile):
+async def frame_load(ser, console, log):
+    """One request at a time; only ConsoleMonitor consumes response bytes."""
     try:
-        pid = int(open(pidfile).read().strip())
-        os.kill(pid, 0)
-        print(f"自动投屏守护正在运行 (pid {pid})，与测试抢串口。")
-        print("先停: systemctl --user stop ai-watch-viewer")
-        sys.exit(2)
-    except (ValueError, ProcessLookupError, PermissionError):
-        pass
+        while True:
+            count = console.filter.frames
+            ser.write(b"s")
+            deadline = time.monotonic() + 2.0
+            while (console.filter.frames == count and
+                   time.monotonic() < deadline and not console.error):
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        console.error = f"frame writer: {exc!r}"
+        log.write("SERIAL_ERROR", console.error, echo=True)
 
-def main():
-    ap = argparse.ArgumentParser()
+
+async def one_trial(args, console, log, trial):
+    from bleak import BleakClient
+
+    result = {"trial": trial, "load": args.load, "handshake": args.handshake}
+    log.write("TRIAL", f"{trial}/{args.trials} load={args.load}", echo=True)
+    try:
+        device = await find_watch(args, log)
+    except Exception as exc:
+        return dict(result, verdict="SCAN_ERROR", detail=repr(exc))
+    if device is None:
+        return dict(result, verdict="NO_ADV", detail="扫描窗口未收到目标广播")
+    result["mac"] = device.address
+    disconnected = asyncio.Event()
+    client = BleakClient(device, adapter=args.adapter,
+                         disconnected_callback=lambda _: disconnected.set(),
+                         timeout=args.connect_timeout)
+    task = None
+    stamp = time.monotonic()
+    phase = "CONNECT"
+    counts = {"status": 0, "data": 0}
+
+    def notification(kind):
+        def callback(_sender, value):
+            counts[kind] += 1
+            log.write("NOTIFY", f"{kind} {bytes(value).hex()}")
+        return callback
+
+    try:
+        if args.load == "frames":
+            task = asyncio.create_task(frame_load(console.ser, console, log))
+        await asyncio.wait_for(client.connect(), args.connect_timeout + 3)
+        result["connect_s"] = round(time.monotonic() - stamp, 3)
+        log.write("CONNECTED", f"{device.address} {result['connect_s']}s", echo=True)
+        if args.handshake == "sync":
+            phase = "GATT"
+            status = client.services.get_characteristic(UUID_STATUS)
+            data = client.services.get_characteristic(UUID_DATAUP)
+            timesync = client.services.get_characteristic(UUID_TIMESYNC)
+            if not all((status, data, timesync)):
+                return dict(result, verdict="FAIL_GATT", detail="缺少 f1/f2/f3 特征")
+            for char, kind in ((status, "status"), (data, "data")):
+                log.write("SUBSCRIBE", f"{kind} handle={char.handle}")
+                await asyncio.wait_for(client.start_notify(char, notification(kind)),
+                                       args.connect_timeout)
+            if args.settle:
+                await asyncio.sleep(args.settle)
+            phase = "SYNC"
+            utc = int(time.time())
+            payload = struct.pack("<BIh", 1, utc, 480)
+            log.write("TIMESYNC", f"utc={utc} payload={payload.hex()}")
+            await asyncio.wait_for(client.write_gatt_char(timesync, payload, response=True),
+                                   args.connect_timeout)
+            deadline = time.monotonic() + args.sync_timeout
+            while True:
+                fault, detail = link_fault(console, stamp, disconnected, client)
+                if fault:
+                    return dict(result, verdict=fault, detail=detail)
+                if any("BLE: time synced" in line and f"utc={utc}" in line
+                       for line in console.since(stamp)):
+                    break
+                if time.monotonic() >= deadline:
+                    return dict(result, verdict="NO_SYNC", detail="未见本轮板端校时确认")
+                await asyncio.sleep(0.05)
+            result["sync_s"] = round(time.monotonic() - stamp, 3)
+            log.write("SYNCED", f"{result['sync_s']}s", echo=True)
+        phase = "HOLD"
+        hold_start = time.monotonic()
+        while time.monotonic() - hold_start < args.hold:
+            fault, detail = link_fault(console, stamp, disconnected, client)
+            if fault:
+                return dict(result, verdict="DIED_HOLD", cause=fault, detail=detail,
+                            held_s=round(time.monotonic() - hold_start, 3))
+            await asyncio.sleep(0.05)
+        fault, detail = link_fault(console, stamp, disconnected, client)
+        if fault:
+            return dict(result, verdict="DIED_HOLD", cause=fault, detail=detail)
+        return dict(result, verdict="SURVIVED", held_s=args.hold,
+                    notifications=counts.copy())
+    except Exception as exc:
+        fault, detail = fault_from_lines(console.since(stamp))
+        if console.error:
+            fault, detail = "SERIAL_ERROR", console.error
+        elif not fault and phase != "CONNECT" and not client.is_connected:
+            fault, detail = "FAIL_DROP", "BlueZ disconnected"
+        verdict = fault or {"CONNECT": "FAIL_CONN", "GATT": "FAIL_GATT",
+                            "SYNC": "FAIL_SYNC", "HOLD": "DIED_HOLD"}[phase]
+        return dict(result, verdict=verdict, phase=phase,
+                    detail=f"{type(exc).__name__}: {exc}; {detail}")
+    finally:
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        # Mark intentional disconnect in the raw log, outside survival scoring.
+        log.write("DISCONNECT_REQUEST", device.address)
+        try:
+            await asyncio.wait_for(client.disconnect(), 6.0)
+        except Exception as exc:
+            log.write("DISCONNECT_ERROR", repr(exc))
+
+
+def check_viewer():
+    pidfile = Path("/tmp/aiwatch_viewer.pid")
+    if pidfile.exists():
+        try:
+            os.kill(int(pidfile.read_text().strip()), 0)
+        except (ValueError, ProcessLookupError):
+            return
+        raise RuntimeError("自动投屏守护占用串口；先 systemctl --user stop ai-watch-viewer")
+
+
+async def run(args):
+    import serial
+
+    check_viewer()
+    log = RunLog(args.log_prefix)
+    ser = serial.Serial(port=None, baudrate=args.baud, timeout=0.05,
+                        write_timeout=1, exclusive=True)
+    ser.dtr = False
+    ser.rts = False
+    ser.port = args.port
+    console = None
+    results = []
+    try:
+        ser.open()
+        console = ConsoleMonitor(ser, log)
+        console.start()
+        log.write("START", f"port={args.port} adapter={args.adapter} reset=none "
+                  f"logs={log.prefix}.*", echo=True)
+        if args.startup_wait:
+            await asyncio.sleep(args.startup_wait)
+        for trial in range(1, args.trials + 1):
+            result = await one_trial(args, console, log, trial)
+            results.append(result)
+            log.write("RESULT", json.dumps(result, ensure_ascii=False), echo=True)
+            if trial < args.trials:
+                await asyncio.sleep(args.gap)
+        tally = Counter(result["verdict"] for result in results)
+        log.write("SUMMARY", json.dumps(dict(tally), ensure_ascii=False), echo=True)
+        with open(log.prefix + ".results.json", "w", encoding="utf-8") as stream:
+            json.dump({"arguments": vars(args), "results": results,
+                       "summary": dict(tally)}, stream, ensure_ascii=False, indent=2)
+        return 0 if tally["SURVIVED"] == args.trials else 1
+    finally:
+        if console:
+            console.stop_flag.set()
+            console.join(timeout=2)
+        ser.close()
+        log.close()
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-p", "--port", default="/dev/ttyUSB0")
     ap.add_argument("-b", "--baud", type=int, default=1000000)
     ap.add_argument("-n", "--trials", type=int, default=5)
-    ap.add_argument("--load", choices=["none", "frames"], default="none")
-    ap.add_argument("--mac", default=None)
+    ap.add_argument("--adapter", default="hci0")
+    ap.add_argument("--load", choices=("none", "frames"), default="none")
+    ap.add_argument("--mac", help="只匹配指定地址；默认每轮按广播名/UUID重扫当前随机地址")
     ap.add_argument("--gap", type=float, default=4.0)
-    ap.add_argument("--hold", type=float, default=45.0,
-                    help="授时成功后保持连接的秒数（0=不保持）")
+    ap.add_argument("--hold", type=float, default=45.0)
+    ap.add_argument("--scan-s", type=float, default=15.0)
+    ap.add_argument("--connect-timeout", type=float, default=20.0)
+    ap.add_argument("--sync-timeout", type=float, default=10.0)
+    ap.add_argument("--startup-wait", type=float, default=0.0)
+    ap.add_argument("--settle", type=float, default=0.0,
+                    help="订阅后、校时前延迟秒数（诊断对照用，默认0）")
+    ap.add_argument("--handshake", choices=("sync", "none"), default="sync",
+                    help="none 只建链/发现服务并观察；sync 订阅并校时")
+    default_log = Path.home() / "huangshan-logs" / datetime.now().strftime("ble_connect_%Y%m%d_%H%M%S")
+    ap.add_argument("--log-prefix", default=str(default_log))
     args = ap.parse_args()
-
-    import serial
-    ser = serial.Serial(args.port, args.baud, timeout=0)
-    ser.rts = False
-    ser.dtr = False
-    time.sleep(0.3)
-    ser.reset_input_buffer()
-    ready, _banner_bytes = wait_for_ready(ser.read, timeout=15.0)
-    print("板子就绪" if ready else "未见启动横幅（按已运行处理）")
-    ser.reset_input_buffer()
-    ser.write(b"v")
-    time.sleep(0.2)
-    ser.reset_input_buffer()
-
-    console = ConsoleMonitor(ser)
-    console.start()
-
-    bt = Bluetoothctl()
-    bt.send("power on", 1.5)
-
-    mac = args.mac
-    if not mac:
-        mac = None
-        for attempt in range(3):
-            bt.send("scan on", 0.3)
-            t_end = time.time() + 12.0
-            seen = []
-            while time.time() < t_end:
-                for line in bt.read_lines(min(0.1, max(0.0, t_end - time.time()))):
-                    if "Device" in line:
-                        seen.append(line)
-                    if WATCH_NAME in line and mac is None:
-                        mac = mac_from_line(line)
-            bt.send("scan off", 0.3)
-            if mac:
-                break
-            print(f"  初扫第 {attempt + 1} 次未取得 MAC，重试..."
-                  f"（本窗口看到 {len(seen)} 个设备）")
-            for l in seen[:5]:
-                print(f"    · {l[:100]}")
-    print(f"目标 {WATCH_NAME} @ {mac}")
-
-    verdicts = []
-    try:
-        i = 0
-        dark_boots = 0
-        while i < args.trials:
-            v, t_conn, events = one_trial(bt, console, mac, args.load, i + 1,
-                                          args.gap, hold_s=args.hold)
-            if v == "NO_ADV" and dark_boots < 2:
-                # this boot never advertised; a fresh reset re-rolls the
-                # bring-up dice (measured 2026-10-31: 1/3 of boots come up
-                # late or never within the scan window). Reopening the
-                # port is what pulses DTR and resets the board.
-                dark_boots += 1
-                print(f"   暗 boot #{dark_boots}，重开串口换一个 boot...")
-                ser.close()
-                time.sleep(0.5)
-                ser.open()
-                ser.rts = False
-                ser.dtr = False
-                time.sleep(0.3)
-                ser.reset_input_buffer()
-                ready, _ = wait_for_ready(ser.read, timeout=15.0)
-                print("   新 boot 就绪" if ready else "   新 boot 未就绪")
-                ser.reset_input_buffer()
-                continue
-            verdicts.append(v)
-            i += 1
-            tail = " | ".join(events[-3:]) if events else ""
-            print(f"   => {v} (connect={t_conn}s)" if t_conn else f"   => {v}")
-            if tail:
-                print(f"      板端: {tail[:200]}")
-    finally:
-        bt.close()
-
-    ok = verdicts.count("SURVIVED")
-    print("\n== 汇总 ==")
-    from collections import Counter
-    for k, c in Counter(verdicts).items():
-        print(f"  {k}: {c}")
-    return 0 if ok == len(verdicts) else 1
+    if args.trials <= 0 or min(args.gap, args.hold, args.startup_wait, args.settle) < 0:
+        ap.error("次数必须大于0，等待时间不能为负数")
+    if min(args.scan_s, args.connect_timeout, args.sync_timeout) <= 0:
+        ap.error("扫描/连接/校时超时必须大于0")
+    return args
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        raise SystemExit(asyncio.run(run(parse_args())))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"测试工具失败：{type(exc).__name__}: {exc}", flush=True)
+        raise SystemExit(2)

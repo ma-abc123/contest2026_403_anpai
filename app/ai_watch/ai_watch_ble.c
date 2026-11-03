@@ -60,6 +60,7 @@
 
 #define AI_WATCH_BLE_TXQ_LEN        48
 #define AI_WATCH_BLE_TXQ_DATA_MAX   30
+#define AI_WATCH_BLE_TXQ_STATUS     0xff
 #define AI_WATCH_BLE_TX_BACKOFF_MS  2000
 
 /* INIT_FAILED auto-recovery pacing: the first attempt runs 10 s after the
@@ -122,6 +123,46 @@ static pthread_mutex_t g_txq_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_txq_dropped;
 static pthread_t g_tx_thread;
 static volatile bool g_tx_thread_ok;
+
+static int ai_ble_txq_enqueue(uint8_t sensor_type, FAR const void *data,
+                              uint8_t data_len)
+{
+  uint8_t next;
+
+  if (data == NULL || data_len == 0 ||
+      data_len > AI_WATCH_BLE_TXQ_DATA_MAX)
+    {
+      return -EINVAL;
+    }
+
+  if (ai_watch_ble_get_state() != AI_WATCH_BLE_BSP_CONNECTED)
+    {
+      return -ENOTCONN;
+    }
+
+  pthread_mutex_lock(&g_txq_lock);
+  next = (g_txq_head + 1u) % AI_WATCH_BLE_TXQ_LEN;
+  if (next == g_txq_tail)
+    {
+      g_txq_dropped++;
+      pthread_mutex_unlock(&g_txq_lock);
+      if ((g_txq_dropped % 100u) == 1u)
+        {
+          printf("BLE: tx queue full, dropped=%lu\n",
+                 (unsigned long)g_txq_dropped);
+        }
+
+      return -ENOSPC;
+    }
+
+  g_txq[g_txq_head].sensor_type = sensor_type;
+  g_txq[g_txq_head].len = data_len;
+  memcpy(g_txq[g_txq_head].data, data, data_len);
+  g_txq_head = next;
+  pthread_mutex_unlock(&g_txq_lock);
+
+  return 0;
+}
 
 /* INIT_FAILED auto-recovery bookkeeping (see ai_watch_ble_process) */
 
@@ -213,8 +254,16 @@ static FAR void *ai_ble_tx_worker(FAR void *arg)
       g_txq_tail = next;
       pthread_mutex_unlock(&g_txq_lock);
 
-      ret = ai_watch_ble_send_sensor_data(entry.sensor_type,
-                                          entry.data, entry.len);
+      if (entry.sensor_type == AI_WATCH_BLE_TXQ_STATUS)
+        {
+          ret = ai_watch_ble_bsp_notify(AI_WATCH_BLE_CHR_STATUS,
+                                        entry.data, entry.len);
+        }
+      else
+        {
+          ret = ai_watch_ble_send_sensor_data(entry.sensor_type,
+                                              entry.data, entry.len);
+        }
 
       /* A failure (peer not yet subscribed, transient radio state) just
        * costs a backoff sleep - without it the "Device is not subscribed"
@@ -306,7 +355,18 @@ static void ai_ble_notify_status(void)
   value[4] = (uint8_t)(sync >> 16);
   value[5] = (uint8_t)(sync >> 24);
 
-  ai_watch_ble_bsp_notify(AI_WATCH_BLE_CHR_STATUS, value, sizeof(value));
+  if (g_tx_thread_ok)
+    {
+      if (ai_ble_txq_enqueue(AI_WATCH_BLE_TXQ_STATUS, value,
+                             sizeof(value)) < 0)
+        {
+          printf("BLE: status queue failed\n");
+        }
+    }
+  else
+    {
+      ai_watch_ble_bsp_notify(AI_WATCH_BLE_CHR_STATUS, value, sizeof(value));
+    }
 }
 
 /****************************************************************************
@@ -1301,8 +1361,6 @@ int ai_watch_ble_post(uint8_t sensor_type,
                       FAR const void *data,
                       uint8_t data_len)
 {
-  uint8_t next;
-
   if (data == NULL || data_len == 0 ||
       data_len > AI_WATCH_BLE_TXQ_DATA_MAX)
     {
@@ -1316,33 +1374,7 @@ int ai_watch_ble_post(uint8_t sensor_type,
       return ai_watch_ble_send_sensor_data(sensor_type, data, data_len);
     }
 
-  if (ai_watch_ble_get_state() != AI_WATCH_BLE_BSP_CONNECTED)
-    {
-      return -ENOTCONN;
-    }
-
-  pthread_mutex_lock(&g_txq_lock);
-  next = (g_txq_head + 1u) % AI_WATCH_BLE_TXQ_LEN;
-  if (next == g_txq_tail)
-    {
-      g_txq_dropped++;
-      pthread_mutex_unlock(&g_txq_lock);
-      if ((g_txq_dropped % 100u) == 1u)
-        {
-          printf("BLE: tx queue full, dropped=%lu\n",
-                 (unsigned long)g_txq_dropped);
-        }
-
-      return -ENOSPC;
-    }
-
-  g_txq[g_txq_head].sensor_type = sensor_type;
-  g_txq[g_txq_head].len = data_len;
-  memcpy(g_txq[g_txq_head].data, data, data_len);
-  g_txq_head = next;
-  pthread_mutex_unlock(&g_txq_lock);
-
-  return 0;
+  return ai_ble_txq_enqueue(sensor_type, data, data_len);
 }
 
 /****************************************************************************

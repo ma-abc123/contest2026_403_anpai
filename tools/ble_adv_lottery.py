@@ -1,170 +1,169 @@
 #!/usr/bin/env python3
-"""Per-boot BLE advertising lottery test.
+"""SF32LB52 开机 BLE 广播回归（显式 RTS 复位，不依赖串口 reopen）。
 
-Opening the serial port resets the board, so each session is one boot.
-For each boot: wait for the app banner, then scan over hci0 for 12 s and
-record whether "AI-Watch-403" was discovered. Repeats N boots and prints
-the failure rate -- the regression gate for the LCPU bring-up wedge
-family (boots that never advertise).
+  systemctl --user stop ai-watch-viewer
+  /usr/bin/python3 tools/ble_adv_lottery.py -n 8 --scan-s 12
 
-    python3 tools/ble_adv_lottery.py -n 8
+始终只有一个串口读者。每轮 RTS=True 100ms -> False 100ms，DTR 保持
+False；对应 sftool 的 SF32LB52 默认硬复位序列：
+https://github.com/OpenSiFli/sftool/blob/master/sftool-lib/src/sf32lb52/mod.rs
+（attempt_connect；不要发送该函数后续的 Enter 调试命令。）
+
+每轮从新启动日志确认版本和就绪横幅，随后通过 Bleak 的实时广告回调
+扫描当前随机地址；不依赖 bluetoothctl 名称输出、不沿用上轮地址。
+没有新启动版本横幅时记 RESET_UNCONFIRMED，不把它算作成功的新 boot。
+扫描与串口异常独立记为 SCAN_ERROR/SERIAL_ERROR，避免冒充 NO_ADV。
+
+--scan-s 是就绪后扫描窗口，--boot-timeout 是启动横幅的最长等待时间。
+保存 .log、逐字节 .raw、带时间/偏移的 .chunks.jsonl 及 .results.json，
+格式与 ble_connect_test.py 一致。所有失败轮次保留，不自动丢弃重试。
 """
 
 import argparse
-import os
+import asyncio
+from collections import Counter
+from datetime import datetime
+import json
+from pathlib import Path
 import re
-import struct
-import subprocess
-import sys
-import threading
 import time
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from ble_connect_test import ConsoleMonitor, RunLog, check_viewer, find_watch
 
-from shot_protocol import wait_for_ready  # noqa: E402
+VERSION = re.compile(r"AI Watch version\s+([^\s]+)")
+READY_MARKS = ("[FRM] ready", "UI created; entering main loop")
 
 
-def one_boot(port, baud, scan_s, keep_open=False, send_v=False):
-    import serial
-    ser = serial.Serial(port, baud, timeout=0)
-    ser.rts = False
+async def pulse_reset(ser, log):
     ser.dtr = False
-    time.sleep(0.3)
-    ser.reset_input_buffer()
-    ready, banner = wait_for_ready(ser.read, timeout=15.0)
-    adv_in_banner = b"advertising as" in banner
-    if send_v:
+    log.write("RESET_ASSERT", "RTS=True DTR=False", echo=True)
+    ser.rts = True
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        ser.rts = False
+    stamp = time.monotonic()
+    log.write("RESET_RELEASE", "RTS=False DTR=False", echo=True)
+    await asyncio.sleep(0.1)
+    return stamp
+
+
+async def wait_for_boot(console, stamp, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        lines = console.since(stamp)
+        version = next((match.group(1) for line in lines
+                        if (match := VERSION.search(line))), None)
+        ready = any(mark in line for line in lines for mark in READY_MARKS)
+        if (version and ready) or console.error or time.monotonic() >= deadline:
+            return version, ready
+        await asyncio.sleep(0.05)
+
+
+async def one_boot(args, ser, console, log, boot):
+    log.write("BOOT", f"{boot}/{args.boots}", echo=True)
+    stamp = await pulse_reset(ser, log)
+    version, ready = await wait_for_boot(console, stamp, args.boot_timeout)
+    result = {"boot": boot, "version": version, "reset_confirmed": bool(version),
+              "ready": ready, "ready_wait_s": round(time.monotonic() - stamp, 3)}
+    if console.error:
+        return dict(result, verdict="SERIAL_ERROR", detail=console.error)
+    if args.send_v:
         ser.write(b"v")
-        time.sleep(0.3)
-
-    # drain console in the background while the host scans
-    console = {"buf": bytearray(), "stop": False}
-
-    def reader():
-        tail = b""
-        while not console["stop"]:
-            try:
-                data = ser.read(4096)
-            except Exception:
-                break
-            if not data:
-                time.sleep(0.02)
-                continue
-            data = tail + data
-            tail = b""
-            out = bytearray()
-            i = 0
-            while i < len(data):
-                idx = data.find(b"SHOT", i)
-                if idx < 0:
-                    out.extend(data[i:])
-                    break
-                out.extend(data[i:idx])
-                if len(data) - idx < 15:
-                    tail = bytes(data[idx:])
-                    break
-                _, w, h, st, fmt, ln = struct.unpack(
-                    "<4sHHHBI", data[idx:idx + 15])
-                if (64 <= w <= 1024 and 64 <= h <= 1024 and
-                        0 < ln <= 2 * 1024 * 1024):
-                    if len(data) - idx < 15 + ln:
-                        tail = bytes(data[idx:])
-                        break
-                    i = idx + 15 + ln
-                else:
-                    out.extend(data[idx:idx + 4])
-                    i = idx + 4
-            console["buf"].extend(out)
-
-    thr = threading.Thread(target=reader, daemon=True)
-    thr.start()
-
-    # scan in a fresh bluetoothctl session with stdin kept open
-    p = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, bufsize=0)
-
-    def send(cmd, wait=0.6):
-        p.stdin.write(cmd + "\n")
-        p.stdin.flush()
-        time.sleep(wait)
-
-    send("power on", 1.0)
-    send("scan on", 0.3)
-    t_end = time.time() + scan_s
-    found = False
-    t_found = None
-    while time.time() < t_end:
-        r, _, _ = __import__("select").select([p.stdout], [], [], 0.1)
-        if r:
-            line = p.stdout.readline()
-            if line and "AI-Watch-403" in line:
-                found = True
-                t_found = time.time() - t_end + scan_s
-                break
-    send("scan off", 0.3)
-    send("quit", 0.2)
-    p.kill()
-    console["stop"] = True
-    thr.join(timeout=1)
-    if not keep_open:
-        ser.close()
-
-    text = bytes(console["buf"]).replace(b"\r", b"").decode(
-        "latin-1", "replace")
-    pat = re.compile(r"ble:|advertis|assert|recovery|teardown|HCI|patch|"
-                     r"lcpu release|IPC queue", re.I)
-    console_lines = [l.strip() for l in text.split("\n") if pat.search(l)]
     try:
-        ser.close()
-    except Exception:
-        pass
-    return ready, adv_in_banner, found, t_found, console_lines
+        device = await find_watch(args, log)
+    except Exception as exc:
+        return dict(result, verdict="SCAN_ERROR", detail=repr(exc))
+    # Recheck after the scan: startup may complete during the scan window.
+    lines = console.since(stamp)
+    version = next((match.group(1) for line in lines
+                    if (match := VERSION.search(line))), version)
+    ready = any(mark in line for line in lines for mark in READY_MARKS)
+    result.update(version=version, reset_confirmed=bool(version), ready=ready,
+                  found=device is not None,
+                  mac=getattr(device, "address", None),
+                  boot_to_scan_result_s=round(time.monotonic() - stamp, 3),
+                  board_adv=any("advertising as" in line for line in lines),
+                  hardware_errors=sum("hardware error" in line.lower() for line in lines),
+                  controller_recoveries=sum("controller recovery type=" in line for line in lines))
+    if console.error:
+        return dict(result, verdict="SERIAL_ERROR", detail=console.error)
+    if not version:
+        return dict(result, verdict="RESET_UNCONFIRMED",
+                    detail="RTS 脉冲后未见新的 AI Watch version 横幅")
+    return dict(result, verdict="ADV" if device else "NO_ADV")
 
 
+async def run(args):
+    import serial
 
-# The auto-preview daemon holds the same serial port; concurrent readers
-# split the byte stream, so refuse to run rather than fail mysteriously.
-pidfile = "/tmp/aiwatch_viewer.pid"
-if os.path.exists(pidfile):
+    check_viewer()
+    log = RunLog(args.log_prefix)
+    ser = serial.Serial(port=None, baudrate=args.baud, timeout=0.05,
+                        write_timeout=1, exclusive=True)
+    ser.dtr = False
+    ser.rts = False
+    ser.port = args.port
+    console = None
+    results = []
     try:
-        pid = int(open(pidfile).read().strip())
-        os.kill(pid, 0)
-        print(f"自动投屏守护正在运行 (pid {pid})，与测试抢串口。")
-        print("先停: systemctl --user stop ai-watch-viewer")
-        sys.exit(2)
-    except (ValueError, ProcessLookupError, PermissionError):
-        pass
+        ser.open()
+        console = ConsoleMonitor(ser, log)
+        console.start()
+        log.write("START", f"port={args.port} adapter={args.adapter} "
+                  f"reset=RTS-100ms logs={log.prefix}.*", echo=True)
+        await asyncio.sleep(0.2)  # Drain existing output before the first pulse.
+        for boot in range(1, args.boots + 1):
+            result = await one_boot(args, ser, console, log, boot)
+            results.append(result)
+            log.write("RESULT", json.dumps(result, ensure_ascii=False), echo=True)
+            if result["verdict"] == "SERIAL_ERROR":
+                break
+            if boot < args.boots:
+                await asyncio.sleep(args.gap)
+        tally = Counter(result["verdict"] for result in results)
+        log.write("SUMMARY", f"{tally['ADV']}/{args.boots} boots 广播可见；"
+                  + json.dumps(dict(tally), ensure_ascii=False), echo=True)
+        with open(log.prefix + ".results.json", "w", encoding="utf-8") as stream:
+            json.dump({"arguments": vars(args), "results": results,
+                       "summary": dict(tally)}, stream, ensure_ascii=False, indent=2)
+        return 0 if tally["ADV"] == args.boots else 1
+    finally:
+        if ser.is_open:
+            ser.dtr = False
+            ser.rts = False
+        if console:
+            console.stop_flag.set()
+            console.join(timeout=2)
+        ser.close()
+        log.close()
 
-def main():
-    ap = argparse.ArgumentParser()
+
+def parse_args():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-p", "--port", default="/dev/ttyUSB0")
     ap.add_argument("-b", "--baud", type=int, default=1000000)
     ap.add_argument("-n", "--boots", type=int, default=8)
+    ap.add_argument("--adapter", default="hci0")
+    ap.add_argument("--mac", help="可选固定地址；默认按名称/服务 UUID 匹配每轮新地址")
     ap.add_argument("--scan-s", type=float, default=12.0)
-    ap.add_argument("--keep-open", action="store_true")
-    ap.add_argument("--send-v", action="store_true")
+    ap.add_argument("--boot-timeout", type=float, default=15.0)
+    ap.add_argument("--gap", type=float, default=1.0)
+    ap.add_argument("--send-v", action="store_true", help="就绪后发送 v 切换串口详细日志")
+    ap.add_argument("--keep-open", action="store_true", help="兼容旧参数；现在始终保持串口开启")
+    default_log = Path.home() / "huangshan-logs" / datetime.now().strftime("ble_boot_%Y%m%d_%H%M%S")
+    ap.add_argument("--log-prefix", default=str(default_log))
     args = ap.parse_args()
-
-    results = []
-    for i in range(1, args.boots + 1):
-        ready, adv_banner, found, t_found, clines = one_boot(
-            args.port, args.baud, args.scan_s,
-            keep_open=args.keep_open, send_v=args.send_v)
-        results.append(found)
-        print(f"boot {i}: ready={ready} banner_adv={adv_banner} "
-              f"discovered={found}"
-              + (f" @ {t_found:.1f}s" if t_found is not None else ""),
-              flush=True)
-        if not found:
-            for l in clines[-8:]:
-                print(f"   | {l[:140]}", flush=True)
-        time.sleep(1.0)
-
-    n_ok = sum(results)
-    print(f"\n== 汇总: {n_ok}/{len(results)} boots 广播可见 ==")
-    return 0 if n_ok == len(results) else 1
+    if args.boots <= 0 or min(args.scan_s, args.boot_timeout) <= 0 or args.gap < 0:
+        ap.error("次数/超时必须大于0，gap 不能为负数")
+    return args
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        raise SystemExit(asyncio.run(run(parse_args())))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"测试工具失败：{type(exc).__name__}: {exc}", flush=True)
+        raise SystemExit(2)
