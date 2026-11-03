@@ -423,6 +423,15 @@ static FAR void *motion_thread(FAR void *arg)
       snap->last_mag_mg = (uint32_t)(mag + 0.5f);
       snap->sensor_ok = true;
 
+#if AI_WATCH_CAPTURE_STREAM
+      /* Capture build: record from the first good sample onwards.  Set
+       * here rather than via ai_watch_motion_record_start(), which takes
+       * the same mutex this thread already holds.
+       */
+
+      snap->recording = true;
+#endif
+
       if (snap->recording)
         {
           struct motion_rec_sample_s s;
@@ -448,6 +457,18 @@ static FAR void *motion_thread(FAR void *arg)
       was_recording = snap->recording;
 
       pthread_mutex_unlock(&g_motion.lock);
+
+#if AI_WATCH_CAPTURE_STREAM
+      if (rec_t0 != 0 && rec_count % 200u == 0)
+        {
+          /* 5 s heartbeat at 40 Hz: proves the stream is alive even
+           * while the wearer is standing still (no REC jitter).
+           */
+
+          printf("CAP,alive,%u,%u\n", (unsigned)(now - rec_t0),
+                 (unsigned)rec_count);
+        }
+#endif
 
       /* --- Stillness deviation ring (last ~1 s) --- */
 
@@ -886,6 +907,7 @@ static void motion_drain_recording(void)
              (unsigned)s->t_ms, s->x, s->y, s->z, s->gx, s->gy, s->gz);
 
       g_rec_ble_seq++;
+#if !AI_WATCH_CAPTURE_STREAM
       if (g_rec_ble_seq % BLE_REC_DEC == 0)
         {
           memcpy(&payload[0], &s->t_ms, sizeof(uint32_t));
@@ -893,6 +915,7 @@ static void motion_drain_recording(void)
           ai_watch_ble_post(AI_WATCH_BLE_SENSOR_MOTION_DATA,
                             payload, sizeof(payload));
         }
+#endif
 
       g_motion.rec_q_tail =
         (g_motion.rec_q_tail + 1u) % MOTION_REC_QLEN;

@@ -57,7 +57,11 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define AI_WATCH_VERSION            "4.8.62-nostore"
+#if AI_WATCH_CAPTURE_STREAM
+#  define AI_WATCH_VERSION          "4.8.63-capture"
+#else
+#  define AI_WATCH_VERSION          "4.8.62-nostore"
+#endif
 #define AI_WATCH_BUTTON_DEVICE      "/dev/buttons"
 #define AI_WATCH_BUTTON_KEY2        (1 << 0)
 #define AI_WATCH_BUTTON_POLL_MS     10
@@ -2619,6 +2623,15 @@ static void ai_watch_fall_cancel_cb(lv_event_t *e)
 
 static void ai_watch_fall_ui_show(void)
 {
+#if AI_WATCH_CAPTURE_STREAM
+  /* Capture build: a 15 s full-screen countdown would interrupt the run.
+   * The state machine still prints every decision to the console, which
+   * is exactly what the offline replay needs.
+   */
+
+  return;
+#endif
+
   if (g_fall_ui.panel == NULL)
     {
       FAR lv_obj_t *panel = lv_obj_create(lv_layer_top());

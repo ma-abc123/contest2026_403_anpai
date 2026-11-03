@@ -47,6 +47,25 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
+/* Dataset capture build (2026-11-03).  When set to 1:
+ *   - the sampling thread records from the first good sample and never
+ *     stops, so every boot is a continuous capture run;
+ *   - REC lines go to the console only (no BLE decimation), and their
+ *     format <c>REC,<t_ms>,<x_mg>,<y_mg>,<z_mg>,<gx>,<gy>,<gz></c> is
+ *     exactly what tools/fall_threshold_analysis.py replays;
+ *   - the fall alert UI is suppressed so a detection (including a false
+ *     one, which is what we want to observe) cannot cover the screen
+ *     for 15 s and interrupt the run.
+ *
+ * 0 for every normal image.  Build with 1 into a separate bin.
+ */
+
+#define AI_WATCH_CAPTURE_STREAM     0
+
+/****************************************************************************
+ * Pre-processor Definitions
+ ****************************************************************************/
+
 /* Activity classification */
 
 #define AI_WATCH_MOTION_REST    0
