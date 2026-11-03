@@ -128,10 +128,22 @@ static volatile bool g_motion_slow;
                                          * after a free-fall impact */
 #define FALL_IMPACT_MAX_OBS_MS  10000   /* observation budget before
                                          * rejecting an impact */
-#define FALL_COOLDOWN_MS        60000   /* re-arm after a finished event */
-#define FALL_REJECT_COOLDOWN_MS 8000    /* shorter blind window after a
-                                         * rejected impact, so slam/pickup
-                                         * test patterns are not swallowed */
+/* Re-arm delay after a finished event.  The capture build shortens it to
+ * 3 s: a dataset run walks through 15 actions at 8 s spacing, and a 60 s
+ * blind window would silently drop every fall after the first one.  Only
+ * the re-arm delay changes -- every detection threshold, and therefore
+ * every single-event decision, stays identical.
+ */
+
+#if AI_WATCH_CAPTURE_STREAM
+#  define FALL_COOLDOWN_MS        3000
+#  define FALL_REJECT_COOLDOWN_MS 2000
+#else
+#  define FALL_COOLDOWN_MS        60000   /* re-arm after a finished event */
+#  define FALL_REJECT_COOLDOWN_MS 8000    /* shorter blind window after a
+                                           * rejected impact, so slam/pickup
+                                           * test patterns are not swallowed */
+#endif
 
 /* Shared queues between the sampling thread and the main loop */
 
@@ -973,7 +985,10 @@ void ai_watch_motion_process(void)
     }
 
   motion_drain_recording();
+
+#if !AI_WATCH_CAPTURE_STREAM
   motion_ble_maybe_send();
+#endif
 }
 
 void ai_watch_motion_get_snapshot(

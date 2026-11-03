@@ -81,7 +81,17 @@
 
 /* Time the "Suspected fall" countdown runs before reporting (ms) */
 
-#define AI_WATCH_FALL_COUNTDOWN_MS      15000
+/* Alert countdown. The capture build compresses it to 3 s: the state
+ * machine ignores new gesture decisions while an alert is counting down,
+ * and a 15 s window would swallow two 8 s-spaced dataset actions.  Only
+ * the countdown length changes; the arming decision itself is untouched.
+ */
+
+#if AI_WATCH_CAPTURE_STREAM
+#  define AI_WATCH_FALL_COUNTDOWN_MS    3000
+#else
+#  define AI_WATCH_FALL_COUNTDOWN_MS    15000
+#endif
 
 /****************************************************************************
  * Public Types

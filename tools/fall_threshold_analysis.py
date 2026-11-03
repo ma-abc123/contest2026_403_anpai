@@ -80,6 +80,10 @@ class FallFSM:
 
     def __init__(self, args):
         self.args = args
+        # Quiet windows mirror the firmware macros; capture runs shorten
+        # both so 8 s-spaced actions are not swallowed.
+        self.cooldown_ms = getattr(args, "cooldown", 60000)
+        self.countdown_ms = getattr(args, "countdown", 15000)
         self.reset()
 
     def reset(self):
@@ -96,6 +100,8 @@ class FallFSM:
         self.dev_ring = []           # (t, |a|-mean)
         self.mean = GRAVITY_MG
         self.events = []
+        self.impact_mag = 0.0
+        self.alarm_end = 0.0         # countdown expiry while in ALARM
 
     def angle_deg(self, a, b):
         dot = sum(i * j for i, j in zip(a, b))
@@ -141,6 +147,16 @@ class FallFSM:
                 self.imp_last_move = t_ms
             return
 
+        if self.state == "ALARM":
+            # The firmware keeps the alert up for AI_WATCH_FALL_COUNTDOWN_MS
+            # (15 s, or 3 s in the capture build) and only then re-arms;
+            # this state used to be terminal ("ALARM-DONE"), which silently
+            # limited a session to a single event.
+            if t_ms >= self.alarm_end:
+                self.state = "NORMAL"
+                self.cooldown = self.alarm_end + self.cooldown_ms
+            return
+
         if self.state == "IMPACT":
             if dev > a.still_dev:
                 self.imp_last_move = t_ms
@@ -159,14 +175,15 @@ class FallFSM:
 
             if not still:
                 self.state = "NORMAL"
-                self.cooldown = t_ms + 60000
+                self.cooldown = t_ms + self.cooldown_ms
                 return
 
             ang = self.angle_deg(self.pre_bearing, self.grav_f)
 
             if ang >= a.angle:
                 self.events.append((t_ms, self.impact_mag, ang))
-                self.state = "ALARM-DONE"   # reported; stays until reset
+                self.state = "ALARM"
+                self.alarm_end = t_ms + self.countdown_ms
                 return
 
             if self.imp_ff and t_ms - self.imp_last_move >= a.long_still:
@@ -174,7 +191,8 @@ class FallFSM:
                 # stillness (the alternate confirmation path)
 
                 self.events.append((t_ms, self.impact_mag, ang))
-                self.state = "ALARM-DONE"
+                self.state = "ALARM"
+                self.alarm_end = t_ms + self.countdown_ms
                 return
 
             if t_ms - self.imp_start < 10000:
@@ -182,7 +200,7 @@ class FallFSM:
                 return
 
             self.state = "NORMAL"
-            self.cooldown = t_ms + 60000
+            self.cooldown = t_ms + self.cooldown_ms
 
 
 def analyze(path, args):
@@ -232,6 +250,10 @@ def main():
     p.add_argument("--jolt", type=float, default=200)
     p.add_argument("--angle", type=float, default=50)
     p.add_argument("--window", type=float, default=3.0)
+    p.add_argument("--cooldown", type=float, default=60000,
+                   help="re-arm delay after an event (ms; capture build 3000)")
+    p.add_argument("--countdown", type=float, default=15000,
+                   help="alert hold before re-arming (ms; capture build 3000)")
     args = p.parse_args()
 
     for path in args.files:

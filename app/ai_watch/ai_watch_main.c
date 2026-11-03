@@ -4993,8 +4993,18 @@ int main(int argc, FAR char *argv[])
 
   ai_watch_skill_init(0);
 
+#if AI_WATCH_CAPTURE_STREAM
+  /* Capture build: the radio stays off.  On this board the controller
+   * boot lottery costs a 1.15 s HCI timeout + LCPU patch reload roughly
+   * every 10 s, and during that window the sampling thread gets no CPU --
+   * measured as periodic 1.1 s holes in the REC stream.  A dataset run
+   * needs none of it.
+   */
+
+#else
   ai_watch_ble_init();
   ai_watch_update_bt_label(&watch);
+#endif
 
   printf("UI created; entering main loop\n");
 
@@ -5045,7 +5055,9 @@ int main(int argc, FAR char *argv[])
 
         enum ai_watch_ble_bsp_state_e state;
 
+#if !AI_WATCH_CAPTURE_STREAM
         ai_watch_ble_process();
+#endif
         state = ai_watch_ble_get_state();
 
         if (state != last_ble_state)
