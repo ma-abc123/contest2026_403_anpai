@@ -314,6 +314,8 @@ struct ai_watch_s
   bool gesture_lock;            /* a slider owns the current touch */
 
   bool touch_available;
+  bool touch_panel_ready;       /* touch_indev is the panel controller,
+                                 * not the temporary host pointer */
   int touch_start_x;
   int touch_start_y;
   int touch_last_y;             /* previous poll sample, brief scroll */
@@ -1301,9 +1303,24 @@ static void ai_watch_push_page(FAR struct ai_watch_s *watch, int page)
   watch->page_stack[watch->page_stack_top] = page;
   watch->current_page = page;
 
-  anim = (page == AI_WATCH_PAGE_APP_LIST) ?
-         LV_SCR_LOAD_ANIM_FADE_ON :
-         LV_SCR_LOAD_ANIM_MOVE_LEFT;
+  /* Animation follows the spatial model: the brief page is the watch
+   * face's LEFT neighbour (summoned with a right swipe), so it slides
+   * in from the left edge. Stacked app/settings pages keep sliding in
+   * from the right; the app list fades instead of sliding.
+   */
+
+  if (page == AI_WATCH_PAGE_APP_LIST)
+    {
+      anim = LV_SCR_LOAD_ANIM_FADE_ON;
+    }
+  else if (page == AI_WATCH_PAGE_BRIEF)
+    {
+      anim = LV_SCR_LOAD_ANIM_MOVE_RIGHT;
+    }
+  else
+    {
+      anim = LV_SCR_LOAD_ANIM_MOVE_LEFT;
+    }
 
   lv_scr_load_anim(target, anim, 200, 0, false);
   printf("Push page %d (stack depth %d)\n", page,
@@ -1377,8 +1394,10 @@ static void ai_watch_pop_page(FAR struct ai_watch_s *watch)
 
 static void ai_watch_go_home(FAR struct ai_watch_s *watch)
 {
-  if (watch->current_page == AI_WATCH_PAGE_HOME ||
-      watch->current_page == AI_WATCH_PAGE_APP_LIST)
+  int leaving_page = watch->current_page;
+
+  if (leaving_page == AI_WATCH_PAGE_HOME ||
+      leaving_page == AI_WATCH_PAGE_APP_LIST)
     {
       return;
     }
@@ -1400,9 +1419,17 @@ static void ai_watch_go_home(FAR struct ai_watch_s *watch)
   watch->page_stack[0] = AI_WATCH_PAGE_HOME;
   watch->current_page = AI_WATCH_PAGE_HOME;
 
-  lv_scr_load_anim(watch->home_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+  /* Direction mirrors the spatial model: leaving the brief (the face's
+   * left neighbour) slides the whole strip leftward so the brief exits
+   * to the LEFT; stacked app/settings pages still exit to the right.
+   */
+
+  lv_scr_load_anim(watch->home_screen,
+                   leaving_page == AI_WATCH_PAGE_BRIEF ?
+                   LV_SCR_LOAD_ANIM_MOVE_LEFT :
+                   LV_SCR_LOAD_ANIM_MOVE_RIGHT,
                    200, 0, false);
-  printf("Swipe: back to home\n");
+  printf("Swipe: back to home (from page %d)\n", leaving_page);
 }
 
 static void ai_watch_open_app(FAR struct ai_watch_s *watch, int app_index)
@@ -4540,8 +4567,19 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
             int dx = point.x - watch->touch_start_x;
             int dy = point.y - watch->touch_start_y;
 
-            if (dx > AI_WATCH_SWIPE_BACK_TRIGGER &&
-                abs(dx) > abs(dy) * 2)
+            /* The brief page is the watch face's horizontal neighbour, so
+             * it returns on a LEFT swipe (the page-to-page direction),
+             * unlike app/settings pages which are stacked and return on a
+             * RIGHT swipe. A right swipe on this page is deliberately
+             * inert: it used to go home, which read as "back" even though
+             * the page is not a child of the face.
+             */
+
+            bool back_swipe = watch->current_page == AI_WATCH_PAGE_BRIEF
+                              ? (dx < -AI_WATCH_SWIPE_BACK_TRIGGER)
+                              : (dx > AI_WATCH_SWIPE_BACK_TRIGGER);
+
+            if (back_swipe && abs(dx) > abs(dy) * 2)
               {
                 watch->gesture_handled = true;
                 ai_watch_go_home(watch);
@@ -4625,16 +4663,15 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
                   ai_watch_push_page(watch, AI_WATCH_PAGE_APP_LIST);
                 }
             }
-          else if (abs(dx) > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
-            {
-              /* Either horizontal direction opens the brief. Left swipe
-               * is the documented gesture; right swipe was added for the
-               * remote-preview era - users naturally swipe right for a
-               * -1 screen, and with only the left branch a right swipe
-               * fell through to the widget underneath and read as a
-               * click. Refresh first so the page shows counters as of
-               * now rather than as of creation.
-               */
+            else if (dx > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
+              {
+                /* Right swipe only: the brief is the face's LEFT
+                 * neighbour, summoned by dragging the content right.
+                 * A left swipe here is deliberately inert (it used to
+                 * open the brief, which fought the return gesture
+                 * sitting on the same axis). Refresh first so the page
+                 * shows counters as of now rather than as of creation.
+                 */
 
               ai_watch_brief_refresh(watch);
               ai_watch_push_page(watch, AI_WATCH_PAGE_BRIEF);
@@ -4655,7 +4692,16 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
               return;
             }
 
-          if (dx > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
+          if (watch->current_page == AI_WATCH_PAGE_BRIEF)
+            {
+              /* Same convention as the mid-drag path: left swipe only. */
+
+              if (dx < -AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
+                {
+                  ai_watch_go_home(watch);
+                }
+            }
+          else if (dx > AI_WATCH_SWIPE_THRESHOLD && abs(dx) > abs(dy))
             {
               ai_watch_go_home(watch);
             }
@@ -4667,21 +4713,29 @@ static void ai_watch_touch_update(FAR struct ai_watch_s *watch)
  * Public Functions
  ****************************************************************************/
 
-/* LCD partial-render plumbing (2026-11-01 screen-fluidity work): LVGL
- * renders invalidated strips into a small SRAM buffer; this flush sends
- * each strip to the panel and mirrors it into a full-frame shadow so the
- * shot link can still snapshot complete pictures (in PARTIAL mode the
- * LVGL buffer only ever holds one strip). */
+/* LCD render plumbing.
+ *
+ * History: 2026-11-01 switched this build to LV_DISPLAY_RENDER_MODE_PARTIAL
+ * with a 100-row SRAM strip, to cut render cost on a dead-panel board that
+ * only ever measured pure rendering (headless, no panel traffic at all).
+ * That result never carried over to a real panel.  With RENDER_MODE_PARTIAL
+ * LVGL flushes once per *strip*: a full-screen scroll produced dozens of
+ * PUTAREA ioctls per frame, and each one makes the LCD driver reprogram the
+ * window before pushing pixels.  On glass the panel visibly stepped one
+ * band at a time.  DIRECT hands the driver one full-frame buffer and a
+ * single dirty rectangle per flush, which is what the panel path wants.
+ *
+ * The shot link still needs a contiguous frame to snapshot, so the flush
+ * mirrors the dirty rectangle into g_lcd_shadow (PSRAM) and the snapshot
+ * path reads that instead of the LVGL buffer.
+ */
 
 static int g_lcd_fd = -1;
 static FAR uint16_t *g_lcd_shadow;
 
-/* Render strip in .bss: guaranteed SRAM (the heap's 351 KB full-frame
- * buffer lands in PSRAM and LVGL renders through the QSPI bus at
- * ~4 MB/s -- the dominant screen-fluidity bottleneck on this board). */
+/* Kept for the PARTIAL fallback below; NULL in the DIRECT path. */
 
-static FAR uint16_t g_lcd_strip[AI_WATCH_SCREEN_WIDTH * AI_WATCH_LCD_STRIP_ROWS]
-  __attribute__((aligned(64)));
+static FAR uint16_t *g_lcd_strip;
 
 static void ai_watch_lcd_flush_cb(lv_display_t *disp, const lv_area_t *area,
                                   uint8_t *color_p)
@@ -4690,25 +4744,53 @@ static void ai_watch_lcd_flush_cb(lv_display_t *disp, const lv_area_t *area,
   int y;
   int row_bytes;
 
+  /* ioctl contract (lcd_dev.c): data points at the first pixel of the
+   * window and stride is the distance to the next row. In DIRECT mode
+   * color_p is the frame origin, so move it to the window's top-left and
+   * keep a full-width stride; in PARTIAL mode it is already the strip
+   * origin with area-relative rows.
+   */
+
+  row_bytes = (area->x2 - area->x1 + 1) * 2;
+
   desc.row_start = area->y1;
   desc.row_end   = area->y2;
   desc.col_start = area->x1;
   desc.col_end   = area->x2;
-  desc.data      = color_p;
-  row_bytes      = (area->x2 - area->x1 + 1) * 2;   /* RGB565 */
-  desc.stride    = row_bytes;
+
+  if (g_lcd_strip == NULL)
+    {
+      desc.stride = AI_WATCH_SCREEN_WIDTH * 2;
+      desc.data   = color_p +
+                    ((size_t)area->y1 * AI_WATCH_SCREEN_WIDTH +
+                     area->x1) * 2;
+    }
+  else
+    {
+      desc.stride = row_bytes;
+      desc.data   = color_p;
+    }
 
   if (g_lcd_fd >= 0)
     {
       ioctl(g_lcd_fd, LCDDEVIO_PUTAREA, (unsigned long)&desc);
     }
 
+  /* Mirror the window into the snapshot frame. desc.data already points
+   * at the window's top-left pixel, so no column offset here.
+   */
+
   if (g_lcd_shadow != NULL)
     {
+      FAR const uint16_t *src = (FAR const uint16_t *)desc.data;
+      size_t src_stride = desc.stride / 2;
+
       for (y = area->y1; y <= area->y2; y++)
         {
-          memcpy(g_lcd_shadow + y * AI_WATCH_SCREEN_WIDTH + area->x1,
-                 color_p + (y - area->y1) * row_bytes, row_bytes);
+          memcpy(g_lcd_shadow + (size_t)y * AI_WATCH_SCREEN_WIDTH +
+                 area->x1,
+                 src + (size_t)(y - area->y1) * src_stride,
+                 row_bytes);
         }
     }
 
@@ -4819,30 +4901,29 @@ int main(int argc, FAR char *argv[])
 
   if (result.disp != NULL)
     {
-      /* PARTIAL strip in SRAM + full-frame shadow (PSRAM): DIRECT with a
-       * full-frame buffer redrew 351 KB through PSRAM at ~4 MB/s
-       * (scroll render 88 ms); the SRAM strip renders an order faster
-       * and the flush mirrors each strip into the shadow that the shot
-       * link snapshots. PARTIAL renders only the damaged areas. */
+      size_t strip_size = (size_t)AI_WATCH_SCREEN_WIDTH *
+                          AI_WATCH_LCD_STRIP_ROWS * sizeof(uint16_t);
+      size_t frame_size = (size_t)AI_WATCH_SCREEN_WIDTH *
+                          AI_WATCH_SCREEN_HEIGHT * sizeof(uint16_t);
 
-      g_lcd_shadow = lv_malloc((size_t)AI_WATCH_SCREEN_WIDTH *
-                               AI_WATCH_SCREEN_HEIGHT * 2);
+      g_lcd_strip = lv_malloc(strip_size);
+      g_lcd_shadow = lv_malloc(frame_size);
 
-      if (g_lcd_shadow != NULL)
+      if (g_lcd_strip != NULL && g_lcd_shadow != NULL)
         {
           lv_display_set_color_format(result.disp, LV_COLOR_FORMAT_RGB565);
           lv_display_set_buffers(result.disp, g_lcd_strip, NULL,
-                                 sizeof(g_lcd_strip),
+                                 strip_size,
                                  LV_DISPLAY_RENDER_MODE_PARTIAL);
           lv_display_set_flush_cb(result.disp, ai_watch_lcd_flush_cb);
           ai_watch_shot_bind_frame((FAR const uint8_t *)g_lcd_shadow,
                                    AI_WATCH_SCREEN_WIDTH,
                                    AI_WATCH_SCREEN_HEIGHT);
-          printf("Headless display: SRAM strip + shadow frame\n");
+          printf("Headless display: runtime strip + shadow frame\n");
         }
       else
         {
-          printf("ERROR: headless shadow frame alloc failed\n");
+          printf("ERROR: headless display buffer allocation failed\n");
           result.disp = NULL;
         }
     }
@@ -4882,50 +4963,33 @@ int main(int argc, FAR char *argv[])
          init_retry + 1);
 
 #if !AI_WATCH_HEADLESS
-  /* Screen fluidity (2026-11-01): lv_nuttx_lcd hands LVGL a full-screen
-   * buffer in RENDER_MODE_FULL -- every invalidation re-rendered every
-   * widget AND re-streamed the whole 351 KB frame over QSPI (measured
-   * 100-180 ms per invalidation; scroll render averaged 88 ms even in
-   * DIRECT, because the full-frame buffer lands in PSRAM and LVGL
-   * renders at ~4 MB/s through the QSPI bus). Switch to a 100-row strip
-   * in SRAM (LV_DISPLAY_RENDER_MODE_PARTIAL): only the invalidated
-   * areas are rendered and streamed. The strip cannot feed the shot
-   * mirror, so the flush mirrors every strip into a full-frame shadow
-   * (PSRAM) that the snapshot path reads instead of the LVGL buffer.
-   * The port's original full-screen buffer stays allocated (no free
-   * API); one-off 351 KB in an 8 MB PSRAM. */
+  /* Real panel: leave the port's own display path alone.
+   *
+   * 2026-11-01 replaced it with a 100-row PARTIAL strip; measured only in
+   * headless mode (no panel traffic at all), it made the glass step band
+   * by band, so it is gone. The replacement we tried first -- switching to
+   * RENDER_MODE_DIRECT and owning the flush callback with a second fd --
+   * rendered fine but the screen only advanced when touched: two fds on
+   * one /dev/lcd0 and a foreign flush_cb upset the refresh handshake.
+   *
+   * So this build does what the port intends: FULL render mode, the
+   * driver's own flush_cb, and no extra fd for drawing.  The only thing
+   * we keep is a read-only fd to copy every flush into the shot mirror.
+   */
 
-  if (result.disp != NULL)
+  g_lcd_shadow = lv_malloc((size_t)AI_WATCH_SCREEN_WIDTH *
+                           AI_WATCH_SCREEN_HEIGHT * 2);
+
+  if (g_lcd_shadow != NULL)
     {
-      FAR lv_color_t *strip =
-        lv_malloc((size_t)AI_WATCH_SCREEN_WIDTH *
-                  AI_WATCH_LCD_STRIP_ROWS * 2);
-
-      g_lcd_shadow = lv_malloc((size_t)AI_WATCH_SCREEN_WIDTH *
-                               AI_WATCH_SCREEN_HEIGHT * 2);
-      g_lcd_fd = open("/dev/lcd0", O_RDWR);
-
-      if (strip != NULL && g_lcd_shadow != NULL && g_lcd_fd >= 0)
-        {
-          lv_display_set_buffers(result.disp, strip, NULL,
-                                 (size_t)AI_WATCH_SCREEN_WIDTH *
-                                 AI_WATCH_LCD_STRIP_ROWS * 2,
-                                 LV_DISPLAY_RENDER_MODE_PARTIAL);
-          lv_display_set_flush_cb(result.disp, ai_watch_lcd_flush_cb);
-          ai_watch_shot_bind_frame((FAR const uint8_t *)g_lcd_shadow,
-                                   AI_WATCH_SCREEN_WIDTH,
-                                   AI_WATCH_SCREEN_HEIGHT);
-          printf("LCD partial render: %d-row strip + shadow frame\n",
-                 AI_WATCH_LCD_STRIP_ROWS);
-        }
-      else
-        {
-          /* Keep the port's full-screen buffer (DIRECT); slower, but the
-           * UI and the mirror keep working. */
-          lv_display_set_render_mode(result.disp,
-                                     LV_DISPLAY_RENDER_MODE_DIRECT);
-          printf("LCD partial setup failed; DIRECT full-frame fallback\n");
-        }
+      ai_watch_shot_bind_frame((FAR const uint8_t *)g_lcd_shadow,
+                               AI_WATCH_SCREEN_WIDTH,
+                               AI_WATCH_SCREEN_HEIGHT);
+      printf("LCD port render path kept (FULL mode, driver flush_cb)\n");
+    }
+  else
+    {
+      printf("ERROR: shot shadow allocation failed\n");
     }
 #endif /* !AI_WATCH_HEADLESS */
 
@@ -4939,6 +5003,7 @@ int main(int argc, FAR char *argv[])
 
   watch.touch_indev = NULL;
   watch.touch_available = false;
+  watch.touch_panel_ready = false;
   watch.touch_poll_remaining = 30;  /* poll for up to 30s */
 
 #if !AI_WATCH_HEADLESS
@@ -4956,6 +5021,7 @@ int main(int argc, FAR char *argv[])
       if (watch.touch_indev != NULL)
         {
           watch.touch_available = true;
+          watch.touch_panel_ready = true;
           watch.touch_poll_remaining = 0;
           printf("Touch input initialized\n");
         }
@@ -4966,9 +5032,18 @@ int main(int argc, FAR char *argv[])
 
   if (!watch.touch_available)
     {
-      /* No panel touch layer. Fall back to the host pointer registered by
-       * the screen-dump hook: without this, every gesture handler bails
+      /* No panel touch layer yet. Fall back to the host pointer registered
+       * by the screen-dump hook: without this, every gesture handler bails
        * out early and clicks from the preview window do nothing.
+       *
+       * In panel mode this must stay a *temporary* stand-in.  The panel's
+       * touch controller is brought up asynchronously (sifli_ap.c does an
+       * 80 ms settle before ft6146_touch_initialize), so /dev/input0 is
+       * routinely missing when the UI starts.  Clearing touch_poll_remaining
+       * here used to stop the retry loop for good: the real controller
+       * registered a moment later and nobody ever bound it, leaving the
+       * panel permanently dead to touch while the host pointer held the
+       * slot.  Keep polling and let the loop below swap in the panel.
        */
 
       watch.touch_indev = ai_watch_shot_get_indev();
@@ -4976,8 +5051,23 @@ int main(int argc, FAR char *argv[])
       if (watch.touch_indev != NULL)
         {
           watch.touch_available = true;
+
+#if AI_WATCH_HEADLESS
+          /* No panel exists in this build: the host pointer is the only
+           * pointing device and is meant to win outright.
+           */
+
           watch.touch_poll_remaining = 0;
           printf("Touch unavailable; using remote pointer from host\n");
+#else
+          /* Panel build: this is a placeholder. Leave the retry budget
+           * alone and poll for the real controller below.
+           */
+
+          printf("Touch pending; host pointer as temporary input\n");
+          clock_gettime(CLOCK_MONOTONIC, &watch.touch_next_poll);
+          watch.touch_next_poll.tv_sec += 1;
+#endif
         }
       else
         {
@@ -5029,19 +5119,34 @@ int main(int argc, FAR char *argv[])
 
       /* Poll for touch device (every 1s, up to 30 attempts) */
 
-      if (!watch.touch_available && watch.touch_poll_remaining > 0)
+      if (!watch.touch_panel_ready && watch.touch_poll_remaining > 0)
         {
           if (ai_watch_deadline_reached(&now,
                                         &watch.touch_next_poll))
             {
               if (access("/dev/input0", F_OK) == 0)
                 {
-                  watch.touch_indev =
+                  FAR lv_indev_t *panel_indev =
                       lv_nuttx_touchscreen_create("/dev/input0");
 
-                  if (watch.touch_indev != NULL)
+                  if (panel_indev != NULL)
                     {
+                      /* The panel controller wins over the host pointer.
+                       * Both are LVGL POINTER indevs bound to the same
+                       * display; leaving the temporary one in place would
+                       * keep eating the gestures meant for the glass.
+                       */
+
+                      if (watch.touch_indev != NULL &&
+                          watch.touch_indev != panel_indev &&
+                          !watch.touch_panel_ready)
+                        {
+                          lv_indev_delete(watch.touch_indev);
+                        }
+
+                      watch.touch_indev = panel_indev;
                       watch.touch_available = true;
+                      watch.touch_panel_ready = true;
                       watch.touch_poll_remaining = 0;
                       printf("Touch input initialized (delayed)\n");
                     }

@@ -33,46 +33,17 @@ import serial
 
 REC_RE = re.compile(r"REC,(\d+),")
 
-# (label, expect_detect). expect_detect=None means "setup / idle".
-ACTIONS = [
-    ("静置（等 boot 与 BLE recovery 平息）", None),
-    ("拿起手表 → 戴上", False),
-    ("站立 → 侧倒在床垫", True),
-    ("站立 → 前倒在床垫", True),
-    ("快速坐下（椅子）", False),
-    ("重重坐下（屁股砸椅子）", False),
-    ("用手拍打手表 3 下", False),
-    ("原地跳 2 下", False),
-    ("正常走路 5 秒", False),
-    ("脱下手表放到桌上", False),
-    ("从桌上拿起 → 戴上", False),
-    ("站立 → 后倒在床垫", True),
-    ("拿起放下 ×3（误报复现）", False),
-]
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from capture_script import ACTIONS, action_at  # noqa: E402
 
-IDLE_S = 25.0          # idle window before action #1
-SLOT_S = 8.0           # one action + 3 s gap
+STEP_RE = re.compile(r"STEP,(\d+),(\d+)")
+
 
 C_RED = "\033[31m"
 C_YEL = "\033[33m"
 C_GRN = "\033[32m"
 C_DIM = "\033[2m"
 C_OFF = "\033[0m"
-
-
-def action_at(elapsed):
-    """Return (index, label, expect, seconds_into_slot, remaining)."""
-
-    if elapsed < IDLE_S:
-        return (0, ACTIONS[0][0], None, elapsed, IDLE_S - elapsed)
-
-    slot = (elapsed - IDLE_S) // SLOT_S
-    idx = int(slot) + 1
-    if idx >= len(ACTIONS):
-        return (None, None, None, 0.0, 0.0)
-
-    into = (elapsed - IDLE_S) % SLOT_S
-    return (idx, ACTIONS[idx][0], ACTIONS[idx][1], into, SLOT_S - into)
 
 
 def main():
@@ -107,6 +78,7 @@ def main():
     t_next_status = t0
     buf = b""
     rec_count = 0
+    step_count = 0
     last_rec_ms = 0
     rec_times = []          # wall clock of recent REC lines (rate)
     detections = []         # (elapsed_s, text)
@@ -140,6 +112,13 @@ def main():
                             rec_times.pop(0)
                         continue
 
+                    ms = STEP_RE.search(line)
+                    if ms:
+                        step_count += 1
+                        print(f"\n{C_DIM}>>> 计一步 t={int(ms.group(1)) / 1000.0:.1f}s"
+                              f" |a|={ms.group(2)} mg{C_OFF}")
+                        continue
+
                     if "MOTION: fall armed" in line:
                         el = now - t0
                         print(f"\n{C_RED}>>> [{el:6.1f}s] 触发告警  {line}"
@@ -168,7 +147,7 @@ def main():
                     print(f"[{elapsed:6.1f}s] {rate:5.1f}Hz "
                           f"rec={rec_count}", end="\r", flush=True)
                 else:
-                    idx, label, expect, into, left = action_at(elapsed)
+                    idx, label, expect, exp_steps, into, left = action_at(elapsed)
                     if idx is None:
                         print(f"\n动作表已走完（{elapsed:.0f}s）。"
                               f"Ctrl-C 结束，日志在 {args.log}")
@@ -182,7 +161,7 @@ def main():
                         hint = f"#{idx} {label}（{mark}，剩 {left:.0f}s）"
 
                     print(f"[{elapsed:6.1f}s] {rate:5.1f}Hz rec={rec_count:5d}"
-                          f"  gap={len(gaps):d}  {hint}")
+                          f"  step={step_count:3d}  gap={len(gaps):d}  {hint}")
 
     except KeyboardInterrupt:
         pass
@@ -191,7 +170,8 @@ def main():
         ser.close()
 
     print("\n\n=== 采集摘要 ===")
-    print(f"时长 {time.time() - t0:.0f}s   REC 样本 {rec_count}")
+    print(f"时长 {time.time() - t0:.0f}s   REC 样本 {rec_count}   "
+          f"计步 {step_count}")
     print(f"检出 {len(detections)} 次：")
     for (el, kind) in detections:
         print(f"  {el:6.1f}s  {kind}")

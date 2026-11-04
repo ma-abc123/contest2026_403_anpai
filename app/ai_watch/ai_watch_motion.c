@@ -121,9 +121,23 @@ static volatile bool g_motion_slow;
 #define FALL_IMPACT_HARD_MG     2400    /* single-sample spike */
 #define FALL_IMPACT_SOFT_MG     2000    /* FF-gated / two consecutive */
 #define FALL_STILL_WINDOW_MS    3000    /* post-impact observation */
-#define FALL_STILL_DEV_MG       80      /* max |a| deviation while still */
+#define FALL_STILL_DEV_MG       80      /* max |a| deviation while still:
+                                         * correct for "was it placed",
+                                         * too strict for "did it land" */
+#define FALL_STILL_DEV_FF_MG    300     /* same, when free-fall preceded the
+                                         * impact. A body landing on a mattress
+                                         * keeps oscillating well past 80 mg
+                                         * (2026-11-03 dataset: 315-606 mg
+                                         * over the 3 s after the impact), so
+                                         * the strict gate rejected two of the
+                                         * three real falls. Free-fall is the
+                                         * strong evidence here; the stillness
+                                         * gate only has to rule out "still
+                                         * being carried". */
 #define FALL_JOLT_MG            200     /* deviation that re-arms the window */
-#define FALL_ANGLE_MIN_DEG      50      /* gravity direction change */
+#define FALL_ANGLE_MIN_DEG      40      /* gravity direction change;
+                                         * 50 missed mattress falls
+                                         * that rotated only ~45 */
 #define FALL_LONG_STILL_MS      4500    /* flat-drop path: still this long
                                          * after a free-fall impact */
 #define FALL_IMPACT_MAX_OBS_MS  10000   /* observation budget before
@@ -574,6 +588,17 @@ static FAR void *motion_thread(FAR void *arg)
                                      STEP_STRIDE_MM / 1000u);
                         last_step_ms = now;
                         step_armed = false;
+
+#if AI_WATCH_CAPTURE_STREAM
+                        /* Step calibration needs ground truth: one line
+                         * per *counted* step, with the magnitude that
+                         * tripped the threshold, so an ADL slot can be
+                         * scored as "0 steps expected, N counted".
+                         */
+
+                        printf("STEP,%u,%u\n", (unsigned)now,
+                               (unsigned)mag);
+#endif
                       }
                   }
                 else if (mag < STEP_VALLEY_MG)
@@ -650,6 +675,29 @@ static FAR void *motion_thread(FAR void *arg)
                 imp_last_move_ms = now;
               }
 
+#if AI_WATCH_CAPTURE_STREAM
+            /* Dataset runs only.  A real wearer does not fall three times
+             * in 15 s, so production keeps the plain "one event at a time"
+             * semantics; but a capture run walks through several labelled
+             * falls, and without this they collapsed into a single alarm
+             * 13 s later with the peak overwritten (2026-11-03 sitting
+             * test: 4 impacts 50-64 s -> 1 alarm at 67 s).
+             */
+
+            if (mag > FALL_IMPACT_HARD_MG &&
+                (now - imp_start_ms) > 1500)
+              {
+                imp_start_ms = now;
+                snap->fall_impact_mg = (int16_t)(mag + 0.5f);
+                fall_window_end = now + FALL_STILL_WINDOW_MS;
+                imp_ff = (ff_seen_ms != 0) &&
+                         (now - ff_seen_ms <= FF_SETTLE_MS);
+                pre_ax = grav_fx;
+                pre_ay = grav_fy;
+                pre_az = grav_fz;
+              }
+#endif
+
             if (mag > (float)snap->fall_impact_mg)
               {
                 /* Keep the true peak for the report */
@@ -681,7 +729,8 @@ static FAR void *motion_thread(FAR void *arg)
                         break;
                       }
 
-                    if (dev_ring[idx] > FALL_STILL_DEV_MG)
+                    if (dev_ring[idx] >
+                        (imp_ff ? FALL_STILL_DEV_FF_MG : FALL_STILL_DEV_MG))
                       {
                         still = false;
                         break;
@@ -704,7 +753,14 @@ static FAR void *motion_thread(FAR void *arg)
                     snap->fall_angle_deg =
                       (ang > 255) ? 255 : (uint8_t)ang;
 
-                    if (ang >= FALL_ANGLE_MIN_DEG)
+                    /* The angle path used to fire on any impact, which
+                     * armed the alarm on "picked it up and turned it"
+                     * (2026-11-03: 3867 mg impact, zero free-fall,
+                     * 55 deg -> false alarm). A fall involves the watch
+                     * being released, so require free-fall before impact.
+                     */
+
+                    if (imp_ff && ang >= FALL_ANGLE_MIN_DEG)
                       {
                         snap->fall_state = FALL_STATE_ALARM;
                         snap->fall_pending = 1;
@@ -756,6 +812,11 @@ static FAR void *motion_thread(FAR void *arg)
         case FALL_STATE_ALARM:
           if ((int32_t)(now - snap->fall_deadline_ms) >= 0)
             {
+              /* A button-started countdown stays a TEST event all the way to
+               * the phone (event 3, "跌倒测试事件").  It must not be dressed
+               * up as a confirmed fall: the record has to say what it is.
+               */
+
               uint8_t event = snap->fall_test ?
                               AI_WATCH_FALL_TEST :
                               AI_WATCH_FALL_CONFIRMED;
@@ -923,7 +984,7 @@ static void motion_drain_recording(void)
       if (g_rec_ble_seq % BLE_REC_DEC == 0)
         {
           memcpy(&payload[0], &s->t_ms, sizeof(uint32_t));
-          memcpy(&payload[4], &s->x, 6 * sizeof(int16_t));
+          memcpy(&payload[4], &s->x, 5 * sizeof(int16_t));
           ai_watch_ble_post(AI_WATCH_BLE_SENSOR_MOTION_DATA,
                             payload, sizeof(payload));
         }
@@ -959,7 +1020,13 @@ void ai_watch_motion_init(void)
   g_motion.snap.activity = AI_WATCH_MOTION_REST;
 
   pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 8192);
+  /* The motion worker keeps its detector windows on-stack.  An 8 KB stack
+   * has previously caused connection-time controller Hardware Error on
+   * this target; 16 KB was verified to keep the shared HCPU/LCPU path
+   * intact when the sampler is active.
+   */
+
+  pthread_attr_setstacksize(&attr, 16384);
   pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
   param.sched_priority = 80;          /* below the LVGL loop (100) */
   pthread_attr_setschedparam(&attr, &param);

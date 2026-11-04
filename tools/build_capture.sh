@@ -5,14 +5,14 @@
 # 无论成功失败都恢复成 0，保证工作区始终是"正常固件"状态。
 #
 # 用法：
-#   tools/build_capture.sh                    # 输出到 ~/huangshan-logs/bin_4863_capture.bin
+#   tools/build_capture.sh                    # 输出到 ~/huangshan-logs/bin_4866_capture.bin
 #   tools/build_capture.sh /tmp/my_capture.bin
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HDR="$ROOT/contest2026_403_anpai/app/ai_watch/ai_watch_motion.h"
-OUT="${1:-$HOME/huangshan-logs/bin_4863_capture.bin}"
+OUT="${1:-$HOME/huangshan-logs/bin_4866_capture.bin}"
 
 if [ ! -f "$HDR" ]; then
     echo "找不到 $HDR" >&2
@@ -20,7 +20,17 @@ if [ ! -f "$HDR" ]; then
 fi
 
 cp "$HDR" "$HDR.capbak"
-restore() { mv -f "$HDR.capbak" "$HDR"; }
+restore() {
+    mv -f "$HDR.capbak" "$HDR"
+    # Dropping the dependents is the only reliable way to force a clean
+    # rebuild here: this filesystem refuses to update a file's mtime
+    # (utimensat is blocked), so make would compare the restored header
+    # against an object compiled with the capture macro and keep it.  That
+    # once produced a "normal" firmware that still forced recording and
+    # skipped BLE init (4.8.65: REC streamed with no recording start).
+    find "$ROOT/cmake_out" -name 'ai_watch_motion.c.o' -delete 2>/dev/null || true
+    find "$ROOT/cmake_out" -name 'ai_watch_main.c.o' -delete 2>/dev/null || true
+}
 trap restore EXIT
 
 python3 - "$HDR" <<'PY'
