@@ -1,8 +1,8 @@
 # AI Watch —— 基于 openvela 的腕上运动安全助手
 
 > openvela AI 硬件开发者大赛 · 队伍 403（anpai）· 硬件：立创·黄山派（SF32LB52）
-> 当前代码版本 **4.8.71**（`test` / `panel` / `capture` 三种构建，由预处理器开关区分，代码只有一份）；
-> 板上已验收的是 **4.8.70**，4.8.71 的改动尚未烧录实测
+> 当前代码版本 **4.8.81**（`test` / `panel` / `capture` 三种构建，由预处理器开关区分，代码只有一份）；
+> 真机验收：**4.8.81-vendor-panel**（2026-11-04：新屏触控与逐帧刷新已验；BLE 连接与校时 5 轮 4 次通过）
 
 ## 一、作品简介
 
@@ -116,12 +116,21 @@ DataUpload 的 `sensor_type`：`0x05` 步数、`0x06` 活动、`0x10` AI 触发�
 
 原读路径每样本走 22 次单字节寄存器读（约 42 ms），有效采样只有 ~15 Hz，冲击峰值有欠采样风险。改成 burst 一帧读回后压到 1 ms，采样节拍由休眠精度决定。**当前实测 25 Hz**（40 ms 中位间隔，抖动极小），25 Hz 对 120–300 ms 的冲击仍有约 3–7 个样本。
 
-### 3. 屏幕流畅度：滚动单帧渲染 88 ms → 55–90 ms
+### 3. 新屏到货后的两个应用层问题：触控被顶掉、渲染优化不成立
 
+新屏装上后表现为"屏能亮、触控全无、画面一帧一帧地刷"。两个症状都出在应用层，与驱动和硬件无关。
+
+**触控**：`ai_watch_shot` 无条件创建的主机鼠标 indev，在面板触摸尚未注册时被当成触摸设备绑定，并把轮询计数清零，轮询就此终止。触摸控制器由 `sifli_ap.c` 的 `lcd_async_init_thread` 异步带起（80 ms settle 后才调 `ft6146_touch_initialize`），启动瞬间 `/dev/input0` 常常还不存在，等它真出现时已经没人绑定了。修法是加一个 `touch_panel_ready` 区分"面板控制器"与"临时主机指针"：面板模式下兜底只提供临时输入、不清零轮询，主循环一旦找到 `/dev/input0` 就删掉临时 indev 并切到面板；headless 行为不变。
+
+**渲染**：
 - 根因不是刷新率，而是**整屏 351 KB 缓冲在 PSRAM 里软渲染**（实测带宽约 4 MB/s），加上脏区计算失效
-- **PARTIAL 条带渲染**：静态 `.bss` 条带（390×60 RGB565，46.8 KB，`aligned(64)` 保证落 SRAM）+ `LV_DISPLAY_RENDER_MODE_PARTIAL`
-- **影子帧**：351 KB PSRAM 影子缓冲，flush 时把每条条带合入，坏屏模式下也靠它供给投屏
-- 结果：负一屏滚动单帧渲染 88 ms → 55–90 ms，最好一次 55 ms（**headless 单次日志，跨运行受拖拽动力学影响，只作趋势参考**）
+- 2026-11-01 改成 **PARTIAL 条带渲染**：静态 `.bss` 条带（390×60 RGB565，46.8 KB，`aligned(64)` 落 SRAM）+ `LV_DISPLAY_RENDER_MODE_PARTIAL`，配一块 351 KB 影子帧；headless 下负一屏滚动单帧 88 ms → 55–90 ms
+- **但这组数字只在 headless（完全不写面板）下成立。** 换到真屏后，PARTIAL 每帧产生几十次 `PUTAREA`，每次都要重设面板窗口，玻璃上表现为一条一条地刷
+- 又试了 `RENDER_MODE_DIRECT` + 自建第二个 `/dev/lcd0` fd 接管 flush：画面能出，但只有触摸时才推进一帧——两个 fd 写同一设备、外加外来 `flush_cb` 打乱了刷新握手
+- **最终回退到端口原生路径**：真屏用 FULL 渲染 + 驱动自带 `flush_cb` + 不额外开绘制 fd，影子帧降级为只读镜像供投屏；PARTIAL 条带只保留在 headless 构建
+- 留下的是一个反例：**benchmark 的测量环境决定了结论的适用范围**——在没有面板的机器上测渲染，测不到面板写入的代价
+
+真机验证（4.8.81-vendor-panel，2026-11-04）：触控跟手、时钟走秒与蓝牙状态正常刷新、滑动不再条带化。
 
 ### 4. 投屏链路：从"点一下卡死"到 9.2 fps
 
@@ -188,7 +197,7 @@ app/ai_watch/          # 主应用
 board/ai_watch/        # 板级 defconfig
 phone/                 # Android App（Kotlin/Compose）
 tools/                 # 采集、投屏、BLE 回归、阈值分析、构建脚本
-docs/development/      # 40 篇文档（25 篇开发日志 + 需求/排查/操作卡）
+docs/development/      # 45 篇文档（28 篇开发日志 + 需求/排查/操作卡）
 logs/                  # AI Coding 对话日志
 .agents/skills/        # ai-watch-playbook（开发手册）、ai-watch-ble-diagnostics（BLE 排查流程）
 ```
@@ -208,7 +217,7 @@ repo sync -c -j8
 # 2. 编译（工作区根目录）
 cmake -G Ninja -S nuttx -B cmake_out/prod -DNUTTX_BUILD=y \
   -DBOARD_CONFIG="$PWD/vendor/openvela/boards/contest2026_403_ai_watch/configs/ai_watch" \
-  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations -Wno-error=implicit-function-declaration -Wno-error=int-conversion -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
+  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
 cmake --build cmake_out/prod -j 12        # 产物 cmake_out/prod/nuttx.bin
 
 # 3. 烧录
@@ -221,9 +230,9 @@ sftool -c SF32LB52 -p /dev/ttyUSB0 -b 1000000 \
 
 | 命令 | 版本号 | 用途 |
 |---|---|---|
-| `cmake --build cmake_out/prod` | `4.8.70-test` | 默认：无屏/坏屏模式（headless + 串口投屏） |
-| `tools/build_panel.sh` | `4.8.70-panel` | 接真屏：flush 走 panel、启用 FT6146 触摸、页面 200 ms 淡入 |
-| `tools/build_capture.sh` | `4.8.70-capture` | 数据采集：上电即连续输出 `REC`/`STEP`，蓝牙关闭 |
+| `cmake --build cmake_out/prod` | `4.8.81-vendor-test` | 默认：无屏/坏屏模式（headless + 串口投屏，PARTIAL 条带渲染） |
+| `tools/build_panel.sh` | `4.8.81-vendor-panel` | 接真屏：FULL 渲染 + 驱动自带 `flush_cb`、启用 FT6146 触摸、页面 200 ms 淡入 |
+| `tools/build_capture.sh` | `4.8.81-capture` | 数据采集：上电即连续输出 `REC`/`STEP`，蓝牙关闭 |
 
 > 两个脚本编译完都会恢复宏并**删掉对应 `.o`**。这一步不能省：本开发容器禁用 `utimensat`，`touch` 改不动 mtime，增量构建会沿用上次编译的目标文件——我们踩过：把采集宏带进正常固件，现象是"蓝牙全废、日志刷 REC"。
 
@@ -254,8 +263,8 @@ python3 tools/shot_selftest.py --live                     # 实机 7 项回归
 - **板级 DHT22 驱动仍在注册**，但 4.8.5 起已移除对应 UI 与上报，本项目不宣称温湿度功能。
 - **统计口径**：步数/活动/跌倒次数为**本次运行内**的统计，重启后清零（本板无法在运行期写同一片 NOR，见开发日志 2026-11-03）。
 - **跌倒判定依据**：用 6 组自采数据（2026-09-02，采样约 15 Hz，当时阈值 50°/80 mg）以固件同源状态机离线回灌，6/6 通过、对照动作无误报。现行阈值（40°/300 mg）只用 2–3 次模拟动作验证过；样本量有限，**不作为误报率/准确率的统计结论**。
-- **UI 实测环境**：屏幕在开发后期损坏，投屏帧率、流畅度数字均在 headless（无屏）模式下测得；正屏模式的启动路径已验证，真屏的亮度/色彩/触摸验收待新屏到货补做。
-- **BLE（当前版本未通过验收）**：4.8.10 上曾完成连接 → 订阅 → 校时 → 提醒的全链路（`timesync accepted` / `BLE: time synced`）。当前 4.8.70 上，连接后约 0.45–5 s 触发控制器 `Hardware error, code 0` 并被强制拆链，错误发生在 GATT 订阅与校时之前；主机侧探针 0/3 扫到广播。4.8.71 已把运动采样线程栈恢复为 16 KB，并修掉 `MOTION_DATA` 帧越界（14 B 帧里时间戳占 4 B，只应复制 5 个 `int16_t`），**尚未烧录 A/B 验证**。口径：已定位到控制器层、正与厂商联调，不承诺现场稳定连接。
+- **UI 实测环境**：屏幕在开发中期损坏，投屏帧率与 headless 渲染耗时均在无屏模式下测得。新屏到货后真屏路径已恢复（4.8.81-vendor-panel，2026-11-04 验证：触控跟手、时钟走秒、蓝牙状态正常刷新），但**投屏 fps 与滚动渲染耗时仍是 headless 数字，真屏未复测**，不当作真屏性能结论。
+- **BLE（4.8.81 实测通过连接与校时）**：4.8.10 上曾完成连接 → 订阅 → 校时 → 提醒的全链路（`timesync accepted` / `BLE: time synced`）。4.8.70 时代出现"连接后 0.45–5 s 触发控制器 `Hardware error, code 0`"的必现掉线，根因指向 HCPU 堆顶与 LCPU 邮箱窗口／共享环的缓存一致性。两项改动合入后——HCI 双核共享环映射为非缓存内存、LCPU 补丁恢复厂商原版数组——用 `tools/ble_connect_test.py` 逐轮回归，**5 轮 4 次 SURVIVED**（连接 1.63–1.75 s、校时 2.2–2.3 s、保持 45 s 不掉线，Status notify 正常）；第 5 轮是主机侧扫描没找到设备（`FAIL_CONN`），不是板端掉线。口径：这是主机脚本的自动回归，**不等于手机 App 长稳测试**，现场仍以实测为准。
 
 ## 九、AI Coding 说明
 
@@ -266,4 +275,4 @@ python3 tools/shot_selftest.py --live                     # 实机 7 项回归
 - **调试定位**（日志里都留了根因链）：CCC 订阅不匹配、`bt_gatt_indicate` 同步阻塞导致触控冻结、跌倒角度基准初始化错误、投屏"点一下卡死"的三层根因、增量构建静默失效、LVGL 对象数导致 BLE 致盲
 - **测试分析**：采集工具链、离线回灌定标、BLE 逐 boot 广播统计
 
-完整对话日志见 `logs/`，过程记录见 `docs/development/`（25 篇开发日志）。经验沉淀为两个随仓提交的 Skill：`.agents/skills/ai-watch-playbook/`（红线规则 + LVGL/BLE/传感器/调试方法论）与 `.agents/skills/ai-watch-ble-diagnostics/`（BLE 分阶段排查流程），用 ZCode / Claude Code 打开仓库即自动加载。
+完整对话日志见 `logs/`，过程记录见 `docs/development/`（28 篇开发日志）。经验沉淀为两个随仓提交的 Skill：`.agents/skills/ai-watch-playbook/`（红线规则 + LVGL/BLE/传感器/调试方法论）与 `.agents/skills/ai-watch-ble-diagnostics/`（BLE 分阶段排查流程），用 ZCode / Claude Code 打开仓库即自动加载。
