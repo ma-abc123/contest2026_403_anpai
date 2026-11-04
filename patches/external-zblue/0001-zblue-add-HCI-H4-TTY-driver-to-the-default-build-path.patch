@@ -1,0 +1,39 @@
+From 44c33964d3256a61c44377158577594f6aed305c Mon Sep 17 00:00:00 2001
+From: ma-abc123 <abc12302019@outlook.com>
+Date: Fri, 23 Oct 2026 20:21:21 +0800
+Subject: [PATCH] zblue: add HCI H4 TTY driver to the default build path
+
+CMakeLists.default.txt never compiles port/drivers/bluetooth/hci/h4.c.
+With CONFIG_BT_H4 enabled, the port's device init entries
+(zephyr_bt_hci_ttyHCI*) are therefore undefined and the host stack has
+no HCI transport. The 3_0_1 variant already appends this source; the
+default file does not.
+
+Append the source to CSRCS when CONFIG_BT_H4 is set.
+
+Signed-off-by: ma-abc123 <abc12302019@outlook.com>
+---
+ zblue/CMakeLists.default.txt | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/zblue/CMakeLists.default.txt b/zblue/CMakeLists.default.txt
+index a216d95..41dbc37 100644
+--- a/zblue/CMakeLists.default.txt
++++ b/zblue/CMakeLists.default.txt
+@@ -756,6 +756,13 @@ if(CONFIG_BT)
+     endif()
+   endif()
+ 
++  if(CONFIG_BT_H4)
++    # The default-repo build misses the HCI H4 TTY driver; without it the
++    # port's device init entries (zephyr_bt_hci_ttyHCI*) are undefined and
++    # the host stack has no transport. The 3_0_1 variant already does this.
++    list(APPEND CSRCS ${ZBLUE_DIR}/port/drivers/bluetooth/hci/h4.c)
++  endif()
++
+   list(APPEND CSRCS
+     zblue/kernel/system_work_q.c
+     zblue/kernel/work.c
+-- 
+2.34.1
+

@@ -204,7 +204,10 @@ logs/                  # AI Coding 对话日志
 
 代码经 manifest `<linkfile>` 映射进 openvela 编译树。对公共仓的配套修改已提 PR：
 [vendor_sifli#32](https://github.com/open-vela/vendor_sifli/pull/32)（SF32LB52 BLE 桥接 zblue、LCPU patch 加载、控制器自愈、LCD 注册竞态、板级 rcS/ROMFS）、
-[frameworks_runtimes_feature#4](https://github.com/open-vela/frameworks_runtimes_feature/pull/4)（move ctor 编译修复）。
+[frameworks_runtimes_feature#4](https://github.com/open-vela/frameworks_runtimes_feature/pull/4)（move ctor 编译修复）、
+[external#52](https://github.com/open-vela/external/pull/52)（zblue 默认构建路径补 HCI H4 TTY 驱动——板级 `CONFIG_BT_H4=y`，缺它链接不过）。
+
+三个 PR 未合入时，在对应公共仓目录下按 `patches/<仓名>/` 的文件名顺序 `git am` 即可；`patches/` 只收录构建必需的最小集，不是完整改动。
 
 ## 七、编译、烧录与运行
 
