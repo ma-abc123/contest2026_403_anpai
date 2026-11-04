@@ -14,7 +14,7 @@ AI Watch 是一台跑 openvela（NuttX）的智能腕表。硬件侧有 390×450
 
 开发后期手表屏幕意外摔坏，我们没有停摆，而是在固件里做了一套**零新增硬件**的替代通道：把调试串口复用成"投屏 + 触摸回传 + 日志"三合一，此后所有 UI 开发与演示都在电脑上完成——这段经历反而成了本作品最有辨识度的工程部分之一。
 
-## 二、系统构成
+### 系统构成
 
 ```
 ┌──────────────── 手表（openvela / NuttX，SF32LB52）────────────────┐
@@ -34,7 +34,106 @@ AI Watch 是一台跑 openvela（NuttX）的智能腕表。硬件侧有 390×450
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## 三、功能全景
+## 二、选题方向
+
+**AI 硬件产品创新**（腕上形态，自定方向）。
+
+出发点是：跌倒对独居老人和运动人群都是高频、后果重的风险，而现有方案要么依赖手机、要么依赖摄像头，反而是戴在手上的设备最合适——它常驻、自带六轴 IMU、能就地告警。
+
+选黄山派（SF32LB52）的理由是外设齐备：390×450 屏、触摸、KEY2、BLE、板载六轴 IMU 都在一块板子上；openvela 的 LVGL + NuttX 栈也足够成熟，可以把精力放在"跌倒检测这类真实痛点 + 手机协同"的产品逻辑上，而不是从头补驱动。
+
+刻意没做端侧模型：腕表上的预算是 25 Hz 采样、单核、几十 KB 内存，确定性规则能在同样资源下给出**可解释、阈值可单独扫描**的结果；没有成规模的标注数据，硬上模型反而是负担。
+
+## 三、目录结构
+
+```
+app/ai_watch/          # 主应用
+  ai_watch_main.c          UI 框架、页面、按键/手势、跌倒告警模态层、设置页
+  ai_watch_motion.c/h      采样线程、计步/活动/跌倒状态机、采集构建开关
+  ai_watch_ble.c/h         BLE 协议层：TimeSync、命令解析、提醒存储、上行队列、恢复阶梯
+  ai_watch_skill.c/h       设备端 Skill（久坐/步数/简报）
+  ai_watch_light.c/h       LTR-303 环境光与自动亮度
+  ai_watch_battery.c/h     GPADC 电池电压与电量估算
+  ai_watch_shot.c/h        远程操控台固件侧：帧快照/RLE/分片发送/触摸注入
+  fonts/ icons/            微子集字体（含 28 px 天气字体）与图标
+board/ai_watch/        # 板级 defconfig
+phone/                 # Android App（Kotlin/Compose）
+tools/                 # 采集、投屏、BLE 回归、阈值分析、构建脚本
+docs/development/      # 45 篇文档（28 篇开发日志 + 需求/排查/操作卡）
+logs/                  # AI Coding 对话日志
+.agents/skills/        # ai-watch-playbook（开发手册）、ai-watch-ble-diagnostics（BLE 排查流程）
+```
+
+代码经 manifest `<linkfile>` 映射进 openvela 编译树。对公共仓的配套修改已提 PR：
+[vendor_sifli#32](https://github.com/open-vela/vendor_sifli/pull/32)（SF32LB52 BLE 桥接 zblue、LCPU patch 加载、控制器自愈、LCD 注册竞态、板级 rcS/ROMFS）、
+[frameworks_runtimes_feature#4](https://github.com/open-vela/frameworks_runtimes_feature/pull/4)（move ctor 编译修复）、
+[external#52](https://github.com/open-vela/external/pull/52)（zblue 默认构建路径补 HCI H4 TTY 驱动——板级 `CONFIG_BT_H4=y`，缺它链接不过）。
+
+三个 PR 未合入时，在对应公共仓目录下按 `patches/<仓名>/` 的文件名顺序 `git am` 即可；`patches/` 只收录构建必需的最小集，不是完整改动。
+
+## 四、运行方式
+
+```bash
+# 1. 拉取
+repo init -u https://github.com/open-vela/contest2026_403_anpai \
+  -b dev-ai-contest-2026 -m contest2026_403_anpai.xml
+repo sync -c -j8
+
+# 2. 编译（工作区根目录）
+cmake -G Ninja -S nuttx -B cmake_out/prod -DNUTTX_BUILD=y \
+  -DBOARD_CONFIG="$PWD/vendor/openvela/boards/contest2026_403_ai_watch/configs/ai_watch" \
+  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
+cmake --build cmake_out/prod -j 12        # 产物 cmake_out/prod/nuttx.bin
+
+# 3. 烧录
+sftool -c SF32LB52 -p /dev/ttyUSB0 -b 1000000 \
+  --before default_reset --after soft_reset \
+  write_flash <绝对路径>/nuttx.bin@0x12010000
+```
+
+### 三种构建
+
+| 命令 | 版本号 | 用途 |
+|---|---|---|
+| `cmake --build cmake_out/prod` | `4.8.81-vendor-test` | 默认：无屏/坏屏模式（headless + 串口投屏，PARTIAL 条带渲染） |
+| `tools/build_panel.sh` | `4.8.81-vendor-panel` | 接真屏：FULL 渲染 + 驱动自带 `flush_cb`、启用 FT6146 触摸、页面 200 ms 淡入 |
+| `tools/build_capture.sh` | `4.8.81-capture` | 数据采集：上电即连续输出 `REC`/`STEP`，蓝牙关闭 |
+
+> 两个脚本编译完都会恢复宏并**删掉对应 `.o`**。这一步不能省：本开发容器禁用 `utimensat`，`touch` 改不动 mtime，增量构建会沿用上次编译的目标文件——我们踩过：把采集宏带进正常固件，现象是"蓝牙全废、日志刷 REC"。
+
+### 运行
+
+无手机也可完整使用：表盘、负一屏、菜单、运动、跌倒检测、设置。连手机 App 后启用校时、提醒、AI 闭环与事件上报（App 源码见 `phone/`）。
+
+投屏与远程操作：
+
+```bash
+python3 tools/shot_remote.py                              # X11 预览窗，鼠标即触摸
+systemctl --user enable --now ai-watch-viewer.service     # 插板自动投屏
+python3 tools/shot_selftest.py --unit                     # 解析器 13 项回归（免板子）
+python3 tools/shot_selftest.py --live                     # 实机 7 项回归
+```
+
+### 演示流程
+
+1. 表盘 → 右滑看负一屏（步数 / 活动 / 跌倒次数 / 天气 / 待触发提醒）
+2. 上滑进蜂窝菜单 → 打开 Exercise 看步数、活动、实时 |a| 与状态
+3. 点 `Test` → 15 s 全屏红色倒计时 → 点 CANCEL 演示"可取消"，或等它走完演示"自动上报"
+4. 手机 App 侧查看事件入库与通知
+5. 条件允许时做一次真实跌落（从约 30 cm 松手到软垫并保持静止），约 5–8 s 出告警
+
+## 五、AI Coding 使用说明
+
+全程与 AI 结对开发（mimo/Claude Code、glm5.3flash/ZCode、gpt5.6sol/Codex），覆盖：
+
+- **方案设计**：BLE 帧格式、跌倒定标流程、投屏协议、采集动作表
+- **编码实现**：应用框架、BLE 桥接与协议层、跌倒状态机、LVGL 页面与微子集字体
+- **调试定位**（日志里都留了根因链）：CCC 订阅不匹配、`bt_gatt_indicate` 同步阻塞导致触控冻结、跌倒角度基准初始化错误、投屏"点一下卡死"的三层根因、增量构建静默失效、LVGL 对象数导致 BLE 致盲
+- **测试分析**：采集工具链、离线回灌定标、BLE 逐 boot 广播统计
+
+完整对话日志见 `logs/`，过程记录见 `docs/development/`（28 篇开发日志）。经验沉淀为两个随仓提交的 Skill：`.agents/skills/ai-watch-playbook/`（红线规则 + LVGL/BLE/传感器/调试方法论）与 `.agents/skills/ai-watch-ble-diagnostics/`（BLE 分阶段排查流程），用 ZCode / Claude Code 打开仓库即自动加载。
+
+## 六、功能全景
 
 ### 1. 界面与交互
 
@@ -54,7 +153,7 @@ AI Watch 是一台跑 openvela（NuttX）的智能腕表。硬件侧有 390×450
 | 采样 | lsm6dsl 单次 burst 读（0x22–0x2D 一帧取回），应用层实测 **25 Hz**（本轮 REC 日志：间隔中位 40 ms，p10=p90=40 ms） |
 | 计步 | 峰值/谷值双阈值 + 300 ms 不应期，含距离估算 |
 | 活动分类 | REST / WALK / RUN 三态，供负一屏与 Skill 使用 |
-| 跌倒检测 | 四要素规则状态机，见第五节 |
+| 跌倒检测 | 四要素规则状态机，见第七节 |
 | 告警流程 | `lv_layer_top` 全屏红色模态层，15 s 倒计时，触摸 CANCEL 或 KEY2 取消；超时上报；取消也上报（事件码区分） |
 | 测试触发 | Exercise 页 `Test` 按钮，走**同一条状态机与上报链路**，上报事件码为 3（测试），不计入当日跌倒次数 |
 | 数据录制 | Exercise 页 `Record`，串口输出全量六轴 CSV（`REC,<t_ms>,ax,ay,az,gx,gy,gz`），供离线复现 |
@@ -104,7 +203,27 @@ DataUpload 的 `sensor_type`：`0x05` 步数、`0x06` 活动、`0x10` AI 触发�
 | `tools/ble_adv_lottery.py` / `ble_connect_test.py` | 逐 boot 广播成功率统计、连接→订阅→校时全流程回归 |
 | `tools/build_panel.sh` | 一键编正屏固件（`AI_WATCH_HEADLESS=0`） |
 
-## 四、决赛阶段做的优化
+## 七、跌倒判定怎么做的
+
+状态机（每个样本推进一次）：
+
+```
+NORMAL ──(冲击 > 2400mg 或 软冲击 2000mg×2 或 自由落体后 2000mg 单点)──> IMPACT
+IMPACT ──(3 s 静止窗口；未决则 1 s 步进续看，预算 10 s)──> 判姿态角变化
+          ├─ 有自由落体 且 角度 ≥ 40°  → ALARM
+          ├─ 有自由落体 且 静止 ≥ 4.5 s（平摔路径）→ ALARM
+          └─ 否则 → 回到 NORMAL（并进入较短的不应期）
+ALARM  ──(15 s 倒计时结束)──> 上报 FALL_EVENT(event=1) → NORMAL（60 s 冷却）
+       └─(CANCEL / KEY2)────> 上报 FALL_EVENT(event=2) → NORMAL
+```
+
+几个刻意的设计：
+- **只报"疑似跌倒"**：语义与上报文案统一，不做医疗级断言（UI 当前为英文 `Suspected fall`，未做中文化）
+- **取消也上报**：手机端能看到"曾经触发又被人取消"，这比"什么都没发生"更有信息量
+- **测试事件独立事件码**：按钮触发走同一条链路，但上报 `event=3`，不会污染真实跌倒记录
+- 判定参数全部集中在 `ai_watch_motion.c` 顶部，离线工具用同名参数复现
+
+## 八、决赛阶段做的优化
 
 这一段是 10-24 之后针对"能不能流畅跑、能不能讲清楚"做的专项，尽量给出前后数字与出处；没有出处的只写趋势。
 
@@ -162,105 +281,7 @@ DataUpload 的 `sensor_type`：`0x05` 步数、`0x06` 活动、`0x10` AI 触发�
 
 按故障阶段（广播 / 连接建立 / 链路 / 重连）分别取证，落成 `.agents/skills/ai-watch-ble-diagnostics/`。应用层做了两件事：**INIT_FAILED 退避温和前倾**（首试 +10 s，后续 15/20/30/60/120/300 s，无次数上限——电池设备不能在现场断电重启），**连接窗口隔离**（`CONNECTED` 且尚未校时的 8 s 内暂停帧流、采样降到 15 Hz，窗口结束立即恢复）。
 
-## 五、跌倒判定怎么做的
-
-状态机（每个样本推进一次）：
-
-```
-NORMAL ──(冲击 > 2400mg 或 软冲击 2000mg×2 或 自由落体后 2000mg 单点)──> IMPACT
-IMPACT ──(3 s 静止窗口；未决则 1 s 步进续看，预算 10 s)──> 判姿态角变化
-          ├─ 有自由落体 且 角度 ≥ 40°  → ALARM
-          ├─ 有自由落体 且 静止 ≥ 4.5 s（平摔路径）→ ALARM
-          └─ 否则 → 回到 NORMAL（并进入较短的不应期）
-ALARM  ──(15 s 倒计时结束)──> 上报 FALL_EVENT(event=1) → NORMAL（60 s 冷却）
-       └─(CANCEL / KEY2)────> 上报 FALL_EVENT(event=2) → NORMAL
-```
-
-几个刻意的设计：
-- **只报"疑似跌倒"**：语义与上报文案统一，不做医疗级断言（UI 当前为英文 `Suspected fall`，未做中文化）
-- **取消也上报**：手机端能看到"曾经触发又被人取消"，这比"什么都没发生"更有信息量
-- **测试事件独立事件码**：按钮触发走同一条链路，但上报 `event=3`，不会污染真实跌倒记录
-- 判定参数全部集中在 `ai_watch_motion.c` 顶部，离线工具用同名参数复现
-
-## 六、目录结构
-
-```
-app/ai_watch/          # 主应用
-  ai_watch_main.c          UI 框架、页面、按键/手势、跌倒告警模态层、设置页
-  ai_watch_motion.c/h      采样线程、计步/活动/跌倒状态机、采集构建开关
-  ai_watch_ble.c/h         BLE 协议层：TimeSync、命令解析、提醒存储、上行队列、恢复阶梯
-  ai_watch_skill.c/h       设备端 Skill（久坐/步数/简报）
-  ai_watch_light.c/h       LTR-303 环境光与自动亮度
-  ai_watch_battery.c/h     GPADC 电池电压与电量估算
-  ai_watch_shot.c/h        远程操控台固件侧：帧快照/RLE/分片发送/触摸注入
-  fonts/ icons/            微子集字体（含 28 px 天气字体）与图标
-board/ai_watch/        # 板级 defconfig
-phone/                 # Android App（Kotlin/Compose）
-tools/                 # 采集、投屏、BLE 回归、阈值分析、构建脚本
-docs/development/      # 45 篇文档（28 篇开发日志 + 需求/排查/操作卡）
-logs/                  # AI Coding 对话日志
-.agents/skills/        # ai-watch-playbook（开发手册）、ai-watch-ble-diagnostics（BLE 排查流程）
-```
-
-代码经 manifest `<linkfile>` 映射进 openvela 编译树。对公共仓的配套修改已提 PR：
-[vendor_sifli#32](https://github.com/open-vela/vendor_sifli/pull/32)（SF32LB52 BLE 桥接 zblue、LCPU patch 加载、控制器自愈、LCD 注册竞态、板级 rcS/ROMFS）、
-[frameworks_runtimes_feature#4](https://github.com/open-vela/frameworks_runtimes_feature/pull/4)（move ctor 编译修复）、
-[external#52](https://github.com/open-vela/external/pull/52)（zblue 默认构建路径补 HCI H4 TTY 驱动——板级 `CONFIG_BT_H4=y`，缺它链接不过）。
-
-三个 PR 未合入时，在对应公共仓目录下按 `patches/<仓名>/` 的文件名顺序 `git am` 即可；`patches/` 只收录构建必需的最小集，不是完整改动。
-
-## 七、编译、烧录与运行
-
-```bash
-# 1. 拉取
-repo init -u https://github.com/open-vela/contest2026_403_anpai \
-  -b dev-ai-contest-2026 -m contest2026_403_anpai.xml
-repo sync -c -j8
-
-# 2. 编译（工作区根目录）
-cmake -G Ninja -S nuttx -B cmake_out/prod -DNUTTX_BUILD=y \
-  -DBOARD_CONFIG="$PWD/vendor/openvela/boards/contest2026_403_ai_watch/configs/ai_watch" \
-  -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -D_LIBCPP_WORKAROUND_OBJCXX_COMPILER_INTRINSICS"
-cmake --build cmake_out/prod -j 12        # 产物 cmake_out/prod/nuttx.bin
-
-# 3. 烧录
-sftool -c SF32LB52 -p /dev/ttyUSB0 -b 1000000 \
-  --before default_reset --after soft_reset \
-  write_flash <绝对路径>/nuttx.bin@0x12010000
-```
-
-### 三种构建
-
-| 命令 | 版本号 | 用途 |
-|---|---|---|
-| `cmake --build cmake_out/prod` | `4.8.81-vendor-test` | 默认：无屏/坏屏模式（headless + 串口投屏，PARTIAL 条带渲染） |
-| `tools/build_panel.sh` | `4.8.81-vendor-panel` | 接真屏：FULL 渲染 + 驱动自带 `flush_cb`、启用 FT6146 触摸、页面 200 ms 淡入 |
-| `tools/build_capture.sh` | `4.8.81-capture` | 数据采集：上电即连续输出 `REC`/`STEP`，蓝牙关闭 |
-
-> 两个脚本编译完都会恢复宏并**删掉对应 `.o`**。这一步不能省：本开发容器禁用 `utimensat`，`touch` 改不动 mtime，增量构建会沿用上次编译的目标文件——我们踩过：把采集宏带进正常固件，现象是"蓝牙全废、日志刷 REC"。
-
-### 运行
-
-无手机也可完整使用：表盘、负一屏、菜单、运动、跌倒检测、设置。连手机 App 后启用校时、提醒、AI 闭环与事件上报（App 源码见 `phone/`）。
-
-投屏与远程操作：
-
-```bash
-python3 tools/shot_remote.py                              # X11 预览窗，鼠标即触摸
-systemctl --user enable --now ai-watch-viewer.service     # 插板自动投屏
-python3 tools/shot_selftest.py --unit                     # 解析器 13 项回归（免板子）
-python3 tools/shot_selftest.py --live                     # 实机 7 项回归
-```
-
-### 演示流程
-
-1. 表盘 → 右滑看负一屏（步数 / 活动 / 跌倒次数 / 天气 / 待触发提醒）
-2. 上滑进蜂窝菜单 → 打开 Exercise 看步数、活动、实时 |a| 与状态
-3. 点 `Test` → 15 s 全屏红色倒计时 → 点 CANCEL 演示"可取消"，或等它走完演示"自动上报"
-4. 手机 App 侧查看事件入库与通知
-5. 条件允许时做一次真实跌落（从约 30 cm 松手到软垫并保持静止），约 5–8 s 出告警
-
-## 八、数据与状态说明
+## 九、数据与状态说明
 
 - **采样率**：应用层实测 25 Hz；`833 Hz` 是传感器 ODR 配置值，不是应用层拿到数据的频率。
 - **板级 DHT22 驱动仍在注册**，但 4.8.5 起已移除对应 UI 与上报，本项目不宣称温湿度功能。
@@ -268,14 +289,3 @@ python3 tools/shot_selftest.py --live                     # 实机 7 项回归
 - **跌倒判定依据**：用 6 组自采数据（2026-09-02，采样约 15 Hz，当时阈值 50°/80 mg）以固件同源状态机离线回灌，6/6 通过、对照动作无误报。现行阈值（40°/300 mg）只用 2–3 次模拟动作验证过；样本量有限，**不作为误报率/准确率的统计结论**。
 - **UI 实测环境**：屏幕在开发中期损坏，投屏帧率与 headless 渲染耗时均在无屏模式下测得。新屏到货后真屏路径已恢复（4.8.81-vendor-panel，2026-11-04 验证：触控跟手、时钟走秒、蓝牙状态正常刷新），但**投屏 fps 与滚动渲染耗时仍是 headless 数字，真屏未复测**，不当作真屏性能结论。
 - **BLE（4.8.81 实测通过连接与校时）**：4.8.10 上曾完成连接 → 订阅 → 校时 → 提醒的全链路（`timesync accepted` / `BLE: time synced`）。4.8.70 时代出现"连接后 0.45–5 s 触发控制器 `Hardware error, code 0`"的必现掉线，根因指向 HCPU 堆顶与 LCPU 邮箱窗口／共享环的缓存一致性。两项改动合入后——HCI 双核共享环映射为非缓存内存、LCPU 补丁恢复厂商原版数组——用 `tools/ble_connect_test.py` 逐轮回归，**5 轮 4 次 SURVIVED**（连接 1.63–1.75 s、校时 2.2–2.3 s、保持 45 s 不掉线，Status notify 正常）；第 5 轮是主机侧扫描没找到设备（`FAIL_CONN`），不是板端掉线。口径：这是主机脚本的自动回归，**不等于手机 App 长稳测试**，现场仍以实测为准。
-
-## 九、AI Coding 说明
-
-全程与 AI 结对开发（mimo/Claude Code、glm5.3flash/ZCode、gpt5.6sol/Codex），覆盖：
-
-- **方案设计**：BLE 帧格式、跌倒定标流程、投屏协议、采集动作表
-- **编码实现**：应用框架、BLE 桥接与协议层、跌倒状态机、LVGL 页面与微子集字体
-- **调试定位**（日志里都留了根因链）：CCC 订阅不匹配、`bt_gatt_indicate` 同步阻塞导致触控冻结、跌倒角度基准初始化错误、投屏"点一下卡死"的三层根因、增量构建静默失效、LVGL 对象数导致 BLE 致盲
-- **测试分析**：采集工具链、离线回灌定标、BLE 逐 boot 广播统计
-
-完整对话日志见 `logs/`，过程记录见 `docs/development/`（28 篇开发日志）。经验沉淀为两个随仓提交的 Skill：`.agents/skills/ai-watch-playbook/`（红线规则 + LVGL/BLE/传感器/调试方法论）与 `.agents/skills/ai-watch-ble-diagnostics/`（BLE 分阶段排查流程），用 ZCode / Claude Code 打开仓库即自动加载。
